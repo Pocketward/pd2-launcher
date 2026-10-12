@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PD2 Launcher
+Comment=Install, update, and launch Project Diablo 2
+Exec=pd2-launcher
+Icon=io.github.kapdon.pd2-launcher
+Categories=Game;
+Terminal=false
+StartupNotify=true
+StartupWMClass=pd2-launcher
