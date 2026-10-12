@@ -127,7 +127,37 @@ pub(crate) fn first_d2gl_launch_pending(root: &Directory) -> bool {
         .is_ok_and(|folder| d2gl::configuration_absent(&folder))
 }
 
-pub(crate) use d2gl::{DisplaySeed, GraphicsProfile};
+pub(crate) use d2gl::{DisplaySeed, GraphicsProfile, pin_dlls as pin_d2gl_dlls};
+
+/// What a launch does to D2GL's configuration in the game `folder` before
+/// the game starts. A Glide launch on the `android` host starts only once
+/// `d2gl.json` names the DLLs PD2 ships ([`pin_d2gl_dlls`]). D2GL owns its
+/// configuration otherwise: the seed only replaces its untouched default
+/// size (on Android also the window size, the cursor and full-screen values
+/// and a changed graphics profile's values) and never blocks the launch. An
+/// absent configuration is still reported so the Launcher can explain
+/// D2GL's first launch.
+fn prepare_d2gl(
+    folder: &Directory,
+    options: GameLaunchOptions,
+    android: bool,
+) -> Result<DisplaySeed, GameLaunchError> {
+    if android && options.renderer == GameRenderer::Glide {
+        pin_d2gl_dlls(folder).map_err(|error| {
+            eprintln!("pd2-launcher: game not started, d2gl.json may name other DLLs: {error}");
+            GameLaunchError::LaunchPreflightFailed
+        })?;
+    }
+    Ok(match (options.renderer, options.display_size) {
+        (GameRenderer::Glide, Some((width, height))) => {
+            d2gl::seed(folder, width, height, options.graphics_profile)
+        }
+        (GameRenderer::Glide, None) if d2gl::configuration_absent(folder) => {
+            DisplaySeed::ConfigurationAbsent
+        }
+        _ => DisplaySeed::NotRequested,
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum GameRenderer {
@@ -385,20 +415,7 @@ impl GameSupervisor {
                 Err(error) => eprintln!("pd2-launcher: the G: drive was not linked: {error}"),
             }
         }
-        // D2GL owns its configuration; the seed only replaces its untouched
-        // default size (on Android also the window size and a changed graphics
-        // profile's values) and never blocks the launch. An absent
-        // configuration is still reported so the Launcher can explain D2GL's
-        // first launch.
-        let display_seed = match (options.renderer, options.display_size) {
-            (GameRenderer::Glide, Some((width, height))) => {
-                d2gl::seed(&paths.folder, width, height, options.graphics_profile)
-            }
-            (GameRenderer::Glide, None) if d2gl::configuration_absent(&paths.folder) => {
-                DisplaySeed::ConfigurationAbsent
-            }
-            _ => DisplaySeed::NotRequested,
-        };
+        let display_seed = prepare_d2gl(&paths.folder, options, android_host())?;
         // How DirectDraw mode draws; a failure keeps PD2's own setting.
         if options.renderer == GameRenderer::DirectDraw
             && let Some(renderer) = options.direct_draw_renderer
@@ -1682,6 +1699,49 @@ mod tests {
         assert_eq!(
             game_dll_overrides(false),
             "winemenubuilder.exe=;winedbg.exe=d"
+        );
+    }
+
+    #[test]
+    fn only_an_android_glide_launch_pins_d2gls_dlls_and_it_waits_for_them() {
+        const PLANTED: &str = r#"{"screen": {"window_size_width": 800, "window_size_height": 600}, "other": {"load_dlls_late": "Save/notes.txt"}}"#;
+        let game = TempDir::new().unwrap();
+        let config = game.path().join("ProjectD2/d2gl.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let folder = Directory::open(game.path()).unwrap();
+        let glide = GameLaunchOptions::default().with_display_size(1280, 960);
+        let direct_draw =
+            GameLaunchOptions::new(GameRenderer::DirectDraw, true).with_display_size(1280, 960);
+        let stored = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&config).unwrap()).unwrap()
+        };
+
+        fs::write(&config, PLANTED).unwrap();
+        assert_eq!(
+            prepare_d2gl(&folder, direct_draw, true),
+            Ok(DisplaySeed::NotRequested)
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), PLANTED);
+        assert_eq!(prepare_d2gl(&folder, glide, false), Ok(DisplaySeed::Seeded));
+        assert_eq!(stored()["other"]["load_dlls_late"], "Save/notes.txt");
+
+        // The seed follows the pin and keeps its values.
+        fs::write(&config, PLANTED).unwrap();
+        assert_eq!(prepare_d2gl(&folder, glide, true), Ok(DisplaySeed::Seeded));
+        assert_eq!(stored()["other"]["load_dlls_late"], "SGD2FreeRes.dll");
+        assert_eq!(stored()["other"]["load_dlls_early"], "");
+        assert_eq!(stored()["screen"]["window_size_width"], 1280);
+
+        // A configuration that cannot be checked keeps the game from starting.
+        fs::remove_file(&config).unwrap();
+        fs::create_dir(&config).unwrap();
+        assert_eq!(
+            prepare_d2gl(&folder, glide, true),
+            Err(GameLaunchError::LaunchPreflightFailed)
+        );
+        assert_eq!(
+            prepare_d2gl(&folder, glide, false),
+            Ok(DisplaySeed::Skipped)
         );
     }
 

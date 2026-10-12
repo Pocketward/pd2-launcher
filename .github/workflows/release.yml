@@ -5,6 +5,14 @@
 # on a runner of its own architecture, and publishes them on the tag's GitHub
 # release with their SHA-256 and build evidence; workflow_dispatch does the same
 # for a given tag.
+#
+# A release candidate is built in the same way before its tag exists:
+# workflow_dispatch on the branch candidate, whose head is the release's commit
+# on top of main, with candidate set (gh workflow run release.yml --ref candidate
+# -f tag=vX.Y.Z -f candidate=true). It builds that head and publishes the files on
+# a draft release of the tag that targets it. To publish it, main moves to that
+# commit and publishing the draft makes the tag there; that push builds nothing,
+# because it finds no tag yet or the tag's release is published with its files.
 name: Release
 
 on:
@@ -15,6 +23,10 @@ on:
       tag:
         description: The release tag to build and publish
         required: true
+      candidate:
+        description: Build the head of the branch candidate as a draft release, before the tag exists
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,16 +41,46 @@ jobs:
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.commit.outputs.commit }}
+      candidate: ${{ steps.tag.outputs.candidate }}
     steps:
+      # The whole history: a candidate's commit must have main in its history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Find the release tag
         id: tag
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_CANDIDATE: ${{ inputs.candidate }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
-          if [[ -n $INPUT_TAG ]]; then
+          # The published release of a tag as JSON, nothing when there is none (HTTP 404); any other
+          # error fails. gh writes an error's body to standard output.
+          published() {
+            local body
+            if body=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$1" 2>/dev/null); then
+              echo "$body"
+            elif [[ $(jq -r '.status // empty' <<<"$body" 2>/dev/null) != 404 ]]; then
+              echo "cannot read the release $1: $body" >&2
+              return 1
+            fi
+          }
+          candidate=
+          # A candidate: the head of the branch candidate, before its tag exists.
+          if [[ $INPUT_CANDIDATE == true ]]; then
+            [[ $GITHUB_REF == refs/heads/candidate ]] ||
+              { echo "a candidate is built on the branch candidate, not $GITHUB_REF" >&2; exit 1; }
+            [[ $INPUT_TAG =~ $pattern ]] || { echo "not a release tag: $INPUT_TAG" >&2; exit 1; }
+            refs=$(git ls-remote --tags origin "refs/tags/$INPUT_TAG")
+            [[ -z $refs ]] || { echo "the tag $INPUT_TAG exists; a candidate is built before its tag" >&2; exit 1; }
+            release=$(published "$INPUT_TAG")
+            [[ -z $release ]] || { echo "the release $INPUT_TAG is published" >&2; exit 1; }
+            tag=$INPUT_TAG
+            candidate=true
+          elif [[ -n $INPUT_TAG ]]; then
             [[ $INPUT_TAG =~ $pattern ]] || { echo "not a release tag: $INPUT_TAG" >&2; exit 1; }
             git ls-remote --exit-code --tags origin "refs/tags/$INPUT_TAG" >/dev/null ||
               { echo "no tag $INPUT_TAG" >&2; exit 1; }
@@ -52,9 +94,36 @@ jobs:
               [[ -n $tag || $attempt == 3 ]] && break
               sleep 10
             done
+            # A published candidate: main has moved to its commit, and publishing its draft put the
+            # tag there; the release has its files.
+            if [[ -n $tag ]]; then
+              release=$(published "$tag")
+              files=0
+              [[ -z $release ]] || files=$(jq '.assets | length' <<<"$release")
+              if [[ $files != 0 ]]; then
+                echo "the release $tag is published with $files files: nothing to build"
+                tag=
+              fi
+            fi
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "release tag: ${tag:-none (not a release)}"
+          echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
+          echo "release tag: ${tag:-none (not a release)}${candidate:+ (a candidate)}"
+
+      # A candidate builds the commit the run started from. It must still be on the branch
+      # candidate, and main must be in its history, so that main can later move to it by a
+      # fast-forward.
+      - name: Check the candidate's commit
+        id: commit
+        if: steps.tag.outputs.candidate == 'true'
+        run: |
+          git fetch -q origin "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/candidate:refs/remotes/origin/candidate"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/candidate ||
+            { echo "::error::$GITHUB_SHA is no longer on the branch candidate"; exit 1; }
+          git merge-base --is-ancestor refs/remotes/origin/main "$GITHUB_SHA" ||
+            { echo "::error::main is not in the history of $GITHUB_SHA"; exit 1; }
+          echo "commit=$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT"
 
   executable:
     needs: tag
@@ -71,7 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.tag.outputs.tag }}
+          ref: ${{ needs.tag.outputs.candidate == 'true' && needs.tag.outputs.commit || needs.tag.outputs.tag }}
 
       - name: Build the release executable
         env:
@@ -97,6 +166,8 @@ jobs:
       contents: write
     env:
       TAG: ${{ needs.tag.outputs.tag }}
+      COMMIT: ${{ needs.tag.outputs.commit }}
+      CANDIDATE: ${{ needs.tag.outputs.candidate }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -108,6 +179,19 @@ jobs:
         working-directory: dist
         run: sha256sum --check --strict pd2-launcher-*.sha256
 
+      # A candidate is published as a draft only while its tag does not exist: publishing the
+      # draft makes it.
+      - name: Check the tag still does not exist
+        if: needs.tag.outputs.candidate == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!gh auth git-credential'
+        run: |
+          refs=$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "refs/tags/$TAG")
+          [[ -z $refs ]] || { echo "::error::the tag $TAG exists now; a candidate is published before its tag"; exit 1; }
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -115,7 +199,21 @@ jobs:
           prerelease=()
           [[ $TAG == *-* ]] && prerelease=(--prerelease)
           notes="PD2 Launcher $TAG: the standalone executables for x86-64 and ARM64 PCs (\`chmod +x\` and run), each with its SHA-256 and build evidence."
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [[ -n $CANDIDATE ]]; then
+            # A candidate's files go on a draft release only, which targets the commit built.
+            if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1); then
+              [[ $draft == true ]] ||
+                { echo "::error::the release $TAG is published; a candidate replaces the files of a draft only"; exit 1; }
+              gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --notes "$notes"
+            elif [[ $draft != "release not found" ]]; then
+              echo "::error::cannot read the release $TAG: $draft"
+              exit 1
+            else
+              gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft --target "$COMMIT" \
+                --title "$TAG" --notes "$notes" "${prerelease[@]}"
+            fi
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \

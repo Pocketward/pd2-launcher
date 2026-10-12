@@ -51,7 +51,9 @@ static ANDROID_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// The Launcher engine runs on the Android host: [`safe_fs`] avoids
 /// `openat2` and opens `home`'s ancestors search-only, Wine's guests also
 /// keep the Android values and load the XInput bridge, and a missing D2GL
-/// configuration is written before the first Glide launch.
+/// configuration is written before the first Glide launch (an existing one
+/// is made full screen with the cursor unlocked), and the DLLs it names are
+/// set to PD2's own before D2GL can start.
 pub(crate) fn use_android_host(home: Option<&std::path::Path>) {
     safe_fs::use_android_host(home);
     ANDROID_HOST.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -89,8 +89,9 @@ const CHILD_VENDOR_UI_HELPER_FD: i32 = 237;
 const WINE_DLL_OVERRIDES: &str = "winemenubuilder.exe=;dsound=;winedbg.exe=d";
 const PREFIX_INITIALIZATION_DLL_OVERRIDES: &str =
     "winemenubuilder.exe=;dsound=;mscoree=;mshtml=;winedbg.exe=d";
-/// FEX settings for every x86 program on ARM64 (installers and the game):
-/// strict x86 memory ordering, full x87 precision, one block at a time.
+/// FEX settings for every x86 program on ARM64 (installers, the official
+/// launcher and the game): strict x86 memory ordering, full x87 precision,
+/// one block at a time.
 /// Slower, but old 32-bit programs (PD2's winmpq.exe, Diablo II's own x87
 /// code) crash without them, and the game is light enough not to need the
 /// speed. FEX reads them from the environment, both run as a Linux translator
@@ -2422,6 +2423,11 @@ impl ProductionInstallDriver {
                     crate::process::game_dll_overrides(crate::android_host()),
                     Kind::Preference,
                 ));
+                // Its .NET runtime is multithreaded x86 code that relies on
+                // x86 memory ordering (JIT-compiled code, the garbage
+                // collector, the thread pool), and a game it starts inherits
+                // this environment.
+                settings.extend(fex_strict_settings());
                 // Only where its .NET runs translated by FEX (ARM64); on
                 // x86-64 it runs natively and needs neither.
                 if TRANSLATED_DOTNET {
@@ -3609,6 +3615,18 @@ impl ProductionInstallDriver {
             && let Err(error) = crate::in_place_drive::link(paths.directory(), &folder)
         {
             eprintln!("pd2-launcher: the G: drive was not linked: {error}");
+        }
+        // It can start the game, whose D2GL loads the DLLs d2gl.json names:
+        // as before a Play, they must be PD2's own.
+        if crate::android_host()
+            && let Err(error) = paths
+                .open_game()
+                .and_then(|game| crate::process::pin_d2gl_dlls(&game))
+        {
+            eprintln!(
+                "pd2-launcher: official launcher not opened, d2gl.json may name other DLLs: {error}"
+            );
+            return Err(AdapterFailure::here());
         }
         if control.is_cancelled() {
             return Err(AdapterFailure::here());
@@ -7616,6 +7634,14 @@ mod tests {
             environment_value(launcher, "DOTNET_TieredCompilation"),
             translated
         );
+        // FEX's strict settings, as for the installers and the game (ARM64).
+        for (name, value) in FEX_STRICT_ENVIRONMENT {
+            assert_eq!(
+                environment_value(launcher, name),
+                cfg!(target_arch = "aarch64").then_some(OsStr::new(value)),
+                "{name}"
+            );
+        }
         assert_launcher_cache_home(launcher, &paths);
         // Its exit is followed by waiting for everything it started.
         assert_wineserver_wait_profile(&requests[3], &paths);

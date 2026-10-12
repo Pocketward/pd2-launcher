@@ -6,19 +6,27 @@
 //! the first fullscreen launch fill the monitor. Any other stored size was
 //! chosen by the player or by D2GL itself and is never touched.
 //!
-//! The configuration is user-owned, so every failure skips the seed and the
-//! launch continues unchanged.
+//! The configuration is user-owned, so every failure of the seed skips it and
+//! the launch continues unchanged.
 //!
 //! On the Android host a handheld cannot toggle Fullscreen comfortably, so
 //! when D2GL has not written its configuration yet the Launcher writes one
 //! (fixed first-launch settings, viewport = the X screen) before the first
 //! Glide launch. The desktop never creates it.
 //! There an existing configuration's window size also follows the X screen,
-//! whose size the app owns, and the app's graphics profile
-//! ([`GraphicsProfile`]) sets its few `graphics` values when it is not the
-//! profile last applied ([`PROFILE_RECORD`]); nothing else in it is touched
-//! (the player changes D2GL's graphics in the game, Ctrl+O, and those changes
-//! stay until the profile changes).
+//! whose size the app owns, its cursor and full-screen values are the first
+//! launch's ([`ANDROID_SCREEN`]: an imported one keeps a desktop player's,
+//! often windowed with a locked cursor, which the X screen cannot use), and
+//! the app's graphics profile ([`GraphicsProfile`]) sets its few `graphics`
+//! values when it is not the profile last applied ([`PROFILE_RECORD`]);
+//! nothing else in it is touched (the player changes D2GL's graphics in the
+//! game, Ctrl+O, and those changes stay until the profile changes).
+//!
+//! D2GL also loads the DLLs its configuration names (`load_dlls_early`,
+//! `load_dlls_late`) into the game. On the Android host other apps the player
+//! lets into the game folder can edit the configuration, so before D2GL can
+//! start the Launcher sets both to the values PD2 ships ([`pin_dlls`]), and
+//! the game does not start when it cannot.
 
 use std::{
     ffi::OsStr,
@@ -37,7 +45,10 @@ use crate::safe_fs::Directory;
 /// ProjectD2 below the game folder (the Managed one, or one used in place).
 const PROJECT_D2: &str = "ProjectD2";
 const CONFIG: &str = "d2gl.json";
-const STAGED: &str = "d2gl.json.pd2launcher-seed";
+const BACKUP: &str = "d2gl.json.bak";
+/// The new configuration before its rename. Other apps on the Android host
+/// cannot reach a name with the `.pd2launcher` prefix in the game folder.
+const STAGED: &str = ".pd2launcher-d2gl.json.staged";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const DEFAULT_SIZE: (u64, u64) = (800, 600);
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -48,6 +59,33 @@ const LAUNCHER_FOLDER: &str = ".pd2launcher";
 /// `d2gl.json`, by name. It lives and goes with the game folder, so a new
 /// installation or an imported one gets the profile at its first Play.
 const PROFILE_RECORD: &str = "d2gl-profile";
+
+/// The `screen` values the Android host writes into every configuration, a
+/// new one and an existing one alike, because the game on the X screen
+/// needs them. An imported configuration holds a desktop player's
+/// choices, made for a real X server and window manager; on the desktop
+/// they stand.
+const ANDROID_SCREEN: [(&str, Value); 3] = [
+    // Unlocked: D2GL's ClipCursor puts Wine in pointer-clipping mode, where
+    // the X screen's XTEST pointer does not move the game's cursor and the
+    // first click after a start is lost.
+    ("unlock_cursor", Value::Bool(true)),
+    // Full screen: Xvfb has no window manager, so Wine places a windowed
+    // game as if one framed it, below a caption and partly off the X screen.
+    ("window_fullscreen", Value::Bool(true)),
+    // D2GL minimizes a full-screen game that loses focus when this is on,
+    // and the X screen has no taskbar or window manager to bring it back.
+    ("auto_minimize", Value::Bool(false)),
+];
+
+/// The `other` values naming the DLLs D2GL loads, as PD2 ships them: the
+/// defaults of PD2's D2GL build, which it writes into a new configuration.
+fn shipped_dlls() -> [(&'static str, Value); 2] {
+    [
+        ("load_dlls_early", Value::from("")),
+        ("load_dlls_late", Value::from("SGD2FreeRes.dll")),
+    ]
+}
 
 /// D2GL's graphics profile, which the Android app sends with each Play (its
 /// Settings → Game → Graphics profile, Automatic already resolved). The
@@ -95,7 +133,9 @@ pub(crate) enum DisplaySeed {
     /// D2GL has not written its configuration yet, so this is its first
     /// launch and nothing can be seeded; D2GL opens at its 800x600 default.
     ConfigurationAbsent,
-    /// The default 800x600 size was replaced with the detected display size.
+    /// The default 800x600 size was replaced with the detected display size
+    /// (on the Android host: the configuration was written, or its window
+    /// size, screen values or graphics profile were).
     Seeded,
     /// The configuration could not be read, parsed, or replaced safely.
     Skipped,
@@ -122,6 +162,113 @@ pub(super) fn configuration_absent(game: &Directory) -> bool {
         .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
+/// Sets `d2gl.json`'s DLLs to [`shipped_dlls`]'s values, every other byte
+/// as it is; the Android host calls it before anything that can start D2GL.
+///
+/// The configuration is written anew even when it has them already, so a
+/// descriptor another app opened before no longer reaches the file D2GL
+/// reads. One that cannot be edited (not JSON, over the size limit, or the
+/// values not uniquely addressable) is replaced with its backup,
+/// [`BACKUP`], with these values, as D2GL itself falls back to the backup
+/// for a configuration it cannot parse (an unchecked backup would name any
+/// DLL too); it is removed when the backup cannot be edited either, and
+/// without a configuration D2GL starts from its defaults, which are these
+/// values. Other spellings of the name go first ([`remove_spellings`]).
+///
+/// An error means the configuration may still name other DLLs, so D2GL
+/// must not start.
+pub(crate) fn pin_dlls(game: &Directory) -> io::Result<()> {
+    let project = game.open_directory(Path::new(PROJECT_D2))?;
+    remove_spellings(&project)?;
+    let config = match project.open_file(Path::new(CONFIG)) {
+        Ok(config) => config,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let edited = read_limited(&config).and_then(|raw| {
+        let pinned = pinned(&raw)?;
+        Ok((pinned != raw, pinned))
+    });
+    match edited {
+        Ok((changed, bytes)) => {
+            if changed {
+                eprintln!("pd2-launcher: d2gl.json names only the DLLs PD2 ships");
+            }
+            replace(&project, &config, &bytes)
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            let backup = project
+                .open_file(Path::new(BACKUP))
+                .and_then(|backup| read_limited(&backup))
+                .and_then(|raw| pinned(&raw));
+            if let Ok(bytes) = backup {
+                eprintln!("pd2-launcher: d2gl.json is its backup with PD2's DLLs: {error}");
+                replace(&project, &config, &bytes)
+            } else {
+                eprintln!(
+                    "pd2-launcher: d2gl.json removed, D2GL starts from its defaults: {error}"
+                );
+                remove(&project, &config)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `raw` with [`shipped_dlls`]'s values. serde_json and D2GL's JSON library
+/// both keep the last of repeated keys, so the values checked here are the
+/// ones D2GL reads.
+fn pinned(raw: &[u8]) -> io::Result<Vec<u8>> {
+    Ok(set_values(raw, "other", &shipped_dlls())?.unwrap_or_else(|| raw.to_vec()))
+}
+
+/// Removes the names in ProjectD2 other than `d2gl.json` that Wine takes for
+/// it, the same letters in another case: Wine opens one of them when
+/// `d2gl.json` itself is missing. A folder among them is an error.
+fn remove_spellings(project: &Directory) -> io::Result<()> {
+    let config = wine_upper(CONFIG);
+    let directory = project.try_clone_file()?;
+    for name in project.names()? {
+        if name == CONFIG || name.to_str().map(wine_upper).as_ref() != Some(&config) {
+            continue;
+        }
+        rustix::fs::unlinkat(&directory, name.as_os_str(), AtFlags::empty())?;
+        eprintln!(
+            "pd2-launcher: ProjectD2/{} removed, which Wine would read as d2gl.json",
+            name.to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
+/// `name` as Wine compares names that differ only in case: each character
+/// upper-cased on its own (one whose capital takes more than one character
+/// stays as it is). This matches Wine for an ASCII name like `d2gl.json`.
+fn wine_upper(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            let mut upper = character.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(capital), None) => capital,
+                _ => character,
+            }
+        })
+        .collect()
+}
+
+/// Reads the configuration, refusing one over [`MAX_CONFIG_BYTES`].
+fn read_limited(config: &File) -> io::Result<Vec<u8>> {
+    if config.metadata()?.len() > MAX_CONFIG_BYTES {
+        return Err(invalid("D2GL configuration exceeded its size limit"));
+    }
+    let mut raw = Vec::new();
+    config.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(invalid("D2GL configuration exceeded its size limit"));
+    }
+    Ok(raw)
+}
+
 fn seed_config(
     game: &Directory,
     width: u32,
@@ -145,25 +292,33 @@ fn seed_config(
         }
         Err(error) => return Err(error),
     };
-    if config.metadata()?.len() > MAX_CONFIG_BYTES {
-        return Err(invalid("D2GL configuration exceeded its size limit"));
-    }
-    let mut raw = Vec::new();
-    (&config).take(MAX_CONFIG_BYTES + 1).read_to_end(&mut raw)?;
-    if raw.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(invalid("D2GL configuration exceeded its size limit"));
-    }
+    let raw = read_limited(&config)?;
     // A profile is written only when it is not the one last applied, so the
     // player's own changes in the game stay until the profile changes.
     let changed = profile.filter(|profile| applied_profile(&project) != Some(*profile));
-    // The window size and the profile stand alone: one that cannot address
-    // the configuration never keeps the other from being written. A profile
-    // that cannot be written is not recorded, so the next Play tries again.
+    // The window size, the Android screen values and the profile stand
+    // alone: one that cannot address the configuration never keeps the
+    // others from being written. A profile that cannot be written is not
+    // recorded, so the next Play tries again.
     let seeded = seeded_config(&raw, width, height, android);
     let base = match &seeded {
         Ok(Some(seeded)) => seeded.as_slice(),
         _ => &raw,
     };
+    // On the Android host an existing configuration gets the first launch's
+    // cursor and full-screen values too: an imported one keeps a desktop
+    // player's, with which the game loses the first click after each start
+    // and runs windowed partly off the X screen.
+    let screened = if android {
+        set_values(base, "screen", &ANDROID_SCREEN).unwrap_or_else(|error| {
+            eprintln!("pd2-launcher: d2gl.json keeps its cursor and full-screen settings: {error}");
+            None
+        })
+    } else {
+        None
+    };
+    let screen_written = screened.is_some();
+    let base = screened.as_deref().unwrap_or(base);
     let profiled = changed.and_then(|profile| match profiled_config(base, profile) {
         Ok(profiled) => Some((profile, profiled)),
         Err(error) => {
@@ -175,17 +330,21 @@ fn seed_config(
         }
     });
     let (applied, profiled) = profiled.unzip();
-    let written = match (profiled.flatten(), seeded) {
-        // The profile's edit was made on the seeded bytes.
-        (profiled, Ok(seeded)) => profiled.or(seeded),
+    // Each edit was made on the bytes of the ones before it.
+    let edited = profiled.flatten().or(screened);
+    let written = match (edited, seeded) {
+        (edited, Ok(seeded)) => edited.or(seeded),
         (None, Err(error)) if applied.is_none() => return Err(error),
-        (profiled, Err(error)) => {
+        (edited, Err(error)) => {
             eprintln!("pd2-launcher: d2gl.json keeps its window size: {error}");
-            profiled
+            edited
         }
     };
     if let Some(bytes) = &written {
         replace(&project, &config, bytes)?;
+    }
+    if screen_written {
+        eprintln!("pd2-launcher: d2gl.json is full screen with the cursor unlocked");
     }
     if let Some(profile) = applied {
         record_profile(&project, profile);
@@ -234,33 +393,42 @@ fn record_profile(project: &Directory, profile: GraphicsProfile) {
 }
 
 /// Returns the configuration with `profile`'s `graphics` values set, or
-/// `None` when it has them already. Present values are replaced in place and
-/// missing ones inserted at the start of `graphics` (or a new `graphics`), so
-/// every other byte stays as it is.
+/// `None` when it has them already ([`set_values`]).
 fn profiled_config(raw: &[u8], profile: GraphicsProfile) -> io::Result<Option<Vec<u8>>> {
+    set_values(raw, "graphics", &profile.values())
+}
+
+/// Returns the configuration with `values` set in its `section` object, or
+/// `None` when it has them already. Present values are replaced in place and
+/// missing ones inserted at the start of the section (or of the
+/// configuration, in a new section), so every other byte stays as it is.
+fn set_values(raw: &[u8], section: &str, values: &[(&str, Value)]) -> io::Result<Option<Vec<u8>>> {
     let (bom, body) = match raw.strip_prefix(UTF8_BOM) {
         Some(body) => (UTF8_BOM, body),
         None => (&[][..], raw),
     };
     let original: Value =
         serde_json::from_slice(body).map_err(|_| invalid("D2GL configuration was not JSON"))?;
-    let values = profile.values();
     let mut expected = original.clone();
-    let graphics = expected
+    let object = expected
         .as_object_mut()
         .ok_or_else(|| invalid("D2GL configuration was not an object"))?
-        .entry("graphics")
+        .entry(section)
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| invalid("D2GL graphics was not an object"))?;
-    for (key, value) in &values {
-        graphics.insert((*key).to_owned(), value.clone());
+        .ok_or_else(|| invalid(format!("D2GL {section} was not an object")))?;
+    for (key, value) in values {
+        object.insert((*key).to_owned(), value.clone());
     }
     if expected == original {
         return Ok(None);
     }
 
-    let unaddressable = || invalid("D2GL graphics were not uniquely addressable");
+    let unaddressable = || {
+        invalid(format!(
+            "D2GL {section} values were not uniquely addressable"
+        ))
+    };
     let mut scanner = Scanner { bytes: body, at: 0 };
     let top = scanner.object_members().ok_or_else(unaddressable)?;
     // (span, text): spans are disjoint; an insertion is an empty span.
@@ -277,15 +445,15 @@ fn profiled_config(raw: &[u8], profile: GraphicsProfile) -> io::Result<Option<Ve
         }
     };
     let rendered = |key: &str, value: &Value| format!("\"{key}\": {value}");
-    match member(&top, b"graphics")? {
-        Some(graphics) => {
+    match member(&top, section.as_bytes())? {
+        Some(span) => {
             let mut scanner = Scanner {
                 bytes: body,
-                at: graphics.start,
+                at: span.start,
             };
             let members = scanner.object_members().ok_or_else(unaddressable)?;
             let mut missing = Vec::new();
-            for (key, value) in &values {
+            for (key, value) in values {
                 match member(&members, key.as_bytes())? {
                     Some(span) => edits.push((span, value.to_string())),
                     None => missing.push(rendered(key, value)),
@@ -296,7 +464,7 @@ fn profiled_config(raw: &[u8], profile: GraphicsProfile) -> io::Result<Option<Ve
                 if !members.is_empty() {
                     text.push_str(", ");
                 }
-                let open = graphics.start + 1;
+                let open = span.start + 1;
                 edits.push((open..open, text));
             }
         }
@@ -311,7 +479,7 @@ fn profiled_config(raw: &[u8], profile: GraphicsProfile) -> io::Result<Option<Ve
                 .map(|(key, value)| rendered(key, value))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut text = format!("\"graphics\": {{{members}}}");
+            let mut text = format!("\"{section}\": {{{members}}}");
             if !top.is_empty() {
                 text.push_str(", ");
             }
@@ -319,22 +487,22 @@ fn profiled_config(raw: &[u8], profile: GraphicsProfile) -> io::Result<Option<Ve
         }
     }
     edits.sort_by_key(|(span, _)| span.start);
-    let mut profiled = bom.to_vec();
+    let mut edited = bom.to_vec();
     let mut cursor = 0;
     for (span, text) in edits {
-        profiled.extend_from_slice(&body[cursor..span.start]);
-        profiled.extend_from_slice(text.as_bytes());
+        edited.extend_from_slice(&body[cursor..span.start]);
+        edited.extend_from_slice(text.as_bytes());
         cursor = span.end;
     }
-    profiled.extend_from_slice(&body[cursor..]);
+    edited.extend_from_slice(&body[cursor..]);
 
-    // The textual splice must change exactly the profile's values.
-    let observed: Value = serde_json::from_slice(&profiled[bom.len()..])
-        .map_err(|_| invalid("profiled D2GL configuration was not JSON"))?;
+    // The textual splice must change exactly the given values.
+    let observed: Value = serde_json::from_slice(&edited[bom.len()..])
+        .map_err(|_| invalid("edited D2GL configuration was not JSON"))?;
     if observed != expected {
-        return Err(invalid("profiled D2GL configuration changed other values"));
+        return Err(invalid("edited D2GL configuration changed other values"));
     }
-    Ok(Some(profiled))
+    Ok(Some(edited))
 }
 
 /// Returns the configuration with only the default window size replaced, or
@@ -562,9 +730,25 @@ fn replace(project: &Directory, original: &File, bytes: &[u8]) -> io::Result<()>
     result
 }
 
+/// Removes `d2gl.json`, only while the name still denotes the descriptor
+/// that was read. No lookup follows a symlink.
+fn remove(project: &Directory, original: &File) -> io::Result<()> {
+    let directory = project.try_clone_file()?;
+    let read = original.metadata()?;
+    let current = rustix::fs::statat(&directory, CONFIG, AtFlags::SYMLINK_NOFOLLOW)?;
+    if current.st_dev != read.dev() || current.st_ino != read.ino() {
+        return Err(io::Error::other(
+            "D2GL configuration changed while it was read",
+        ));
+    }
+    rustix::fs::unlinkat(&directory, CONFIG, AtFlags::empty())?;
+    directory.sync_all()
+}
+
 /// The Android host's first-launch D2GL settings: the fullscreen viewport
-/// set to the X screen, D2GL's corner mini map off, and `profile`'s graphics
-/// values. The player changes them in the game (Ctrl+O).
+/// set to the X screen, D2GL's corner mini map off, and [`ANDROID_SCREEN`]'s,
+/// [`shipped_dlls`]' and `profile`'s values. The player changes them in the
+/// game (Ctrl+O); [`ANDROID_SCREEN`]'s are set again at the next Play.
 fn first_launch_config(width: u32, height: u32, profile: GraphicsProfile) -> Vec<u8> {
     let mut config = json!({
         "screen": {
@@ -573,9 +757,8 @@ fn first_launch_config(width: u32, height: u32, profile: GraphicsProfile) -> Vec
             "window_centered": true,
             "window_position_x": 0,
             "window_position_y": 0,
-            // Unlocked: D2GL's ClipCursor puts Wine in pointer-clipping
-            // mode, where the X screen's XTEST pointer does not move the
-            // game's cursor and the first click after a start is lost.
+            // These three keep their place here; their values are
+            // ANDROID_SCREEN's, set below.
             "unlock_cursor": true,
             "window_fullscreen": true,
             "window_vsync": true,
@@ -620,10 +803,18 @@ fn first_launch_config(width: u32, height: u32, profile: GraphicsProfile) -> Vec
             "gl_ver_minor": 6,
             "use_compute_shader": false,
             "frame_latency": 1,
+            // These two keep their place here; their values are
+            // shipped_dlls()'s, set below.
             "load_dlls_early": "",
-            "load_dlls_late": "SGD2FreeRes.dll"
+            "load_dlls_late": ""
         }
     });
+    for (key, value) in ANDROID_SCREEN {
+        config["screen"][key] = value;
+    }
+    for (key, value) in shipped_dlls() {
+        config["other"][key] = value;
+    }
     for (key, value) in profile.values() {
         config["graphics"][key] = value;
     }
@@ -663,7 +854,7 @@ fn create(project: &Directory, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn invalid(message: &'static str) -> io::Error {
+fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
@@ -996,13 +1187,28 @@ mod tests {
                 fs::write(folder.join(PROFILE_RECORD), record).unwrap();
             }
             assert_eq!(
-                seed_config(&root, 800, 600, true, Some(GraphicsProfile::Performance)).unwrap(),
+                seed_config(&root, 1280, 960, true, Some(GraphicsProfile::Performance)).unwrap(),
                 DisplaySeed::Seeded
             );
             let written = String::from_utf8(read_config(&temporary)).unwrap();
             assert_eq!(
                 written,
                 DEFAULT_CONFIG
+                    .replacen(
+                        "\"window_size_width\": 800",
+                        "\"window_size_width\": 1280",
+                        1
+                    )
+                    .replacen(
+                        "\"window_size_height\": 600",
+                        "\"window_size_height\": 960",
+                        1
+                    )
+                    .replacen(
+                        "\"screen\": {",
+                        "\"screen\": {\"unlock_cursor\": true, \"auto_minimize\": false, ",
+                        1
+                    )
                     .replacen(
                         "\"graphics\": {",
                         "\"graphics\": {\"sharpen\": false, \"bloom\": false, ",
@@ -1022,7 +1228,7 @@ mod tests {
         // Graphics that are not an object: the window size still follows the
         // X screen, and nothing is recorded, so the next Play tries again.
         let (temporary, root) = managed_root(Some(
-            br#"{"screen": {"window_size_width": 1604, "window_size_height": 720}, "graphics": null}"#,
+            br#"{"screen": {"window_size_width": 1604, "window_size_height": 720, "unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "graphics": null}"#,
         ));
         assert_eq!(
             seed_config(&root, 1068, 480, true, Some(GraphicsProfile::Performance)).unwrap(),
@@ -1030,12 +1236,12 @@ mod tests {
         );
         assert_eq!(
             read_config(&temporary),
-            br#"{"screen": {"window_size_width": 1068, "window_size_height": 480}, "graphics": null}"#
+            br#"{"screen": {"window_size_width": 1068, "window_size_height": 480, "unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "graphics": null}"#
         );
         assert!(!record_path(&temporary).exists());
 
         // A window size that is not addressable: the profile is still written.
-        let ambiguous = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "window_size_width": 800}, "graphics": {}}"#;
+        let ambiguous = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "window_size_width": 800, "unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "graphics": {}}"#;
         let (temporary, root) = managed_root(Some(ambiguous.as_bytes()));
         assert!(seed_config(&root, 1068, 480, true, None).is_err());
         assert_eq!(
@@ -1152,6 +1358,194 @@ mod tests {
         assert!(!record_path(&temporary).exists());
     }
 
+    /// A desktop player's configuration, as an import from a PC brings it:
+    /// windowed, with D2GL's locked cursor, their own fps limit, FXAA, corner
+    /// mini map and fps counter.
+    const IMPORTED_CONFIG: &str = r#"{
+    "screen": {
+        "window_size_width": 3840,
+        "window_size_height": 2160,
+        "window_centered": true,
+        "unlock_cursor": false,
+        "window_fullscreen": false,
+        "foreground_fps_value": 123,
+        "auto_minimize": false,
+        "window_dark_mode": true
+    },
+    "graphics": {
+        "shader_preset": "anti-aliasing\\advanced-aa.slangp",
+        "fxaa": true
+    },
+    "features": {
+        "mini_map": true,
+        "show_fps": true
+    }
+}"#;
+
+    #[test]
+    fn the_android_host_makes_an_imported_configuration_full_screen_with_the_cursor_unlocked() {
+        // With the locked cursor the first click after each start is lost on
+        // the X screen, and the window is placed partly off it; the window
+        // size follows the X screen.
+        let (temporary, root) = managed_root(Some(IMPORTED_CONFIG.as_bytes()));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Seeded
+        );
+        let expected = IMPORTED_CONFIG
+            .replacen(
+                "\"window_size_width\": 3840",
+                "\"window_size_width\": 1280",
+                1,
+            )
+            .replacen(
+                "\"window_size_height\": 2160",
+                "\"window_size_height\": 960",
+                1,
+            )
+            .replacen("\"unlock_cursor\": false", "\"unlock_cursor\": true", 1)
+            .replacen(
+                "\"window_fullscreen\": false",
+                "\"window_fullscreen\": true",
+                1,
+            );
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            expected
+        );
+
+        // Every other key stays as the player had it.
+        let written: Value = serde_json::from_slice(&read_config(&temporary)).unwrap();
+        let original: Value = serde_json::from_str(IMPORTED_CONFIG).unwrap();
+        assert_eq!(written["graphics"], original["graphics"]);
+        assert_eq!(written["features"], original["features"]);
+        assert_eq!(written["screen"]["foreground_fps_value"], 123);
+        assert_eq!(written["screen"]["window_dark_mode"], true);
+        assert!(!record_path(&temporary).exists());
+
+        // The next Play finds nothing to change.
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Unchanged
+        );
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_desktop_keeps_an_imported_configuration_as_the_player_set_it() {
+        // A real X server and window manager handle a locked cursor and a
+        // window, so the player's choices stand.
+        let (temporary, root) = managed_root(Some(IMPORTED_CONFIG.as_bytes()));
+        assert_eq!(
+            seed_config(&root, 1280, 960, false, None).unwrap(),
+            DisplaySeed::Unchanged
+        );
+        assert_eq!(read_config(&temporary), IMPORTED_CONFIG.as_bytes());
+        // The production entry decides by the host, which is the desktop here.
+        assert_eq!(seed(&root, 1280, 960, None), DisplaySeed::Unchanged);
+        assert_eq!(read_config(&temporary), IMPORTED_CONFIG.as_bytes());
+
+        // D2GL's untouched default size is still seeded, and only that.
+        let default_size = IMPORTED_CONFIG
+            .replacen("3840", "800", 1)
+            .replacen("2160", "600", 1);
+        let (temporary, root) = managed_root(Some(default_size.as_bytes()));
+        assert_eq!(seed(&root, 1280, 960, None), DisplaySeed::Seeded);
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            IMPORTED_CONFIG
+                .replacen("3840", "1280", 1)
+                .replacen("2160", "960", 1)
+        );
+    }
+
+    #[test]
+    fn the_android_screen_values_are_inserted_where_missing_and_stand_alone() {
+        // Missing values at the start of screen, present ones in place: a
+        // player's auto_minimize goes off with the game full screen.
+        let (temporary, root) = managed_root(Some(
+            br#"{"screen": {"window_size_width": 1280, "window_size_height": 960, "auto_minimize": true}, "other": {}}"#,
+        ));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Seeded
+        );
+        assert_eq!(
+            read_config(&temporary),
+            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "window_size_width": 1280, "window_size_height": 960, "auto_minimize": false}, "other": {}}"#
+        );
+
+        // No screen at all: a new one with just these values.
+        let (temporary, root) = managed_root(Some(br#"{"other": {}}"#));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Seeded
+        );
+        assert_eq!(
+            read_config(&temporary),
+            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "other": {}}"#
+        );
+
+        // A window size that is not addressable: the screen values are still
+        // written.
+        let ambiguous = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "window_size_width": 800}}"#;
+        let (temporary, root) = managed_root(Some(ambiguous.as_bytes()));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Seeded
+        );
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            ambiguous.replacen(
+                "\"screen\": {",
+                "\"screen\": {\"unlock_cursor\": true, \"window_fullscreen\": true, \"auto_minimize\": false, ",
+                1
+            )
+        );
+
+        // Screen values that are not addressable (a key twice): the window
+        // size is still written, and the rest stays.
+        let twice = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "unlock_cursor": false, "unlock_cursor": false}}"#;
+        let (temporary, root) = managed_root(Some(twice.as_bytes()));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Seeded
+        );
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            twice.replacen("800", "1280", 1).replacen("600", "960", 1)
+        );
+
+        // A screen that is not an object: it stays, and the profile is still
+        // written.
+        let (temporary, root) = managed_root(Some(br#"{"screen": null, "graphics": {}}"#));
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, None).unwrap(),
+            DisplaySeed::Unchanged
+        );
+        assert_eq!(
+            seed_config(&root, 1280, 960, true, Some(GraphicsProfile::Performance)).unwrap(),
+            DisplaySeed::Seeded
+        );
+        assert_eq!(
+            read_config(&temporary),
+            br#"{"screen": null, "graphics": {"shader_preset": "bilinear.slangp", "sharpen": false, "bloom": false}}"#
+        );
+    }
+
+    #[test]
+    fn the_first_launch_has_the_android_screen_values() {
+        let first: Value =
+            serde_json::from_slice(&first_launch_config(1280, 960, GraphicsProfile::Default))
+                .unwrap();
+        for (key, value) in ANDROID_SCREEN {
+            assert_eq!(first["screen"][key], value, "{key}");
+        }
+    }
+
     #[test]
     fn graphics_the_player_chose_stay_without_a_profile() {
         // Only the window size follows the X screen.
@@ -1253,5 +1647,197 @@ mod tests {
 
         assert_eq!(seed(&root, 3840, 2560, None), DisplaySeed::Skipped);
         assert_eq!(fs::read_to_string(outside).unwrap(), DEFAULT_CONFIG);
+    }
+
+    /// The `other` section as PD2's D2GL writes it.
+    const PD2_OTHER: &str = r#""other": {
+        "gl_ver_major": 4,
+        "gl_ver_minor": 6,
+        "use_compute_shader": false,
+        "frame_latency": 1,
+        "load_dlls_early": "",
+        "load_dlls_late": "SGD2FreeRes.dll"
+    }"#;
+
+    fn pd2_config(other: &str) -> String {
+        format!(
+            "{{\n    \"screen\": {{\n        \"window_size_width\": 1068,\n        \"unlock_cursor\": true\n    }},\n    {other}\n}}"
+        )
+    }
+
+    #[test]
+    fn the_dlls_are_set_to_pd2s_own_and_every_other_byte_stays() {
+        // Another app pointed both at files it dropped in the game folder;
+        // D2GL loads a PE file whatever its name.
+        let planted = PD2_OTHER
+            .replacen(
+                "\"load_dlls_early\": \"\"",
+                "\"load_dlls_early\": \"Save/notes.txt\"",
+                1,
+            )
+            .replacen(
+                "\"SGD2FreeRes.dll\"",
+                "\"SGD2FreeRes.dll, filters/x.png:stdcall:_Init@0\"",
+                1,
+            );
+        let (temporary, root) = managed_root(Some(pd2_config(&planted).as_bytes()));
+        pin_dlls(&root).unwrap();
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            pd2_config(PD2_OTHER)
+        );
+
+        // Missing values go at the start of `other`, a missing `other` at
+        // the start of the configuration.
+        for (config, pinned) in [
+            (
+                r#"{"other": {"frame_latency": 2}}"#,
+                r#"{"other": {"load_dlls_early": "", "load_dlls_late": "SGD2FreeRes.dll", "frame_latency": 2}}"#,
+            ),
+            (
+                r#"{"screen": {}}"#,
+                r#"{"other": {"load_dlls_early": "", "load_dlls_late": "SGD2FreeRes.dll"}, "screen": {}}"#,
+            ),
+        ] {
+            let (temporary, root) = managed_root(Some(config.as_bytes()));
+            pin_dlls(&root).unwrap();
+            assert_eq!(read_config(&temporary), pinned.as_bytes());
+        }
+
+        // A byte order mark stays.
+        let (temporary, root) = managed_root(Some(b"\xEF\xBB\xBF{\"other\": {}}"));
+        pin_dlls(&root).unwrap();
+        assert_eq!(
+            read_config(&temporary),
+            b"\xEF\xBB\xBF{\"other\": {\"load_dlls_early\": \"\", \"load_dlls_late\": \"SGD2FreeRes.dll\"}}"
+        );
+    }
+
+    #[test]
+    fn pinned_dlls_are_written_anew_so_an_earlier_descriptor_misses_them() {
+        let (temporary, root) = managed_root(Some(pd2_config(PD2_OTHER).as_bytes()));
+        let path = temporary.path().join(PROJECT_D2).join(CONFIG);
+        let held = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let before = fs::metadata(&path).unwrap().ino();
+
+        pin_dlls(&root).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), before);
+        (&held)
+            .write_all(br#"{"other": {"load_dlls_late": "Save/notes.txt"}}"#)
+            .unwrap();
+        assert_eq!(read_config(&temporary), pd2_config(PD2_OTHER).as_bytes());
+        assert!(!temporary.path().join(PROJECT_D2).join(STAGED).exists());
+    }
+
+    #[test]
+    fn a_configuration_whose_dlls_cannot_be_set_becomes_its_backup_with_pd2s_dlls() {
+        // D2GL loads its backup in place of a configuration it cannot parse.
+        let mut oversized = pd2_config(PD2_OTHER).into_bytes();
+        oversized.resize(MAX_CONFIG_BYTES as usize + 1, b' ');
+        let unpinnable = [
+            b"{ not json".to_vec(),
+            oversized,
+            br#"{"other": {"load_dlls_late": "SGD2FreeRes.dll", "load_dlls_late": "Save/notes.txt"}}"#.to_vec(),
+            br#"{"other": {"load_dlls_lat\u0065": "Save/notes.txt"}}"#.to_vec(),
+            br#"{"other": {}, "\u006fther": {"load_dlls_early": "Save/notes.txt"}}"#.to_vec(),
+            br#"{"other": "load_dlls_late"}"#.to_vec(),
+            br#"{"other": null}"#.to_vec(),
+            b"[]".to_vec(),
+        ];
+        let planted_backup =
+            pd2_config(&PD2_OTHER.replacen("\"SGD2FreeRes.dll\"", "\"Save/notes.txt\"", 1));
+        for config in &unpinnable {
+            let (temporary, root) = managed_root(Some(config));
+            fs::write(
+                temporary.path().join(PROJECT_D2).join(BACKUP),
+                &planted_backup,
+            )
+            .unwrap();
+            pin_dlls(&root).unwrap();
+            assert_eq!(
+                String::from_utf8(read_config(&temporary)).unwrap(),
+                pd2_config(PD2_OTHER),
+                "{}",
+                String::from_utf8_lossy(config)
+            );
+        }
+
+        // Without a backup that can be edited it is removed, and D2GL starts
+        // from its defaults (PD2's DLLs).
+        for backup in [None, Some(&b"{ not json"[..])] {
+            let (temporary, root) = managed_root(Some(b"{ not json"));
+            if let Some(backup) = backup {
+                fs::write(temporary.path().join(PROJECT_D2).join(BACKUP), backup).unwrap();
+            }
+            pin_dlls(&root).unwrap();
+            assert!(!temporary.path().join(PROJECT_D2).join(CONFIG).exists());
+        }
+
+        // Repeated keys whose last is PD2's: what D2GL reads is already
+        // right, and the file stays as it is.
+        let repeated = br#"{"other": {"load_dlls_late": "Save/notes.txt", "load_dlls_late": "SGD2FreeRes.dll", "load_dlls_early": ""}}"#;
+        let (temporary, root) = managed_root(Some(repeated));
+        pin_dlls(&root).unwrap();
+        assert_eq!(read_config(&temporary), repeated);
+    }
+
+    #[test]
+    fn a_missing_configuration_stays_missing_and_one_that_is_no_file_stops_the_pin() {
+        let (temporary, root) = managed_root(None);
+        pin_dlls(&root).unwrap();
+        assert!(!temporary.path().join(PROJECT_D2).join(CONFIG).exists());
+
+        // D2GL cannot write a configuration over a folder and loads its
+        // backup instead.
+        let (temporary, root) = managed_root(None);
+        fs::create_dir(temporary.path().join(PROJECT_D2).join(CONFIG)).unwrap();
+        assert!(pin_dlls(&root).is_err());
+
+        let (temporary, root) = managed_root(None);
+        let outside = temporary.path().join("outside.json");
+        fs::write(&outside, DEFAULT_CONFIG).unwrap();
+        symlink(&outside, temporary.path().join(PROJECT_D2).join(CONFIG)).unwrap();
+        assert!(pin_dlls(&root).is_err());
+        assert_eq!(fs::read_to_string(outside).unwrap(), DEFAULT_CONFIG);
+    }
+
+    #[test]
+    fn other_spellings_of_the_configuration_are_removed() {
+        // Wine opens a name that differs only in case when d2gl.json itself
+        // is missing (`ſ` is a lowercase s).
+        let (temporary, root) = managed_root(None);
+        let project = temporary.path().join(PROJECT_D2);
+        for name in ["D2GL.json", "d2gl.JSON", "d2gl.jſon"] {
+            fs::write(
+                project.join(name),
+                br#"{"other": {"load_dlls_late": "Save/notes.txt"}}"#,
+            )
+            .unwrap();
+        }
+        for name in [BACKUP, "d2gl.jsonx", "d2gl.jßon"] {
+            fs::write(project.join(name), b"{}").unwrap();
+        }
+        pin_dlls(&root).unwrap();
+        let mut names = fs::read_dir(&project)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, [BACKUP, "d2gl.jsonx", "d2gl.jßon"]);
+
+        // A folder among them stops the pin.
+        fs::create_dir(project.join("D2GL.JSON")).unwrap();
+        assert!(pin_dlls(&root).is_err());
+    }
+
+    #[test]
+    fn the_first_launch_has_the_dlls_pd2_ships() {
+        let first: Value =
+            serde_json::from_slice(&first_launch_config(1280, 960, GraphicsProfile::Default))
+                .unwrap();
+        assert_eq!(first["other"]["load_dlls_early"], "");
+        assert_eq!(first["other"]["load_dlls_late"], "SGD2FreeRes.dll");
+        let pinned = first_launch_config(1280, 960, GraphicsProfile::Default);
+        assert_eq!(set_values(&pinned, "other", &shipped_dlls()).unwrap(), None);
     }
 }
