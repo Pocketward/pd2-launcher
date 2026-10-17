@@ -20,20 +20,107 @@ use sha2::{Digest as _, Sha256};
 
 /// The folder in the managed root.
 pub(crate) const DIRECTORY: &str = "fex";
-/// FEX's release in every package below.
-pub(crate) const FEX_VERSION: &str = "2609.1";
 const RECORD: &str = "installed.json";
 const RECORD_SCHEMA: u32 = 1;
 const ROOTFS_NAME: &str = "Ubuntu_24_04";
 const STAGING: &str = "fex.staging";
 const RETIRED: &str = "fex.retired";
 
+/// Every file the built-in FEX downloads, named in one place: FEX's release,
+/// and for each file its name on the project's mirror release, its size and
+/// SHA-256, and its upstream sources. A file is downloaded from the mirror
+/// first, then from each upstream source in order; every source must give
+/// the same bytes. The public repository's mirror workflow
+/// (`.github/workflows/mirror-fex.yml`) fills the mirror release from the
+/// upstream sources with the same checks.
+const PINS_JSON: &str = include_str!("builtin_fex_pins.json");
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pins {
+    schema: u32,
+    fex_version: &'static str,
+    mirror: Mirror,
+    files: Vec<PinnedFile>,
+}
+
+/// The GitHub release that holds a copy of every pinned file, unchanged.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Mirror {
+    repository: &'static str,
+    tag: &'static str,
+}
+
+/// One pinned file of the built-in FEX.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PinnedFile {
+    id: &'static str,
+    /// Its name on the mirror release.
+    name: &'static str,
+    size: u64,
+    sha256: &'static str,
+    /// Where FEX publishes it, in the order they are tried after the mirror.
+    upstream: Vec<&'static str>,
+    #[serde(skip)]
+    mirror_url: String,
+}
+
+impl PinnedFile {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn sha256(&self) -> &'static str {
+        self.sha256
+    }
+
+    /// The copy on the project's mirror release, tried first.
+    pub(crate) fn mirror_url(&'static self) -> &'static str {
+        &self.mirror_url
+    }
+
+    /// The upstream sources, tried in order after the mirror.
+    pub(crate) fn upstream(&'static self) -> &'static [&'static str] {
+        &self.upstream
+    }
+}
+
+fn pins() -> &'static Pins {
+    static PINS: std::sync::OnceLock<Pins> = std::sync::OnceLock::new();
+    PINS.get_or_init(|| {
+        let mut pins: Pins =
+            serde_json::from_str(PINS_JSON).expect("the built-in FEX's pins are valid JSON");
+        assert_eq!(pins.schema, 1, "the built-in FEX's pins have schema 1");
+        for file in &mut pins.files {
+            file.mirror_url = format!(
+                "https://github.com/{}/releases/download/{}/{}",
+                pins.mirror.repository, pins.mirror.tag, file.name
+            );
+        }
+        pins
+    })
+}
+
+fn pinned(id: &str) -> &'static PinnedFile {
+    pins()
+        .files
+        .iter()
+        .find(|file| file.id == id)
+        .expect("every built-in FEX file is pinned")
+}
+
+/// FEX's release in every package.
+pub(crate) fn fex_version() -> &'static str {
+    pins().fex_version
+}
+
 /// FEX's Ubuntu 24.04 RootFS, from FEX's own server.
-pub(crate) const ROOTFS_URL: &str =
-    "https://rootfs.fex-emu.gg/Ubuntu_24_04/2026-08-11/Ubuntu_24_04.sqsh";
-pub(crate) const ROOTFS_SIZE: u64 = 525_615_104;
-pub(crate) const ROOTFS_SHA256: &str =
-    "2854b06d3ff1b8f6e526135bfb6dd5b7b30ab3ab73e79ae933a3d9fed959a178";
+pub(crate) fn rootfs() -> &'static PinnedFile {
+    pinned("rootfs")
+}
+
 pub(crate) const ROOTFS_CACHE_NAME: &str = "fex-rootfs-ubuntu-24.04-2026-08-11.verified";
 /// The unpacked RootFS (1.89 GB), with room to spare for the programs and
 /// FEX's caches.
@@ -58,34 +145,21 @@ const ARMV8_4_FEATURES: &[&str] = &[
 ];
 
 impl FexVariant {
-    pub(crate) const fn package_url(self) -> &'static str {
-        match self {
-            Self::Armv8_0 => {
-                "https://ppa.launchpadcontent.net/fex-emu/fex/ubuntu/pool/main/f/fex-emu-armv8.0/fex-emu-armv8.0_2609.1-1~j_arm64.deb"
-            }
-            Self::Armv8_2 => {
-                "https://ppa.launchpadcontent.net/fex-emu/fex/ubuntu/pool/main/f/fex-emu-armv8.2/fex-emu-armv8.2_2609.1-1~j_arm64.deb"
-            }
-            Self::Armv8_4 => {
-                "https://ppa.launchpadcontent.net/fex-emu/fex/ubuntu/pool/main/f/fex-emu-armv8.4/fex-emu-armv8.4_2609.1-1~j_arm64.deb"
-            }
-        }
+    /// This CPU level's package.
+    pub(crate) fn package(self) -> &'static PinnedFile {
+        pinned(match self {
+            Self::Armv8_0 => "fex-armv8.0",
+            Self::Armv8_2 => "fex-armv8.2",
+            Self::Armv8_4 => "fex-armv8.4",
+        })
     }
 
-    pub(crate) const fn package_size(self) -> u64 {
-        match self {
-            Self::Armv8_0 => 3_407_810,
-            Self::Armv8_2 => 3_411_742,
-            Self::Armv8_4 => 3_415_064,
-        }
+    pub(crate) fn package_size(self) -> u64 {
+        self.package().size()
     }
 
-    pub(crate) const fn package_sha256(self) -> &'static str {
-        match self {
-            Self::Armv8_0 => "2c4e97b245bf32374cdafc9c6908727e1948319dc959e941d2bdd21bf23a68cc",
-            Self::Armv8_2 => "7418a68b713e1828d71019ec7c29b676fbdfc1825873fd68c7b072432f5f65bc",
-            Self::Armv8_4 => "b401af7c1b92c304abb640d0b3eaea81ca900d8597079979915c4edea850474d",
-        }
+    pub(crate) fn package_sha256(self) -> &'static str {
+        self.package().sha256()
     }
 
     pub(crate) const fn cache_name(self) -> &'static str {
@@ -233,10 +307,10 @@ impl Record {
     fn current(variant: FexVariant) -> Self {
         Self {
             schema: RECORD_SCHEMA,
-            fex_version: FEX_VERSION.to_owned(),
+            fex_version: fex_version().to_owned(),
             variant,
             package_sha256: variant.package_sha256().to_owned(),
-            rootfs_sha256: ROOTFS_SHA256.to_owned(),
+            rootfs_sha256: rootfs().sha256().to_owned(),
         }
     }
 }
@@ -466,7 +540,7 @@ impl AppRecord {
         Self {
             schema: RECORD_SCHEMA,
             fex: APP_PROVIDED.to_owned(),
-            rootfs_sha256: ROOTFS_SHA256.to_owned(),
+            rootfs_sha256: rootfs().sha256().to_owned(),
             fex_probe_passed,
             wine_preflight_passed,
         }
@@ -918,7 +992,8 @@ mod tests {
         fs::write(
             root.join("fex/installed.json"),
             format!(
-                r#"{{"schema":1,"fex":"app-provided","rootfs_sha256":"{ROOTFS_SHA256}","fex_probe_passed":false}}"#
+                r#"{{"schema":1,"fex":"app-provided","rootfs_sha256":"{}","fex_probe_passed":false}}"#,
+                rootfs().sha256()
             ),
         )
         .unwrap();
@@ -950,11 +1025,102 @@ mod tests {
 
     #[test]
     fn every_variant_is_pinned_to_its_own_package() {
-        for variant in FexVariant::ALL {
-            assert!(variant.package_url().ends_with("_2609.1-1~j_arm64.deb"));
-            assert_eq!(variant.package_sha256().len(), 64);
+        assert_eq!(pins().schema, 1);
+        assert_eq!(fex_version(), "2609.1");
+        // The packages the built-in FEX was proven with, byte for byte.
+        let tested = [
+            (
+                FexVariant::Armv8_0,
+                "armv8.0",
+                3_407_810,
+                "2c4e97b245bf32374cdafc9c6908727e1948319dc959e941d2bdd21bf23a68cc",
+            ),
+            (
+                FexVariant::Armv8_2,
+                "armv8.2",
+                3_411_742,
+                "7418a68b713e1828d71019ec7c29b676fbdfc1825873fd68c7b072432f5f65bc",
+            ),
+            (
+                FexVariant::Armv8_4,
+                "armv8.4",
+                3_415_064,
+                "b401af7c1b92c304abb640d0b3eaea81ca900d8597079979915c4edea850474d",
+            ),
+        ];
+        assert_eq!(tested.map(|(variant, ..)| variant), FexVariant::ALL);
+        for (variant, level, size, sha256) in tested {
+            let package = variant.package();
+            assert_eq!((package.size(), package.sha256()), (size, sha256));
+            let upstream = format!("fex-emu-{level}_2609.1-1~j_arm64.deb");
+            assert_eq!(
+                package.upstream(),
+                [
+                    format!("https://launchpad.net/~fex-emu/+archive/ubuntu/fex/+files/{upstream}"),
+                    format!(
+                        "https://ppa.launchpadcontent.net/fex-emu/fex/ubuntu/pool/main/f/fex-emu-{level}/{upstream}"
+                    ),
+                ],
+                "Launchpad's file link first: it outlives the pool by some days"
+            );
+            assert_eq!(
+                package.mirror_url(),
+                format!(
+                    "https://github.com/Pocketward/pd2-launcher/releases/download/fex-2609.1/fex-emu-{level}_2609.1-1.j_arm64.deb"
+                )
+            );
             assert!(variant.cache_name().ends_with(".verified"));
-            assert!(variant.package_url().contains("/fex-emu-armv8."));
+            assert!(variant.cache_name().contains(fex_version()));
+        }
+        let rootfs = rootfs();
+        assert_eq!(
+            (rootfs.size(), rootfs.sha256()),
+            (
+                525_615_104,
+                "2854b06d3ff1b8f6e526135bfb6dd5b7b30ab3ab73e79ae933a3d9fed959a178"
+            )
+        );
+        assert_eq!(
+            rootfs.upstream(),
+            ["https://rootfs.fex-emu.gg/Ubuntu_24_04/2026-08-11/Ubuntu_24_04.sqsh"]
+        );
+        assert_eq!(
+            rootfs.mirror_url(),
+            "https://github.com/Pocketward/pd2-launcher/releases/download/fex-2609.1/Ubuntu_24_04-2026-08-11.sqsh"
+        );
+        assert!(ROOTFS_CACHE_NAME.contains("2026-08-11"));
+    }
+
+    #[test]
+    fn the_pins_suit_the_mirror_release() {
+        let pins = pins();
+        assert_eq!(pins.mirror.tag, format!("fex-{}", pins.fex_version));
+        let mut ids = pins.files.iter().map(|file| file.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["fex-armv8.0", "fex-armv8.2", "fex-armv8.4", "rootfs"]);
+        let mut names = pins.files.iter().map(|file| file.name).collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), pins.files.len(), "one name per file");
+        for file in &pins.files {
+            // A name GitHub keeps as it is (it renames other characters).
+            assert!(
+                file.name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+                "{}",
+                file.name
+            );
+            assert!(file.size > 0);
+            assert!(
+                file.sha256.len() == 64
+                    && file
+                        .sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert!(!file.upstream.is_empty());
+            assert!(file.upstream.iter().all(|url| url.starts_with("https://")));
         }
     }
 

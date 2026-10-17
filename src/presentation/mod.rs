@@ -2434,7 +2434,37 @@ pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
         ),
         "installer-download-failed" => card(
             "Download didn't finish",
-            "The Diablo II installers couldn't be downloaded. Check your internet connection and try again. Anything already downloaded is kept.",
+            "Blizzard's downloader couldn't be downloaded. Check your internet connection and try again. Anything already downloaded is kept.",
+            Some(TryAgain),
+        ),
+        "installer-download-stalled" => card(
+            "Download didn't finish",
+            "Blizzard's download got no new data for a minute. Check your internet connection and try again. Anything already downloaded is kept.",
+            Some(TryAgain),
+        ),
+        "installer-downloader-error" => card(
+            "Blizzard's downloader showed an error",
+            "Try again. If it happens again, open Diagnostics and choose Save report to ask for help; the report has the downloader's message.",
+            Some(TryAgain),
+        ),
+        "installer-download-incomplete" => card(
+            "Download didn't finish",
+            "Blizzard's downloader stopped before the download was complete. Try again, or open Diagnostics and choose Save report to ask for help.",
+            Some(TryAgain),
+        ),
+        "installer-download-rejected" => card(
+            "The downloaded files didn't pass the check",
+            "The files from Blizzard's downloader aren't the expected Diablo II files. Try again, or open Diagnostics and choose Save report to ask for help.",
+            Some(TryAgain),
+        ),
+        "installer-downloader-failed" => card(
+            "Download didn't finish",
+            "Blizzard's downloader stopped unexpectedly. Try again, or open Diagnostics and choose Save report to ask for help.",
+            Some(TryAgain),
+        ),
+        "installer-payload-store-failed" => card(
+            "Download didn't finish",
+            "Blizzard's download finished, but its files couldn't be stored. Check that the install location has free space and try again.",
             Some(TryAgain),
         ),
         "download-failed" => card(
@@ -3556,7 +3586,7 @@ pub(crate) fn about_built_with() -> String {
     if cfg!(target_arch = "aarch64") {
         format!(
             "{wine} · FEX-Emu {} (the built-in FEX)",
-            crate::builtin_fex::FEX_VERSION
+            crate::builtin_fex::fex_version()
         )
     } else {
         wine.to_owned()
@@ -7605,6 +7635,31 @@ mod tests {
             card(ActiveJobView::InstallBaseGame, "installer-download-failed")
                 .message
                 .contains("internet connection")
+        );
+        // Each way Blizzard's downloader fails has its own card; only these
+        // two are the connection.
+        assert!(
+            card(ActiveJobView::InstallBaseGame, "installer-download-stalled")
+                .message
+                .contains("internet connection")
+        );
+        for code in [
+            "installer-downloader-error",
+            "installer-download-incomplete",
+            "installer-download-rejected",
+            "installer-downloader-failed",
+        ] {
+            let card = card(ActiveJobView::InstallBaseGame, code);
+            assert!(!card.message.contains("internet connection"), "{code}");
+            assert!(card.message.contains("Save report"), "{code}");
+        }
+        assert!(
+            card(
+                ActiveJobView::InstallBaseGame,
+                "installer-payload-store-failed"
+            )
+            .message
+            .contains("free space")
         );
         // An unknown code still says what to do, in plain words.
         let unknown = card(ActiveJobView::InstallBaseGame, "managed-install-failed");

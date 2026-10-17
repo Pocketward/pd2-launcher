@@ -465,7 +465,27 @@ pub(crate) fn plain_reason(code: &str) -> &'static str {
         "runtime-setup-failed" => "Setting up Wine or the game environment (prefix) failed",
         "builtin-fex-setup-failed" => "Unpacking the built-in FEX and its RootFS failed",
         "client-install-failed" => "Installing Project Diablo 2 failed",
-        "installer-download-failed" => "Blizzard's installers could not be downloaded",
+        "installer-download-failed" => {
+            "Blizzard's downloader program could not be downloaded from Blizzard"
+        }
+        "installer-download-stalled" => {
+            "Blizzard's downloader got no new data for a minute (a lost or blocked connection)"
+        }
+        "installer-downloader-error" => {
+            "Blizzard's downloader showed an error message (the downloader UI helper's output has its text)"
+        }
+        "installer-download-incomplete" => {
+            "Blizzard's downloader ended before its download was complete (see payload-rejected)"
+        }
+        "installer-download-rejected" => {
+            "Files Blizzard's downloader fetched differ from their pinned identity (see payload-rejected)"
+        }
+        "installer-payload-store-failed" => {
+            "Blizzard's downloader finished, but its files could not be stored (for example no free space)"
+        }
+        "installer-downloader-failed" => {
+            "Blizzard's downloader did not run to the end (no window, could not be stopped, or exited)"
+        }
         "download-failed" => "A download did not finish",
         "download-cache-unusable" => {
             "The download cache could not be used (unrecognised entries or write state, for example a folder copied mid-write)"
@@ -688,6 +708,15 @@ fn excerpt(
             ActivityEvent::StageFailed { code, detail } => {
                 lines.push(format!("stage failed: {code} ({detail})"));
             }
+            ActivityEvent::PayloadRejected {
+                payload,
+                file,
+                check,
+                size,
+            } => lines.push(format!(
+                "payload {payload}: {file} failed the {check} check{}",
+                size.map_or_else(String::new, |size| format!(" ({size} bytes)"))
+            )),
             _ => {}
         }
     }
@@ -717,13 +746,14 @@ fn excerpt(
 
 /// What the sealed installer UI helper's exit code says it saw.
 fn helper_verdict(label: &str, code: Option<i32>) -> &'static str {
-    if label != "installer UI helper" {
-        return "";
-    }
-    match code {
-        Some(20) => " (the installer showed an error dialog)",
-        Some(22) => " (the installer rejected the CD key)",
-        Some(23) => " (the installer stayed at its menu)",
+    match (label, code) {
+        ("installer UI helper", Some(20)) => " (the installer showed an error dialog)",
+        ("installer UI helper", Some(22)) => " (the installer rejected the CD key)",
+        ("installer UI helper", Some(23)) => " (the installer stayed at its menu)",
+        ("downloader UI helper", Some(21)) => " (no downloader window within ten minutes)",
+        ("downloader UI helper", Some(22)) => " (the downloader asked for a folder)",
+        ("downloader UI helper", Some(23)) => " (the downloader showed an error message)",
+        ("downloader UI helper", Some(24..=26)) => " (the downloader could not be stopped)",
         _ => "",
     }
 }
@@ -1211,6 +1241,7 @@ fn job_json(job: &JobRecord, activity: &[ActivityEntry]) -> Value {
                         entry.event,
                         ActivityEvent::StageFailed { .. }
                             | ActivityEvent::Process { .. }
+                            | ActivityEvent::PayloadRejected { .. }
                             | ActivityEvent::Download { .. }
                     ))
                     .map(|entry| {
@@ -1713,6 +1744,26 @@ fn registry_excerpt(prefix: &Path) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn each_helper_s_exit_codes_are_read_by_its_own_meaning() {
+        assert_eq!(
+            helper_verdict("installer UI helper", Some(23)),
+            " (the installer stayed at its menu)"
+        );
+        assert_eq!(
+            helper_verdict("downloader UI helper", Some(23)),
+            " (the downloader showed an error message)"
+        );
+        assert_eq!(
+            helper_verdict("downloader UI helper", Some(21)),
+            " (no downloader window within ten minutes)"
+        );
+        assert_eq!(helper_verdict("downloader UI helper", Some(0)), "");
+        assert_eq!(helper_verdict("wine BaseGameWrapper", Some(23)), "");
+        assert!(plain_reason("installer-download-stalled").contains("connection"));
+        assert!(!plain_reason("installer-download-rejected").contains("connection"));
+    }
 
     #[test]
     fn utc_stamps_are_civil_dates() {

@@ -777,7 +777,7 @@ impl ReadyBackend {
             builtin_available: BUILTIN_FEX_AVAILABLE,
             builtin_installed,
             builtin_download_bytes: crate::builtin_fex::FexVariant::current().package_size()
-                + crate::builtin_fex::ROOTFS_SIZE,
+                + crate::builtin_fex::rootfs().size(),
             // While the built-in FEX runs, it is the one in use.
             in_use: if builtin_installed && crate::builtin_fex::in_use(settings.as_ref(), &root) {
                 Some(crate::builtin_fex::Layout::new(&root).interpreter())
@@ -3626,7 +3626,7 @@ fn update_download_source_setting(
 /// The stable code of an install that stopped at a known stage, so the view
 /// can say which step failed and what to do next.
 fn install_failure_code(error: &InstallError) -> &'static str {
-    use crate::install::{ArtifactKind, InstallStage};
+    use crate::install::{ArtifactKind, DownloaderFailure, InstallStage};
     match error {
         InstallError::KeyRejected {
             stage: InstallStage::BaseGame,
@@ -3653,8 +3653,10 @@ fn install_failure_code(error: &InstallError) -> &'static str {
         | InstallError::InstallerMenu { stage } => match stage {
             InstallStage::Download => "download-failed",
             InstallStage::ManagedRuntime => "runtime-setup-failed",
+            // Not the downloader (DownloaderFailed) nor fetching it: what
+            // follows a verified download, such as storing the files.
             InstallStage::BaseGameDownload | InstallStage::ExpansionDownload => {
-                "installer-download-failed"
+                "installer-payload-store-failed"
             }
             InstallStage::ClientPrefetch => "client-download-failed",
             InstallStage::BaseGame => "base-game-install-failed",
@@ -3664,6 +3666,15 @@ fn install_failure_code(error: &InstallError) -> &'static str {
                 "client-install-failed"
             }
             InstallStage::BuiltinFex => "builtin-fex-setup-failed",
+        },
+        // How Blizzard's downloader failed, each its own code, as only the
+        // first is a connection problem for certain.
+        InstallError::DownloaderFailed { failure, .. } => match failure {
+            DownloaderFailure::Stalled => "installer-download-stalled",
+            DownloaderFailure::ErrorDialog => "installer-downloader-error",
+            DownloaderFailure::Incomplete => "installer-download-incomplete",
+            DownloaderFailure::Rejected => "installer-download-rejected",
+            DownloaderFailure::Ended => "installer-downloader-failed",
         },
         InstallError::BaseGameRequired => "base-game-required",
         InstallError::BaseGameInstalled => "base-game-installed",
@@ -3855,7 +3866,7 @@ mod tests {
 
     #[test]
     fn install_failures_name_the_stage_and_a_rejected_key() {
-        use crate::install::{ArtifactKind, InstallStage};
+        use crate::install::{ArtifactKind, DownloaderFailure, InstallStage};
         for (error, code) in [
             (
                 InstallError::KeyRejected {
@@ -3910,6 +3921,54 @@ mod tests {
                     artifact: ArtifactKind::ManagedRuntime,
                 },
                 "download-failed",
+            ),
+            // The built-in FEX's package after every source of it failed.
+            (
+                InstallError::AcquisitionFailed {
+                    artifact: ArtifactKind::FexPackage,
+                },
+                "download-failed",
+            ),
+            (
+                InstallError::StageFailed {
+                    stage: InstallStage::BaseGameDownload,
+                },
+                "installer-payload-store-failed",
+            ),
+            (
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DownloaderFailure::Stalled,
+                },
+                "installer-download-stalled",
+            ),
+            (
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::ExpansionDownload,
+                    failure: DownloaderFailure::ErrorDialog,
+                },
+                "installer-downloader-error",
+            ),
+            (
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DownloaderFailure::Incomplete,
+                },
+                "installer-download-incomplete",
+            ),
+            (
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DownloaderFailure::Rejected,
+                },
+                "installer-download-rejected",
+            ),
+            (
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DownloaderFailure::Ended,
+                },
+                "installer-downloader-failed",
             ),
             (InstallError::AuditUnavailable, "managed-install-failed"),
         ] {

@@ -27,6 +27,8 @@ A default Ubuntu desktop install already has all of these.
 
 **ARM64:** [FEX-Emu](https://fex-emu.com/) with its x86 system files (its RootFS; run `FEXRootFSFetcher` once) on a kernel with 4 KB memory pages, plus the same libraries. The game runs through FEX, so it is slower than on a PC of the same class.
 
+**Built-in FEX (ARM64):** the launcher downloads FEX-Emu and its Ubuntu RootFS, unchanged, from this project's `fex-<version>` mirror release, and from FEX's own sources (its Launchpad PPA, its RootFS server) when the mirror does not give them; every file must match its pinned SHA-256.
+
 **Display and graphics:** Xorg, or Wayland with XWayland (the default on GNOME and KDE). No particular GPU driver is required: the game draws with OpenGL, and when that is done in software (as in a virtual machine), the Play screen says so; the game still runs, only slower.
 
 ## Using it

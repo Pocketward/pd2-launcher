@@ -195,8 +195,24 @@ impl ArtifactKind {
 enum RedirectPolicy {
     None,
     GithubReleaseAsset,
+    /// A Launchpad PPA's file link (`…/+files/<name>`), which sends the
+    /// request on to the Launchpad librarian's copy of the same file name.
+    LaunchpadLibrarian,
     /// Custom sources only: any `http`/`https` destination, bounded hops.
     AnyHttp,
+}
+
+impl RedirectPolicy {
+    /// The policy of a built-in source, from where it is.
+    fn for_builtin_source(url: &str) -> Self {
+        if url.starts_with("https://github.com/") {
+            Self::GithubReleaseAsset
+        } else if url.starts_with("https://launchpad.net/") {
+            Self::LaunchpadLibrarian
+        } else {
+            Self::None
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,11 +239,39 @@ pub(crate) struct ArtifactSpec {
     size: SizePolicy,
     integrity: IntegrityPolicy,
     expected_filename: Option<&'static str>,
+    /// Other built-in sources of the same bytes, tried in order when
+    /// `request_url` does not give them. Each has the size and digest above
+    /// and the redirect policy of where it is.
+    fallback_urls: &'static [&'static str],
 }
 
 impl ArtifactSpec {
     pub(crate) fn request_url(&self) -> &str {
         &self.request_url
+    }
+
+    /// Every source of this artifact in the order they are tried, each as a
+    /// spec of its own: `request_url` first, then each fallback.
+    pub(crate) fn sources(&self) -> impl Iterator<Item = Self> + '_ {
+        let only = |request_url: Cow<'static, str>, redirects| Self {
+            request_url,
+            redirects,
+            fallback_urls: &[],
+            ..self.clone()
+        };
+        std::iter::once(only(self.request_url.clone(), self.redirects)).chain(
+            self.fallback_urls
+                .iter()
+                .map(move |url| only(Cow::Borrowed(*url), RedirectPolicy::for_builtin_source(url))),
+        )
+    }
+
+    /// Whether an artifact requested from `requested_url` and served from
+    /// `final_url` came from one of this spec's sources.
+    fn approves_source(&self, requested_url: &str, final_url: &str) -> bool {
+        self.sources()
+            .find(|source| source.request_url() == requested_url)
+            .is_some_and(|source| source.approves_final_url(final_url))
     }
 
     pub(crate) fn kind(&self) -> ArtifactKind {
@@ -248,6 +292,7 @@ impl ArtifactSpec {
             },
             integrity: IntegrityPolicy::Unverified,
             expected_filename: None,
+            fallback_urls: &[],
         }
     }
 
@@ -282,6 +327,22 @@ impl ArtifactSpec {
                                 && !rest.split('/').any(|part| matches!(part, "." | ".."))
                         })
             }
+            // `https://launchpadlibrarian.net/<number>/<the requested file name>`.
+            RedirectPolicy::LaunchpadLibrarian => {
+                final_url == self.request_url
+                    || final_url
+                        .strip_prefix("https://launchpadlibrarian.net/")
+                        .and_then(|rest| rest.split_once('/'))
+                        .is_some_and(|(number, name)| {
+                            !number.is_empty()
+                                && number.bytes().all(|byte| byte.is_ascii_digit())
+                                && !name.is_empty()
+                                && self
+                                    .request_url
+                                    .rsplit_once("/+files/")
+                                    .is_some_and(|(_, requested)| requested == name)
+                        })
+            }
         }
     }
 }
@@ -314,6 +375,7 @@ impl ArtifactCatalog {
                 size: SizePolicy::Exact(runtime.archive_size),
                 integrity: IntegrityPolicy::Sha512(runtime.archive_sha512),
                 expected_filename: None,
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::Gecko,
@@ -326,6 +388,7 @@ impl ArtifactCatalog {
                     "26cecc47706b091908f7f814bddb074c61beb8063318e9efc5a7f789857793d6",
                 ),
                 expected_filename: None,
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::WineMono,
@@ -334,6 +397,7 @@ impl ArtifactCatalog {
                 size: SizePolicy::Exact(83_348_992),
                 integrity: IntegrityPolicy::Sha256(crate::audit::WINE_MONO_MSI_SHA256),
                 expected_filename: None,
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::DotnetDesktop,
@@ -345,6 +409,7 @@ impl ArtifactCatalog {
                     "a18351aabfe1590e58af79e57ac2414254ba80cb7a1fef19545a6b8418575c735fc1dc164c3c7fed426c4698f099991487fa4f443bab93afd41d1563845fbcf4",
                 ),
                 expected_filename: None,
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::BaseGameWrapper,
@@ -358,6 +423,7 @@ impl ArtifactCatalog {
                 },
                 integrity: IntegrityPolicy::PeExecutable,
                 expected_filename: Some("Downloader_Diablo2_enUS.exe"),
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::ExpansionWrapper,
@@ -371,6 +437,7 @@ impl ArtifactCatalog {
                 },
                 integrity: IntegrityPolicy::PeExecutable,
                 expected_filename: Some("Downloader_Diablo2_Lord_of_Destruction_enUS.exe"),
+                fallback_urls: &[],
             },
             ArtifactSpec {
                 kind: ArtifactKind::ClientBootstrap,
@@ -383,24 +450,28 @@ impl ArtifactCatalog {
                     "50ef80e41ef626a14a2cd584b915e79774ad0b03d51cd03af719a6fbf8d93677",
                 ),
                 expected_filename: None,
+                fallback_urls: &[],
             },
-            ArtifactSpec {
-                kind: ArtifactKind::FexPackage,
-                request_url: Cow::Borrowed(fex.package_url()),
-                redirects: RedirectPolicy::None,
-                size: SizePolicy::Exact(fex.package_size()),
-                integrity: IntegrityPolicy::Sha256(fex.package_sha256()),
-                expected_filename: None,
-            },
-            ArtifactSpec {
-                kind: ArtifactKind::FexRootFs,
-                request_url: Cow::Borrowed(crate::builtin_fex::ROOTFS_URL),
-                redirects: RedirectPolicy::None,
-                size: SizePolicy::Exact(crate::builtin_fex::ROOTFS_SIZE),
-                integrity: IntegrityPolicy::Sha256(crate::builtin_fex::ROOTFS_SHA256),
-                expected_filename: None,
-            },
+            Self::builtin_fex_spec(ArtifactKind::FexPackage, fex.package()),
+            Self::builtin_fex_spec(ArtifactKind::FexRootFs, crate::builtin_fex::rootfs()),
         ])
+    }
+
+    /// A built-in FEX file: from the project's mirror release first, then
+    /// from its upstream sources, the same bytes from each.
+    fn builtin_fex_spec(
+        kind: ArtifactKind,
+        file: &'static crate::builtin_fex::PinnedFile,
+    ) -> ArtifactSpec {
+        ArtifactSpec {
+            kind,
+            request_url: Cow::Borrowed(file.mirror_url()),
+            redirects: RedirectPolicy::for_builtin_source(file.mirror_url()),
+            size: SizePolicy::Exact(file.size()),
+            integrity: IntegrityPolicy::Sha256(file.sha256()),
+            expected_filename: None,
+            fallback_urls: file.upstream(),
+        }
     }
 
     /// The built-in catalog with each custom source in `sources` replacing
@@ -645,10 +716,13 @@ fn validate_artifact_provenance(
 ) -> Result<(), ArtifactRejection> {
     match artifact.origin {
         ArtifactOrigin::ApprovedNetwork => {
-            if artifact.requested_url != spec.request_url() {
+            if !spec
+                .sources()
+                .any(|source| source.request_url() == artifact.requested_url)
+            {
                 return Err(ArtifactRejection::RequestUrlMismatch);
             }
-            if !spec.approves_final_url(&artifact.final_url) {
+            if !spec.approves_source(&artifact.requested_url, &artifact.final_url) {
                 return Err(ArtifactRejection::UnapprovedFinalUrl);
             }
         }
@@ -1134,11 +1208,25 @@ pub(crate) enum CacheProblem {
 /// Where a Vendor stage failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VendorFailure {
-    /// The downloader wrapper did not produce a verified payload, so no
-    /// installer ran. A Blizzard wrapper's embedded download authorization
-    /// expires about a week after it was fetched, so this is retried once
-    /// with a freshly downloaded wrapper.
+    /// Blizzard's downloader ended without a verified payload in some other
+    /// way (no window, could not be stopped, its own exit, its timeout), so
+    /// no installer ran. A Blizzard wrapper's embedded download authorization
+    /// expires about a week after it was fetched, so this and the next three
+    /// are retried once with a freshly downloaded wrapper.
     WrapperDownload,
+    /// Blizzard's downloader showed a message box (its helper prints the
+    /// text).
+    DownloaderErrorDialog,
+    /// The downloader ended with its download unfinished: a file missing or
+    /// still a `.part`.
+    PayloadIncomplete,
+    /// The downloader finished, but a file differs from its frozen identity
+    /// (size, hash, an unexpected entry).
+    PayloadRejected,
+    /// Blizzard's downloader got no new data for its stall limit, as when
+    /// the connection is lost: a network failure, so the wrapper is kept and
+    /// the stage fails at once.
+    DownloadStalled,
     /// The installer showed its error dialog about the product key it was
     /// given: the key was rejected.
     KeyRejected,
@@ -1148,6 +1236,45 @@ pub(crate) enum VendorFailure {
     InstallerMenu,
     /// Anything else, including a failure after the installer started.
     Install,
+}
+
+impl VendorFailure {
+    /// Whether a freshly downloaded wrapper may succeed where this failed:
+    /// every downloader failure but a stall, which is the connection's.
+    fn may_need_fresh_wrapper(self) -> bool {
+        matches!(
+            self,
+            Self::WrapperDownload
+                | Self::DownloaderErrorDialog
+                | Self::PayloadIncomplete
+                | Self::PayloadRejected
+        )
+    }
+
+    /// How Blizzard's downloader failed, when this is its failure.
+    fn downloader_failure(self) -> Option<DownloaderFailure> {
+        match self {
+            Self::WrapperDownload => Some(DownloaderFailure::Ended),
+            Self::DownloaderErrorDialog => Some(DownloaderFailure::ErrorDialog),
+            Self::PayloadIncomplete => Some(DownloaderFailure::Incomplete),
+            Self::PayloadRejected => Some(DownloaderFailure::Rejected),
+            Self::DownloadStalled => Some(DownloaderFailure::Stalled),
+            Self::KeyRejected | Self::ErrorDialog | Self::InstallerMenu | Self::Install => None,
+        }
+    }
+}
+
+/// How Blizzard's downloader failed to deliver a verified payload, each with
+/// its own failure code (`install_failure_code`): a lost connection, an
+/// error it reported, a download it left unfinished, files that differ from
+/// their identity, or any other end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DownloaderFailure {
+    Stalled,
+    ErrorDialog,
+    Incomplete,
+    Rejected,
+    Ended,
 }
 
 impl From<AdapterFailure> for VendorFailure {
@@ -1226,6 +1353,12 @@ pub(crate) enum InstallError {
     },
     StageFailed {
         stage: InstallStage,
+    },
+    /// Blizzard's downloader for `stage` (a download stage) delivered no
+    /// verified payload, as `failure` says.
+    DownloaderFailed {
+        stage: InstallStage,
+        failure: DownloaderFailure,
     },
     /// The Vendor installer showed its error dialog about the product key
     /// for `stage`: that key was rejected.
@@ -1562,9 +1695,11 @@ impl<'a> ManagedInstaller<'a> {
                 Ok(()) => break,
                 // A cached Blizzard wrapper carries a download authorization
                 // that expires; discard it and download a fresh one once.
-                // Selected media and custom sources report the failure.
-                Err(VendorFailure::WrapperDownload)
-                    if !refetched
+                // Selected media and custom sources report the failure, and
+                // so does a stalled download (DownloadStalled).
+                Err(failure)
+                    if failure.may_need_fresh_wrapper()
+                        && !refetched
                         && !control.is_cancelled()
                         && artifact.origin == ArtifactOrigin::ApprovedNetwork
                         && artifact.custom_source().is_none()
@@ -1575,7 +1710,16 @@ impl<'a> ManagedInstaller<'a> {
                     artifact = self.acquire(paths, kind, control)?;
                     check_cancelled(control)?;
                 }
-                Err(_) => return Err(stage_failure(control, stage)),
+                Err(failure) => {
+                    return Err(
+                        match (stage_failure(control, stage), failure.downloader_failure()) {
+                            (InstallError::StageFailed { stage }, Some(failure)) => {
+                                InstallError::DownloaderFailed { stage, failure }
+                            }
+                            (error, _) => error,
+                        },
+                    );
+                }
             }
         }
         check_cancelled(control)?;
@@ -1972,6 +2116,16 @@ impl<'a> ManagedInstaller<'a> {
                 }
                 (InstallError::StageFailed { stage }, VendorFailure::InstallerMenu) => {
                     InstallError::InstallerMenu { stage }
+                }
+                // Its download, not its installer, failed.
+                (InstallError::StageFailed { stage }, failure) => {
+                    match failure.downloader_failure() {
+                        Some(failure) => InstallError::DownloaderFailed {
+                            stage: product.download_stage(),
+                            failure,
+                        },
+                        None => InstallError::StageFailed { stage },
+                    }
                 }
                 (error, _) => error,
             })?;
@@ -2674,6 +2828,14 @@ mod tests {
                     stage: InstallStage::Expansion,
                 },
             ),
+            // Its download, not its installer, failed.
+            (
+                VendorFailure::DownloadStalled,
+                InstallError::DownloaderFailed {
+                    stage: InstallStage::ExpansionDownload,
+                    failure: DownloaderFailure::Stalled,
+                },
+            ),
         ] {
             let fixture = TempDir::new().unwrap();
             let auditor = ScriptedAuditor::new([
@@ -2742,6 +2904,26 @@ mod tests {
             RecordedOperation::BaseGameDownload
         );
 
+        // A stalled download lost its connection: the wrapper is kept and
+        // the stage fails at once.
+        let auditor = ScriptedAuditor::new([audit(
+            InstallationStatus::NeedsBaseGame,
+            CheckStatus::Satisfied,
+        )]);
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver {
+            wrapper_download_stalls: 1.into(),
+            ..RecordingDriver::default()
+        };
+        assert_eq!(
+            download(&auditor, &source, &driver, fixture_catalog()),
+            Err(InstallError::DownloaderFailed {
+                stage: InstallStage::BaseGameDownload,
+                failure: DownloaderFailure::Stalled,
+            })
+        );
+        assert_eq!(base_acquisitions(&source), 1);
+
         // Only once: a second failure is reported.
         let auditor = ScriptedAuditor::new([audit(
             InstallationStatus::NeedsBaseGame,
@@ -2754,11 +2936,45 @@ mod tests {
         };
         assert_eq!(
             download(&auditor, &source, &driver, fixture_catalog()),
-            Err(InstallError::StageFailed {
-                stage: InstallStage::BaseGameDownload
+            Err(InstallError::DownloaderFailed {
+                stage: InstallStage::BaseGameDownload,
+                failure: DownloaderFailure::Ended,
             })
         );
         assert_eq!(base_acquisitions(&source), 2);
+
+        // An error box, an unfinished download and other files are retried
+        // with a fresh wrapper too, then reported as what they were.
+        for (failure, expected) in [
+            (
+                VendorFailure::DownloaderErrorDialog,
+                DownloaderFailure::ErrorDialog,
+            ),
+            (
+                VendorFailure::PayloadIncomplete,
+                DownloaderFailure::Incomplete,
+            ),
+            (VendorFailure::PayloadRejected, DownloaderFailure::Rejected),
+        ] {
+            let auditor = ScriptedAuditor::new([audit(
+                InstallationStatus::NeedsBaseGame,
+                CheckStatus::Satisfied,
+            )]);
+            let source = FixtureArtifactSource::default();
+            let driver = RecordingDriver {
+                wrapper_download_failures: 2.into(),
+                wrapper_download_failure: Some(failure).into(),
+                ..RecordingDriver::default()
+            };
+            assert_eq!(
+                download(&auditor, &source, &driver, fixture_catalog()),
+                Err(InstallError::DownloaderFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: expected,
+                })
+            );
+            assert_eq!(base_acquisitions(&source), 2);
+        }
 
         // A custom source is never replaced: its failure is reported.
         let auditor = ScriptedAuditor::new([audit(
@@ -2790,8 +3006,9 @@ mod tests {
         ]);
         assert_eq!(
             download(&auditor, &source, &driver, catalog),
-            Err(InstallError::StageFailed {
-                stage: InstallStage::BaseGameDownload
+            Err(InstallError::DownloaderFailed {
+                stage: InstallStage::BaseGameDownload,
+                failure: DownloaderFailure::Ended,
             })
         );
         assert_eq!(base_acquisitions(&source), 1);
@@ -3912,6 +4129,129 @@ mod tests {
     }
 
     #[test]
+    fn the_builtin_fex_comes_from_the_mirror_then_launchpad_with_the_same_pins() {
+        let catalog = ArtifactCatalog::pinned();
+        let package = crate::builtin_fex::FexVariant::current().package();
+        let spec = catalog.spec(ArtifactKind::FexPackage);
+        let sources = spec
+            .sources()
+            .map(|source| (source.request_url().to_owned(), source.redirects))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sources,
+            [
+                (
+                    package.mirror_url().to_owned(),
+                    RedirectPolicy::GithubReleaseAsset
+                ),
+                (
+                    package.upstream()[0].to_owned(),
+                    RedirectPolicy::LaunchpadLibrarian
+                ),
+                (package.upstream()[1].to_owned(), RedirectPolicy::None),
+            ]
+        );
+        assert!(sources[0].0.starts_with("https://github.com/"));
+        assert!(sources[1].0.contains("/+files/"));
+        assert!(sources[2].0.contains("/pool/"));
+        for source in spec.sources() {
+            assert_eq!(source.size, SizePolicy::Exact(package.size()));
+            assert_eq!(source.integrity, IntegrityPolicy::Sha256(package.sha256()));
+            assert!(source.fallback_urls.is_empty());
+        }
+
+        let rootfs = crate::builtin_fex::rootfs();
+        let spec = catalog.spec(ArtifactKind::FexRootFs);
+        assert_eq!(
+            spec.sources()
+                .map(|source| (source.request_url().to_owned(), source.redirects))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    rootfs.mirror_url().to_owned(),
+                    RedirectPolicy::GithubReleaseAsset
+                ),
+                (rootfs.upstream()[0].to_owned(), RedirectPolicy::None),
+            ]
+        );
+        assert_eq!(spec.size, SizePolicy::Exact(rootfs.size()));
+        assert_eq!(spec.integrity, IntegrityPolicy::Sha256(rootfs.sha256()));
+
+        // Only the built-in FEX has other sources; a custom source has none.
+        for spec in &catalog.specs {
+            let builtin_fex = matches!(
+                spec.kind,
+                ArtifactKind::FexPackage | ArtifactKind::FexRootFs
+            );
+            assert_eq!(spec.fallback_urls.is_empty(), !builtin_fex, "{spec:?}");
+        }
+        let sources = crate::sources::DownloadSources::resolve(
+            &[(
+                crate::sources::DownloadArtifact::Fex,
+                "https://mirror.example/fex.deb".to_owned(),
+            )]
+            .into(),
+            &std::collections::BTreeMap::new(),
+        );
+        let custom = ArtifactCatalog::with_sources(&sources);
+        let custom = custom.spec(ArtifactKind::FexPackage);
+        assert!(custom.is_custom());
+        assert_eq!(custom.sources().count(), 1);
+    }
+
+    #[test]
+    fn launchpads_file_link_may_lead_only_to_its_librarians_copy_of_that_file() {
+        let spec = ArtifactCatalog::pinned()
+            .spec(ArtifactKind::FexPackage)
+            .sources()
+            .nth(1)
+            .unwrap();
+        let name = spec.request_url().rsplit_once('/').unwrap().1.to_owned();
+        assert!(name.ends_with("_arm64.deb"), "{name}");
+        assert!(spec.approves_final_url(spec.request_url()));
+        assert!(
+            spec.approves_final_url(&format!("https://launchpadlibrarian.net/877920585/{name}"))
+        );
+        for refused in [
+            format!("https://launchpadlibrarian.net/877920585/other_{name}"),
+            format!("https://launchpadlibrarian.net/87a/{name}"),
+            format!("https://launchpadlibrarian.net//{name}"),
+            "https://launchpadlibrarian.net/877920585/".to_owned(),
+            format!("https://launchpadlibrarian.net.evil.invalid/877920585/{name}"),
+            format!("http://launchpadlibrarian.net/877920585/{name}"),
+            format!("https://launchpadlibrarian.net/877920585/x/{name}"),
+            format!("https://elsewhere.invalid/{name}"),
+        ] {
+            assert!(!spec.approves_final_url(&refused), "{refused}");
+        }
+
+        // The workflow accepts what came from a fallback, and only from where
+        // that fallback may lead.
+        let catalog = ArtifactCatalog::pinned();
+        let pinned = catalog.spec(ArtifactKind::FexPackage);
+        let librarian = format!("https://launchpadlibrarian.net/877920585/{name}");
+        let fixture = tempfile::tempdir().unwrap();
+        let artifact = |requested: &str, served: &str| {
+            AcquiredArtifact::new(fixture.path().join("fex"), requested, served, None)
+        };
+        assert!(
+            validate_artifact_provenance(pinned, &artifact(spec.request_url(), &librarian)).is_ok()
+        );
+        assert_eq!(
+            validate_artifact_provenance(
+                pinned,
+                &artifact(spec.request_url(), "https://elsewhere.invalid/fex.deb")
+            ),
+            Err(ArtifactRejection::UnapprovedFinalUrl)
+        );
+        // A librarian link is not a source of its own.
+        assert_eq!(
+            validate_artifact_provenance(pinned, &artifact(&librarian, &librarian)),
+            Err(ArtifactRejection::RequestUrlMismatch)
+        );
+    }
+
+    #[test]
     fn pinned_catalog_freezes_reviewed_artifact_contracts() {
         let catalog = ArtifactCatalog::pinned();
         let runtime = catalog.spec(ArtifactKind::ManagedRuntime);
@@ -3935,8 +4275,8 @@ mod tests {
         );
 
         // No built-in source is cleartext.
-        for spec in &catalog.specs {
-            assert!(spec.request_url().starts_with("https://"), "{spec:?}");
+        for source in catalog.specs.iter().flat_map(ArtifactSpec::sources) {
+            assert!(source.request_url().starts_with("https://"), "{source:?}");
         }
 
         let base = catalog.spec(ArtifactKind::BaseGameWrapper);
@@ -4200,6 +4540,9 @@ mod tests {
         expansion_failure: Option<VendorFailure>,
         /// How many base-game downloads fail in the downloader wrapper.
         wrapper_download_failures: std::cell::Cell<usize>,
+        /// What those failures are; WrapperDownload when none is set.
+        wrapper_download_failure: std::cell::Cell<Option<VendorFailure>>,
+        wrapper_download_stalls: std::cell::Cell<usize>,
         fail_import: bool,
     }
 
@@ -4261,7 +4604,17 @@ mod tests {
             {
                 self.wrapper_download_failures
                     .set(self.wrapper_download_failures.get() - 1);
-                return Err(VendorFailure::WrapperDownload);
+                return Err(self
+                    .wrapper_download_failure
+                    .get()
+                    .unwrap_or(VendorFailure::WrapperDownload));
+            }
+            if wrapper.kind() == ArtifactKind::BaseGameWrapper
+                && self.wrapper_download_stalls.get() > 0
+            {
+                self.wrapper_download_stalls
+                    .set(self.wrapper_download_stalls.get() - 1);
+                return Err(VendorFailure::DownloadStalled);
             }
             // The verified payload lands in the product's cache folder.
             let directory = match wrapper.kind() {
@@ -4395,6 +4748,7 @@ mod tests {
             size: SizePolicy::Exact(7),
             integrity: IntegrityPolicy::Sha256(FIXTURE_SHA256),
             expected_filename: None,
+            fallback_urls: &[],
         }
     }
 
@@ -4411,6 +4765,7 @@ mod tests {
             size: SizePolicy::Bounded { min: 64, max: 256 },
             integrity: IntegrityPolicy::PeExecutable,
             expected_filename: Some(filename),
+            fallback_urls: &[],
         }
     }
 

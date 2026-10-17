@@ -64,7 +64,8 @@ pub(crate) enum ActivityEvent {
     },
     Process {
         label: String,
-        /// `exited`, `timed-out`, `spawn-failed`, or `wait-failed`.
+        /// `exited`, `timed-out`, `stalled` (a download that stopped
+        /// changing), `spawn-failed`, or `wait-failed`.
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
@@ -72,6 +73,17 @@ pub(crate) enum ActivityEvent {
         stdout: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         stderr: String,
+    },
+    /// A file of the payload Blizzard's downloader left that did not verify:
+    /// the payload folder, the file in it and the check it failed (`missing`,
+    /// `partial`, `unexpected`, `not-a-file`, `unreadable`, `size`,
+    /// `not-a-program`, `sha256`), with the size found for `size`.
+    PayloadRejected {
+        payload: String,
+        file: String,
+        check: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
     },
     Download {
         target: String,
@@ -280,6 +292,15 @@ fn note(event: &ActivityEvent) {
                 push(format!("  {line}"));
             }
         }
+        ActivityEvent::PayloadRejected {
+            payload,
+            file,
+            check,
+            size,
+        } => push(format!(
+            "{payload}: {file} failed the {check} check{}",
+            size.map_or_else(String::new, |size| format!(" ({size} bytes)"))
+        )),
         ActivityEvent::Download {
             target,
             host,
@@ -324,6 +345,21 @@ fn record_entry(job: Option<u64>, event: ActivityEvent) {
 }
 
 /// A failed process: its label, how it ended, and the tail of what it wrote.
+/// A downloaded payload's file that did not verify ([`ActivityEvent::PayloadRejected`]).
+pub(crate) fn record_payload_problem(payload: &str, file: &str, check: &str, size: Option<u64>) {
+    eprintln!(
+        "pd2-launcher: payload {}: {} failed the {check} check",
+        redacted(payload),
+        redacted(file)
+    );
+    record(ActivityEvent::PayloadRejected {
+        payload: payload.to_owned(),
+        file: file.to_owned(),
+        check: check.to_owned(),
+        size,
+    });
+}
+
 pub(crate) fn record_process(
     label: &str,
     outcome: &str,
@@ -363,12 +399,18 @@ pub(crate) fn record_download(target: &str, url: &str, status: Option<u16>, erro
     });
 }
 
-/// Classify a transport error without its message (which names the URL).
+/// Classify a transport error without its message (which names the URL). A
+/// connection that failed says why when its causes tell: `connection-blocked`
+/// (the system refused this app the network), `dns-failed`,
+/// `connection-refused`, `network-unreachable`; else `connection-failed`.
+/// A phone's per-app block mostly drops packets instead of refusing them, so
+/// it shows here as `timed-out` or `dns-failed`: the app's network check
+/// (`files/logs/network.log` on Android) is what tells a block.
 pub(crate) fn transport_error_kind(error: &zed_reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "timed-out"
     } else if error.is_connect() {
-        "connection-failed"
+        connect_failure_kind(error)
     } else if error.is_redirect() {
         "redirect-refused"
     } else if error.is_body() || error.is_decode() {
@@ -377,6 +419,35 @@ pub(crate) fn transport_error_kind(error: &zed_reqwest::Error) -> &'static str {
         "request-failed"
     } else {
         "transport-failed"
+    }
+}
+
+/// Why a connection failed, from the errors that caused it: their I/O kinds,
+/// and the resolver's own word for a failed lookup (its messages name no URL).
+fn connect_failure_kind(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    let mut source = error.source();
+    let (mut blocked, mut lookup, mut refused, mut unreachable) = (false, false, false, false);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::PermissionDenied => blocked = true,
+                std::io::ErrorKind::ConnectionRefused => refused = true,
+                std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable => {
+                    unreachable = true;
+                }
+                _ => {}
+            }
+        }
+        lookup |= cause.to_string().contains("dns error");
+        source = cause.source();
+    }
+    // A block first; a failed lookup over the I/O kind its error carries.
+    match (blocked, lookup, refused, unreachable) {
+        (true, ..) => "connection-blocked",
+        (_, true, ..) => "dns-failed",
+        (_, _, true, _) => "connection-refused",
+        (_, _, _, true) => "network-unreachable",
+        _ => "connection-failed",
     }
 }
 
@@ -453,6 +524,17 @@ fn redact_event(event: ActivityEvent, redactor: &Redactor) -> ActivityEvent {
             exit_code,
             stdout: redactor.text(&stdout),
             stderr: redactor.text(&stderr),
+        },
+        ActivityEvent::PayloadRejected {
+            payload,
+            file,
+            check,
+            size,
+        } => ActivityEvent::PayloadRejected {
+            payload: text(payload),
+            file: text(file),
+            check: text(check),
+            size,
         },
         ActivityEvent::Download {
             target,
@@ -539,6 +621,82 @@ pub(crate) fn process_label(executable: &Path, arguments: &[std::ffi::OsString])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error caused by `causes`, innermost last, as a connector reports it.
+    #[derive(Debug)]
+    struct Chain(String, Option<Box<dyn std::error::Error + 'static>>);
+
+    impl std::fmt::Display for Chain {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for Chain {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref()
+        }
+    }
+
+    fn failed_by(cause: Box<dyn std::error::Error + 'static>) -> Chain {
+        Chain(
+            "error sending request".to_owned(),
+            Some(Box::new(Chain(
+                "client error (Connect)".to_owned(),
+                Some(cause),
+            ))),
+        )
+    }
+
+    #[test]
+    fn a_failed_connection_says_why_when_its_causes_tell() {
+        let io = |kind| -> Box<dyn std::error::Error> { Box::new(std::io::Error::from(kind)) };
+        assert_eq!(
+            connect_failure_kind(&failed_by(io(std::io::ErrorKind::PermissionDenied))),
+            "connection-blocked"
+        );
+        assert_eq!(
+            connect_failure_kind(&failed_by(io(std::io::ErrorKind::ConnectionRefused))),
+            "connection-refused"
+        );
+        assert_eq!(
+            connect_failure_kind(&failed_by(io(std::io::ErrorKind::NetworkUnreachable))),
+            "network-unreachable"
+        );
+        let lookup = Box::new(Chain(
+            "dns error".to_owned(),
+            Some(Box::new(std::io::Error::other(
+                "failed to lookup address information",
+            ))),
+        ));
+        assert_eq!(connect_failure_kind(&failed_by(lookup)), "dns-failed");
+        assert_eq!(
+            connect_failure_kind(&failed_by(io(std::io::ErrorKind::HostUnreachable))),
+            "network-unreachable"
+        );
+        // A lookup that failed with a refused query is still a failed lookup.
+        let refused_lookup = Box::new(Chain(
+            "dns error".to_owned(),
+            Some(io(std::io::ErrorKind::ConnectionRefused)),
+        ));
+        assert_eq!(
+            connect_failure_kind(&failed_by(refused_lookup)),
+            "dns-failed"
+        );
+        // A block wins over the failed lookup it caused.
+        let blocked_lookup = Box::new(Chain(
+            "dns error".to_owned(),
+            Some(io(std::io::ErrorKind::PermissionDenied)),
+        ));
+        assert_eq!(
+            connect_failure_kind(&failed_by(blocked_lookup)),
+            "connection-blocked"
+        );
+        assert_eq!(
+            connect_failure_kind(&failed_by(io(std::io::ErrorKind::Other))),
+            "connection-failed"
+        );
+    }
     use tempfile::TempDir;
 
     fn download(host: &str) -> ActivityEntry {

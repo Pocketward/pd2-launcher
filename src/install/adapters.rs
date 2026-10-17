@@ -12,7 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -163,6 +163,38 @@ const NETWORK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// resumes with `Range` instead of failing after a fixed total time; this
 /// still stops a server that trickles a few bytes per connection forever.
 const MAX_PROGRESSING_ATTEMPTS: usize = 64;
+/// How long Blizzard's downloader may go without new data in its download
+/// folder before it is stopped and the stage fails. A lost connection leaves
+/// it at "Lost Internet Connection!" with no dialog its helper could answer,
+/// so it would otherwise wait for the whole [`INSTALL_TIMEOUT`]. Short on
+/// purpose: Blizzard's downloader is expected to work, so a running download
+/// that gets nothing for a minute is taken as a dead connection. A working
+/// download that pauses longer (about three minutes was seen once) fails the
+/// same way, and Try again resumes it from the parts it kept.
+const DOWNLOAD_STALL_LIMIT: Duration = Duration::from_secs(60);
+/// The limit before the first change once the downloader runs, when the
+/// folder already holds parts from an earlier run ([`GrowthClock`]): the
+/// downloader starts under Wine, fetches its description and may check the
+/// parts it kept before it writes, which can take longer than a minute.
+const DOWNLOAD_RESUME_LIMIT: Duration = Duration::from_secs(5 * 60);
+/// The limit while the download folder holds no file and has not changed:
+/// the downloader has not started its download, and its helper reports one
+/// that showed no window after ten minutes, so this waits past that. A
+/// downloader that runs creates its (empty) parts within seconds, also with
+/// no connection, and the one-minute limit counts from there.
+const DOWNLOAD_EMPTY_LIMIT: Duration = Duration::from_secs(11 * 60);
+/// Data received that counts as the downloader working although its folder
+/// has not changed (a slow connection filling a large piece, say), from the
+/// count the host gives in `PD2_RECEIVED_BYTES_FILE` (Android: the app's
+/// received bytes, which Blizzard's downloader under Wine shares): about
+/// 1 KB/s over the minute. A lost connection's retries (lookups, a reset, a
+/// failed TLS exchange of a few KB) stay below it; any download that is
+/// worth waiting for passes it within seconds. The engine log says how much
+/// came in when the downloader is stopped, to check it in the field.
+const DOWNLOAD_ACTIVITY_BYTES: u64 = 64 * 1024;
+/// Where the host writes its received-byte count ([`DOWNLOAD_ACTIVITY_BYTES`]),
+/// one decimal number; without it only the folder counts (the desktop).
+const RECEIVED_BYTES_FILE: &str = "PD2_RECEIVED_BYTES_FILE";
 /// Redirect hops a custom (user-supplied) source may take.
 const CUSTOM_REDIRECT_LIMIT: usize = 10;
 const WINDOWS_GAME_DIRECTORY: &str = r"C:\Program Files (x86)\Diablo II";
@@ -191,9 +223,9 @@ const VENDOR_UI_HELPER_SHA256: &str =
 const VENDOR_UI_HELPER_XZ_HEX: &str = include_str!("vendor_ui_helper.hex");
 /// Sealed Blizzard Downloader helper; source in
 /// `tools/downloader-ui-helper.c`, rebuilt by `tools/build-sealed-helper.sh`.
-const DOWNLOADER_UI_HELPER_SIZE: usize = 3_584;
+const DOWNLOADER_UI_HELPER_SIZE: usize = 4_096;
 const DOWNLOADER_UI_HELPER_SHA256: &str =
-    "d9dfecd9f200be6848d8a6319fc5f3a9edd4c4ce06b82f9d2a354ebbbd0fde9f";
+    "85416beb66fe49804766e5a2d007f2e822cb160ee8122e2de0a7d4fa524eb46e";
 const DOWNLOADER_UI_HELPER_XZ_HEX: &str = include_str!("downloader_ui_helper.hex");
 /// Sealed OpenGL renderer probe the game supervisor runs in the prefix;
 /// source in `tools/gl-probe-helper.c`, rebuilt by
@@ -445,10 +477,12 @@ fn approved_request_transport(spec: &ArtifactSpec) -> bool {
                 .is_ok_and(|url| url.scheme() == "http" && url.host_str().is_some()))
 }
 
+/// `previous_hops` counts the URLs requested so far, the first request
+/// included: a limit of 2 allows one redirect.
 fn approved_redirect(spec: &ArtifactSpec, destination: &str, previous_hops: usize) -> bool {
     let hop_limit = match spec.redirects {
         RedirectPolicy::None => return false,
-        RedirectPolicy::GithubReleaseAsset => 2,
+        RedirectPolicy::GithubReleaseAsset | RedirectPolicy::LaunchpadLibrarian => 2,
         RedirectPolicy::AnyHttp => CUSTOM_REDIRECT_LIMIT,
     };
     previous_hops < hop_limit && spec.approves_final_url(destination)
@@ -771,7 +805,48 @@ impl ArtifactSource for ProductionArtifactSource {
             );
         }
 
-        self.download(spec, cache, cache_directory, control, final_path, true)
+        self.download_from_sources(spec, cache, cache_directory, control, &final_path)
+    }
+}
+
+impl ProductionArtifactSource {
+    /// Download from each of the spec's sources in turn until one gives the
+    /// pinned bytes. Standard error names the host each came from.
+    fn download_from_sources(
+        &self,
+        spec: &ArtifactSpec,
+        cache: &Path,
+        cache_directory: &Directory,
+        control: &OperationControl,
+        final_path: &Path,
+    ) -> Result<AcquiredArtifact, AdapterFailure> {
+        let mut sources = spec.sources().peekable();
+        while let Some(source) = sources.next() {
+            let host = crate::sources::redacted_host(source.request_url());
+            match self.download(
+                &source,
+                cache,
+                cache_directory,
+                control,
+                final_path.to_path_buf(),
+                true,
+            ) {
+                Ok(acquired) => {
+                    eprintln!("pd2-launcher: downloaded {:?} from {host}", spec.kind());
+                    return Ok(acquired);
+                }
+                Err(failure) if control.is_cancelled() => return Err(failure),
+                Err(failure) => match sources.peek() {
+                    Some(next) => eprintln!(
+                        "pd2-launcher: {:?} could not be downloaded from {host}; trying {}",
+                        spec.kind(),
+                        crate::sources::redacted_host(next.request_url())
+                    ),
+                    None => return Err(failure),
+                },
+            }
+        }
+        Err(AdapterFailure::here())
     }
 }
 
@@ -1165,13 +1240,54 @@ fn validate_complete_payload_directory(
     identity: CompletePayloadIdentity,
     allow_known_source_directories: bool,
 ) -> Result<(), AdapterFailure> {
+    check_complete_payload_directory(directory, identity, allow_known_source_directories)
+        .map_err(|_| AdapterFailure::here())
+}
+
+/// Why a complete payload did not verify: the file, relative to the payload
+/// folder, and the check it failed (`unreadable`, `missing`, `partial` (a
+/// `.part` the downloader had not finished), `unexpected`, `not-a-file`,
+/// `size`, `not-a-program` or `sha256`), with the size found where it
+/// matters. File names come from Blizzard's downloader, never the player.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PayloadProblem {
+    file: String,
+    check: &'static str,
+    size: Option<u64>,
+}
+
+impl PayloadProblem {
+    fn new(file: impl Into<String>, check: &'static str) -> Self {
+        Self {
+            file: file.into(),
+            check,
+            size: None,
+        }
+    }
+
+    /// Whether the download looks unfinished (a file missing or still a
+    /// `.part`), rather than finished with other contents.
+    fn incomplete(&self) -> bool {
+        matches!(self.check, "missing" | "partial")
+    }
+}
+
+fn check_complete_payload_directory(
+    directory: &Directory,
+    identity: CompletePayloadIdentity,
+    allow_known_source_directories: bool,
+) -> Result<(), PayloadProblem> {
     let mut files = BTreeSet::new();
     let mut directx = None;
-    for name in directory.names().map_err(|_| AdapterFailure::here())? {
+    for name in directory
+        .names()
+        .map_err(|_| PayloadProblem::new(".", "unreadable"))?
+    {
+        let shown = name.to_string_lossy().into_owned();
         if matches!(name.to_str(), Some(PAYLOAD_INSTALLER | PAYLOAD_TOME)) {
             directory
                 .open_file(Path::new(&name))
-                .map_err(|_| AdapterFailure::here())?;
+                .map_err(|_| PayloadProblem::new(shown, "not-a-file"))?;
             files.insert(name);
             continue;
         }
@@ -1179,65 +1295,107 @@ fn validate_complete_payload_directory(
             directx = Some(
                 directory
                     .open_directory(Path::new(&name))
-                    .map_err(|_| AdapterFailure::here())?,
+                    .map_err(|_| PayloadProblem::new(shown, "unreadable"))?,
             );
             continue;
         }
         if allow_known_source_directories && name == OsStr::new("Installer.app") {
             directory
                 .open_directory(Path::new(&name))
-                .map_err(|_| AdapterFailure::here())?;
+                .map_err(|_| PayloadProblem::new(shown, "unreadable"))?;
             continue;
         }
-        return Err(AdapterFailure::here());
+        return Err(unexpected_payload_entry(shown));
     }
-    if files
-        != BTreeSet::from([
-            OsString::from(PAYLOAD_INSTALLER),
-            OsString::from(PAYLOAD_TOME),
-        ])
-    {
-        return Err(AdapterFailure::here());
+    for expected in [PAYLOAD_INSTALLER, PAYLOAD_TOME] {
+        if !files.contains(OsStr::new(expected)) {
+            return Err(PayloadProblem::new(expected, "missing"));
+        }
     }
-    validate_complete_payload_file(
+    check_complete_payload_file(
         directory,
+        "",
         PAYLOAD_INSTALLER,
         identity.installer_size,
         identity.installer_sha256,
         true,
     )?;
-    validate_complete_payload_file(
+    check_complete_payload_file(
         directory,
+        "",
         PAYLOAD_TOME,
         identity.tome_size,
         identity.tome_sha256,
         false,
     )?;
-    validate_payload_file_set(
-        &directx.ok_or_else(|| AdapterFailure::here())?,
+    check_payload_file_set(
+        &directx.ok_or_else(|| PayloadProblem::new(DIRECTX_DIRECTORY, "missing"))?,
         identity.directx_files,
     )
 }
 
-fn validate_payload_file_set(
+/// Remove a payload file that finished with other contents (`size`,
+/// `sha256`, `not-a-program`), only that file and only when it is still the
+/// regular file checked; a failure leaves it for the next check to report.
+fn discard_payload_file(root: &Directory, payload: &Path, problem: &PayloadProblem) {
+    if !matches!(problem.check, "size" | "sha256" | "not-a-program") {
+        return;
+    }
+    let path = payload.join(&problem.file);
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let removed = root.open_directory(parent).and_then(|folder| {
+        let file = folder.open_file(Path::new(name))?;
+        folder.remove_open_file_bounded(name, &file)
+    });
+    if let Err(error) = removed {
+        eprintln!(
+            "pd2-launcher: payload file {} was not removed: {}",
+            problem.file,
+            error.kind()
+        );
+    }
+}
+
+/// An entry a complete payload does not have; a `.part` is a file the
+/// downloader had not finished.
+fn unexpected_payload_entry(shown: String) -> PayloadProblem {
+    let check = if shown.ends_with(".part") {
+        "partial"
+    } else {
+        "unexpected"
+    };
+    PayloadProblem::new(shown, check)
+}
+
+fn check_payload_file_set(
     directory: &Directory,
     identities: &[PayloadFileIdentity],
-) -> Result<(), AdapterFailure> {
-    let expected = identities
-        .iter()
-        .map(|identity| OsString::from(identity.name))
-        .collect::<BTreeSet<_>>();
+) -> Result<(), PayloadProblem> {
+    let inside = |name: &str| format!("{DIRECTX_DIRECTORY}/{name}");
     let observed = directory
         .names()
-        .map_err(|_| AdapterFailure::here())?
+        .map_err(|_| PayloadProblem::new(DIRECTX_DIRECTORY, "unreadable"))?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if observed != expected {
-        return Err(AdapterFailure::here());
+    for name in &observed {
+        if !identities
+            .iter()
+            .any(|identity| OsStr::new(identity.name) == name.as_os_str())
+        {
+            return Err(unexpected_payload_entry(inside(&name.to_string_lossy())));
+        }
     }
     for identity in identities {
-        validate_complete_payload_file(
+        if !observed.contains(OsStr::new(identity.name)) {
+            return Err(PayloadProblem::new(inside(identity.name), "missing"));
+        }
+    }
+    for identity in identities {
+        check_complete_payload_file(
             directory,
+            DIRECTX_DIRECTORY,
             identity.name,
             identity.size,
             identity.sha256,
@@ -1247,25 +1405,38 @@ fn validate_payload_file_set(
     Ok(())
 }
 
-fn validate_complete_payload_file(
+fn check_complete_payload_file(
     directory: &Directory,
+    folder: &str,
     name: &str,
     expected_size: u64,
     expected_sha256: &str,
     executable: bool,
-) -> Result<(), AdapterFailure> {
+) -> Result<(), PayloadProblem> {
+    let shown = if folder.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{folder}/{name}")
+    };
+    let problem = |check| PayloadProblem::new(shown.clone(), check);
     let mut file = directory
         .open_file(Path::new(name))
-        .map_err(|_| AdapterFailure::here())?;
-    let metadata = file.metadata().map_err(|_| AdapterFailure::here())?;
-    if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() != expected_size {
-        return Err(AdapterFailure::here());
+        .map_err(|_| problem("not-a-file"))?;
+    let metadata = file.metadata().map_err(|_| problem("unreadable"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(problem("not-a-file"));
+    }
+    if metadata.len() != expected_size {
+        return Err(PayloadProblem {
+            size: Some(metadata.len()),
+            ..problem("size")
+        });
     }
     if executable {
-        validate_open_pe(&mut file).map_err(|_| AdapterFailure::here())?;
+        validate_open_pe(&mut file).map_err(|_| problem("not-a-program"))?;
     }
-    if sha256_open_file(&mut file)? != expected_sha256 {
-        return Err(AdapterFailure::here());
+    if sha256_open_file(&mut file).map_err(|_| problem("unreadable"))? != expected_sha256 {
+        return Err(problem("sha256"));
     }
     Ok(())
 }
@@ -2043,6 +2214,11 @@ pub(crate) struct ProductionInstallDriver {
     host: Arc<dyn HostExecution>,
     custom_wine: bool,
     wpf_software_rendering: bool,
+    download_stall_limit: Duration,
+    download_resume_limit: Duration,
+    download_empty_limit: Duration,
+    /// The host's received-byte count ([`RECEIVED_BYTES_FILE`]).
+    received_bytes: Option<PathBuf>,
 }
 
 impl ProductionInstallDriver {
@@ -2051,7 +2227,30 @@ impl ProductionInstallDriver {
             host,
             custom_wine: false,
             wpf_software_rendering: true,
+            download_stall_limit: DOWNLOAD_STALL_LIMIT,
+            download_resume_limit: DOWNLOAD_RESUME_LIMIT,
+            download_empty_limit: DOWNLOAD_EMPTY_LIMIT,
+            received_bytes: env::var_os(RECEIVED_BYTES_FILE)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         }
+    }
+
+    /// Another [`DOWNLOAD_STALL_LIMIT`], also for an empty folder, for tests
+    /// that cannot wait for them.
+    #[cfg(test)]
+    fn with_download_stall_limit(mut self, limit: Duration) -> Self {
+        self.download_stall_limit = limit;
+        self.download_resume_limit = limit;
+        self.download_empty_limit = limit;
+        self
+    }
+
+    /// Another received-byte count file, for tests.
+    #[cfg(test)]
+    fn with_received_bytes(mut self, file: PathBuf) -> Self {
+        self.received_bytes = Some(file);
+        self
     }
 
     /// The official-launcher software rendering setting: written into a new
@@ -2082,6 +2281,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: if self.wpf_software_rendering {
                 &[]
             } else {
@@ -2130,6 +2330,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })?;
         let prefix = paths
@@ -2183,6 +2384,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })?;
         record_dependency_provenance(paths, PrefixDependency::WineMono, mono)
@@ -2210,6 +2412,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             // 3010 "restart required" is success for an unattended install; the
             // receipt still needs the pinned runtime folder.
             accepted_exit_codes: &[DOTNET_RESTART_REQUIRED_STATUS],
@@ -2264,6 +2467,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })
     }
@@ -2500,6 +2704,9 @@ impl ProductionInstallDriver {
                     self.host
                         .spawn(request)
                         .map_err(|_| AdapterFailure::here())?,
+                    invocation
+                        .ui_helper
+                        .map_or("installer UI helper", UiHelper::label),
                 ),
             ),
             None => None,
@@ -2521,6 +2728,7 @@ impl ProductionInstallDriver {
             &label,
             request,
             deadline,
+            invocation.stall,
             invocation.control,
             &mut helper,
             invocation.profile == WineProfile::OfficialLauncher,
@@ -2770,7 +2978,16 @@ impl ProductionInstallDriver {
         any_exit: bool,
     ) -> Result<ProcessWait, AdapterFailure> {
         let label = crate::activity::process_label(request.executable(), request.arguments());
-        self.spawn_and_wait_accepting(&label, request, deadline, control, helper, any_exit, &[])
+        self.spawn_and_wait_accepting(
+            &label,
+            request,
+            deadline,
+            None,
+            control,
+            helper,
+            any_exit,
+            &[],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2779,6 +2996,7 @@ impl ProductionInstallDriver {
         label: &str,
         request: ProcessRequest,
         deadline: Instant,
+        stall: Option<&DownloadStall>,
         control: &OperationControl,
         helper: &mut Option<Box<dyn SupervisedProcess>>,
         any_exit: bool,
@@ -2793,6 +3011,10 @@ impl ProductionInstallDriver {
             );
             AdapterFailure
         })?);
+        // The stall clock counts from here, not from the setup before it.
+        if let Some(stall) = stall {
+            stall.arm();
+        }
         loop {
             if control.is_cancelled() {
                 let process_stopped = stop_owned_process(&mut process);
@@ -2860,7 +3082,7 @@ impl ProductionInstallDriver {
                     Ok(Some(exit)) if exit.success() => *helper = None,
                     Ok(Some(exit)) => {
                         crate::activity::record_process(
-                            "installer UI helper",
+                            helper_process.helper_label(),
                             "exited",
                             exit.code(),
                             &helper_process.output(),
@@ -2876,11 +3098,27 @@ impl ProductionInstallDriver {
                     Ok(None) => {}
                 }
             }
+            // A download that stopped changing ends like a timeout, under its
+            // own name in the activity log; after the helper's check, so an
+            // error the helper saw in the same poll is the one reported.
+            if let Some(stall) = stall
+                && stall.is_stalled()
+            {
+                stall.mark_ended();
+                if let Some(process) = process.as_ref() {
+                    crate::activity::record_process(label, "stalled", None, &process.output());
+                }
+                stop_owned_process(&mut process);
+                return Err(AdapterFailure::here());
+            }
             thread::sleep(PROCESS_POLL_INTERVAL);
         }
     }
 }
 
+/// The sealed downloader helper saw a message box: Blizzard's downloader
+/// reported an error (the helper prints its text).
+const DOWNLOADER_HELPER_ERROR_DIALOG: i32 = 23;
 /// The sealed vendor helper saw the installer's generic `Installer` error
 /// dialog.
 const VENDOR_HELPER_ERROR_DIALOG: i32 = 20;
@@ -2902,10 +3140,15 @@ impl HelperExit {
         Some(self.0.load(Ordering::SeqCst)).filter(|code| *code != Self::NONE)
     }
 
-    fn observe(&self, inner: Box<dyn SupervisedProcess>) -> Box<dyn SupervisedProcess> {
+    fn observe(
+        &self,
+        inner: Box<dyn SupervisedProcess>,
+        label: &'static str,
+    ) -> Box<dyn SupervisedProcess> {
         Box::new(ObservedHelper {
             inner,
             exit: self.clone(),
+            label,
         })
     }
 
@@ -2924,10 +3167,12 @@ impl Default for HelperExit {
     }
 }
 
-/// A helper process whose exit status is recorded as it is observed.
+/// A helper process whose exit status is recorded as it is observed, and
+/// which the activity log names by its kind ([`UiHelper::label`]).
 struct ObservedHelper {
     inner: Box<dyn SupervisedProcess>,
     exit: HelperExit,
+    label: &'static str,
 }
 
 impl SupervisedProcess for ObservedHelper {
@@ -2951,6 +3196,10 @@ impl SupervisedProcess for ObservedHelper {
 
     fn output(&self) -> crate::host_execution::ProcessOutput {
         self.inner.output()
+    }
+
+    fn helper_label(&self) -> &'static str {
+        self.label
     }
 }
 
@@ -2987,7 +3236,7 @@ fn finish_helper_within(
         }
         Ok(Some(exit)) => {
             crate::activity::record_process(
-                "installer UI helper",
+                process.helper_label(),
                 "exited",
                 exit.code(),
                 &process.output(),
@@ -2997,7 +3246,7 @@ fn finish_helper_within(
         }
         Ok(None) | Err(_) => {
             crate::activity::record_process(
-                "installer UI helper",
+                process.helper_label(),
                 "did-not-exit",
                 None,
                 &process.output(),
@@ -3054,6 +3303,8 @@ struct WineInvocation<'a> {
     ui_helper: Option<UiHelper>,
     /// Unix exit statuses of the child accepted besides success.
     accepted_exit_codes: &'static [i32],
+    /// Ends the child early once its download stopped changing.
+    stall: Option<&'a DownloadStall>,
 }
 
 /// Environment and exit policy of one Wine invocation.
@@ -3082,6 +3333,14 @@ enum UiHelper {
 }
 
 impl UiHelper {
+    /// Its name in the activity log; the report reads its exit codes by it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vendor => "installer UI helper",
+            Self::Downloader => "downloader UI helper",
+        }
+    }
+
     fn sealed_file(self) -> Result<File, AdapterFailure> {
         match self {
             Self::Vendor => sealed_helper_file(
@@ -3512,21 +3771,34 @@ impl ProductionInstallDriver {
     /// identity exactly as a selected complete payload. Nothing the
     /// download produced runs before that. A payload that does not verify
     /// is kept for the downloader to resume on the next attempt.
+    /// Blizzard's downloader for `wrapper`: its verified payload folder and
+    /// installer. How it failed, when it did, is told apart for the stage
+    /// and the player: a download that stopped changing for the stall limit
+    /// ([`VendorFailure::DownloadStalled`], a connection problem), an error
+    /// box its helper saw ([`VendorFailure::DownloaderErrorDialog`], whose
+    /// text the helper prints), a download that ended unfinished or whose
+    /// files differ from their identity ([`VendorFailure::PayloadIncomplete`],
+    /// [`VendorFailure::PayloadRejected`], each recorded with the file and
+    /// the check), and any other end of the downloader
+    /// ([`VendorFailure::WrapperDownload`]).
     fn download_wrapper_payload(
         &self,
         paths: &ManagedPaths,
         wrapper: &VerifiedArtifact,
         mutation_lease: &File,
         control: &OperationControl,
-    ) -> Result<(PathBuf, VerifiedArtifact), AdapterFailure> {
-        let identity =
-            complete_payload_identity(wrapper.kind()).ok_or_else(|| AdapterFailure::here())?;
+    ) -> Result<(PathBuf, VerifiedArtifact), VendorFailure> {
+        let identity = complete_payload_identity(wrapper.kind()).ok_or(VendorFailure::Install)?;
         paths
             .directory()
             .ensure_directory(Path::new(WRAPPER_DOWNLOADS))
-            .map_err(|_| AdapterFailure::here())?;
+            .map_err(|_| VendorFailure::WrapperDownload)?;
+        let stall = DownloadStall::default();
+        let helper_exit = HelperExit::default();
         // The Blizzard Downloader reports no progress of its own; the
-        // growth of its download folder is the only honest measure.
+        // growth of its download folder is the only honest measure, and a
+        // folder that stops changing while no data comes in ends it
+        // ([`DOWNLOAD_STALL_LIMIT`], [`DOWNLOAD_ACTIVITY_BYTES`]).
         let _watcher = DownloadFolderWatcher::start(
             paths.root().join(WRAPPER_DOWNLOADS),
             identity.installer_size + identity.tome_size,
@@ -3535,6 +3807,14 @@ impl ProductionInstallDriver {
                 _ => WorkPhase::BaseGameDownload,
             },
             control.clone(),
+            GrowthClock::new(
+                self.download_stall_limit,
+                self.download_resume_limit,
+                self.download_empty_limit,
+                Instant::now(),
+            ),
+            stall.clone(),
+            self.received_bytes.clone(),
         );
         // The wrapper re-reads its own image for the embedded download
         // description. A UI helper starts the prefix's wineserver first, and
@@ -3542,26 +3822,55 @@ impl ProductionInstallDriver {
         // descriptor, so the wrapper is named beneath the inherited
         // managed-root descriptor; the verified object stays inherited as
         // proof.
-        self.run_wine(WineInvocation {
-            paths,
-            runtime: self.installed_runtime(paths),
-            working_directory: paths.root(),
-            program: WineProgram::ManagedVerified(wrapper),
-            verified_argument: None,
-            arguments: wrapper_arguments(),
-            profile: WineProfile::Install,
-            timeout: INSTALL_TIMEOUT,
-            mutation_lease,
-            control,
-            ui_helper: Some(UiHelper::Downloader),
-            accepted_exit_codes: &[],
+        self.run_wine_observing_helper(
+            WineInvocation {
+                paths,
+                runtime: self.installed_runtime(paths),
+                working_directory: paths.root(),
+                program: WineProgram::ManagedVerified(wrapper),
+                verified_argument: None,
+                arguments: wrapper_arguments(),
+                profile: WineProfile::Install,
+                timeout: INSTALL_TIMEOUT,
+                mutation_lease,
+                control,
+                ui_helper: Some(UiHelper::Downloader),
+                stall: Some(&stall),
+                accepted_exit_codes: &[],
+            },
+            &helper_exit,
+        )
+        .map_err(|_| {
+            if stall.ended_it() {
+                VendorFailure::DownloadStalled
+            } else if helper_exit.code() == Some(DOWNLOADER_HELPER_ERROR_DIALOG) {
+                VendorFailure::DownloaderErrorDialog
+            } else {
+                VendorFailure::WrapperDownload
+            }
         })?;
         let relative = Path::new(WRAPPER_DOWNLOADS).join(identity.source_directory);
-        let payload = paths
+        // What the downloader left: unfinished, or finished with other files.
+        let checked = paths
             .directory()
             .open_directory(&relative)
-            .map_err(|_| AdapterFailure::here())?;
-        validate_complete_payload_directory(&payload, identity, true)?;
+            .map_err(|_| PayloadProblem::new(".", "missing"))
+            .and_then(|payload| check_complete_payload_directory(&payload, identity, true));
+        if let Err(problem) = checked {
+            crate::activity::record_payload_problem(
+                identity.source_directory,
+                &problem.file,
+                problem.check,
+                problem.size,
+            );
+            if problem.incomplete() {
+                return Err(VendorFailure::PayloadIncomplete);
+            }
+            // A finished file the downloader would keep on its next run:
+            // removed, so the retry or Try again downloads it again.
+            discard_payload_file(paths.directory(), &relative, &problem);
+            return Err(VendorFailure::PayloadRejected);
+        }
         let directory = paths.root().join(&relative);
         let installer = VerifiedArtifact {
             kind: wrapper.kind(),
@@ -3643,6 +3952,7 @@ impl ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })
     }
@@ -3806,6 +4116,7 @@ impl InstallDriver for ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })?;
         if let Some(version) = runtime.windows_version() {
@@ -3821,6 +4132,7 @@ impl InstallDriver for ProductionInstallDriver {
                 mutation_lease,
                 control,
                 ui_helper: None,
+                stall: None,
                 accepted_exit_codes: &[],
             })?;
         }
@@ -3861,8 +4173,7 @@ impl InstallDriver for ProductionInstallDriver {
         if managed_complete_payload_directory(wrapper, paths)?.is_some() {
             return Ok(());
         }
-        self.download_wrapper_payload(paths, wrapper, mutation_lease, control)
-            .map_err(|_| VendorFailure::WrapperDownload)?;
+        self.download_wrapper_payload(paths, wrapper, mutation_lease, control)?;
         // The prefix is quiet: keep the verified payload as the product's
         // complete installer in the artifact cache, then remove the
         // download folder. Nothing it fetched has run.
@@ -3940,6 +4251,7 @@ impl InstallDriver for ProductionInstallDriver {
                 mutation_lease,
                 control,
                 ui_helper: None,
+                stall: None,
                 accepted_exit_codes: &[],
             })?;
         }
@@ -3974,14 +4286,12 @@ impl InstallDriver for ProductionInstallDriver {
         let (payload_directory, installer) = match payload_directory {
             Some(directory) => (directory, request.artifact()),
             None => {
-                downloaded = self
-                    .download_wrapper_payload(
-                        request.paths(),
-                        request.artifact(),
-                        mutation_lease,
-                        control,
-                    )
-                    .map_err(|_| VendorFailure::WrapperDownload)?;
+                downloaded = self.download_wrapper_payload(
+                    request.paths(),
+                    request.artifact(),
+                    mutation_lease,
+                    control,
+                )?;
                 (downloaded.0.clone(), &downloaded.1)
             }
         };
@@ -4007,6 +4317,7 @@ impl InstallDriver for ProductionInstallDriver {
                         mutation_lease,
                         control,
                         ui_helper: Some(UiHelper::Vendor),
+                        stall: None,
                         accepted_exit_codes: &[],
                     },
                     &helper_exit,
@@ -4055,6 +4366,7 @@ impl InstallDriver for ProductionInstallDriver {
             mutation_lease,
             control,
             ui_helper: None,
+            stall: None,
             accepted_exit_codes: &[],
         })?;
         // The pinned bootstrap installed the official launcher: its copy is
@@ -4071,15 +4383,27 @@ impl InstallDriver for ProductionInstallDriver {
 /// while it runs. It only reads sizes (never following a link) and decides
 /// nothing: the payload is still verified by its frozen identity.
 struct DownloadFolderWatcher {
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl DownloadFolderWatcher {
     const INTERVAL: Duration = Duration::from_secs(1);
 
-    fn start(folder: PathBuf, expected: u64, phase: WorkPhase, control: OperationControl) -> Self {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    /// Reports the folder's size as `phase`'s progress each second and,
+    /// once its program runs ([`DownloadStall::arm`]), sets `stall` when
+    /// `clock` finds the folder unchanged and no data received (the host's
+    /// count in `received`, when it gives one) for its limit.
+    fn start(
+        folder: PathBuf,
+        expected: u64,
+        phase: WorkPhase,
+        control: OperationControl,
+        mut clock: GrowthClock,
+        stall: DownloadStall,
+        received: Option<PathBuf>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("pd2-download-watch".to_owned())
@@ -4092,6 +4416,23 @@ impl DownloadFolderWatcher {
                                 .with_file_bytes(size, Some(expected)),
                         );
                     }
+                    let count = received.as_deref().and_then(received_bytes);
+                    if stall.is_armed()
+                        && clock.observe(folder_state(&folder, 8), count, Instant::now())
+                        && !stall.is_stalled()
+                    {
+                        // How much came in while it waited, to check
+                        // DOWNLOAD_ACTIVITY_BYTES in the field.
+                        eprintln!(
+                            "pd2-launcher: the download showed no activity for its limit \
+                             (received since the data last counted: {})",
+                            clock.received_since_mark(count).map_or_else(
+                                || "not counted".to_owned(),
+                                |bytes| format!("{bytes} bytes")
+                            )
+                        );
+                        stall.mark_stalled();
+                    }
                     let mut waited = Duration::ZERO;
                     while waited < Self::INTERVAL && !stopped.load(Ordering::Acquire) {
                         thread::sleep(Duration::from_millis(100));
@@ -4099,8 +4440,174 @@ impl DownloadFolderWatcher {
                     }
                 }
             })
+            .map_err(|error| {
+                // Neither progress nor the stall limit then: the run waits
+                // for its own timeout.
+                eprintln!("pd2-launcher: the download watcher did not start: {error}");
+            })
             .ok();
         Self { stop, thread }
+    }
+}
+
+/// A watched download's stall, shared by its [`DownloadFolderWatcher`] and
+/// the wait for its program ([`WineInvocation::stall`]): the clock counts
+/// once the program runs ([`Self::arm`]), the wait ends the program when
+/// [`Self::is_stalled`], and [`Self::ended_it`] then tells that end apart
+/// from another failure of the same run.
+#[derive(Clone, Default)]
+struct DownloadStall(Arc<StallState>);
+
+#[derive(Default)]
+struct StallState {
+    armed: AtomicBool,
+    stalled: AtomicBool,
+    ended: AtomicBool,
+}
+
+impl DownloadStall {
+    fn arm(&self) {
+        self.0.armed.store(true, Ordering::Release);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.0.armed.load(Ordering::Acquire)
+    }
+
+    fn mark_stalled(&self) {
+        self.0.stalled.store(true, Ordering::Release);
+    }
+
+    fn is_stalled(&self) -> bool {
+        self.0.stalled.load(Ordering::Acquire)
+    }
+
+    fn mark_ended(&self) {
+        self.0.ended.store(true, Ordering::Release);
+    }
+
+    fn ended_it(&self) -> bool {
+        self.0.ended.load(Ordering::Acquire)
+    }
+}
+
+/// What tells a download folder changed: how many files it holds, their
+/// total length and their allocated blocks, so a downloader that fills a file
+/// of its final length (pieces out of order) still counts as working. Not
+/// modification times: a downloader that only rewrites a state file is not
+/// downloading.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FolderState {
+    files: u64,
+    length: u64,
+    blocks: u64,
+}
+
+/// [`FolderState`] of the regular files below `folder`, `depth` levels deep.
+fn folder_state(folder: &Path, depth: usize) -> FolderState {
+    let mut state = FolderState::default();
+    let Ok(entries) = fs::read_dir(folder) else {
+        return state;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {
+                if let Ok(metadata) = entry.metadata() {
+                    state.files += 1;
+                    state.length += metadata.len();
+                    state.blocks += metadata.blocks();
+                }
+            }
+            Ok(kind) if kind.is_dir() && depth > 1 => {
+                let inner = folder_state(&entry.path(), depth - 1);
+                state.files += inner.files;
+                state.length += inner.length;
+                state.blocks += inner.blocks;
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+/// The host's received-byte count in `file` ([`RECEIVED_BYTES_FILE`]), if it
+/// holds one.
+fn received_bytes(file: &Path) -> Option<u64> {
+    fs::read_to_string(file).ok()?.trim().parse().ok()
+}
+
+/// When a download last showed activity: [`Self::observe`] says whether it
+/// has shown none for its limit. Activity is any change of its folder, as a
+/// downloader may also start a file again or replace its parts, or
+/// [`DOWNLOAD_ACTIVITY_BYTES`] received since the data last counted, when the
+/// host counts them (so a slow trickle adds up). The limit is `limit`
+/// ([`DOWNLOAD_STALL_LIMIT`]) once the folder has changed; before that the
+/// downloader has not started writing: `resume_limit`
+/// ([`DOWNLOAD_RESUME_LIMIT`]) while the folder holds parts from an earlier
+/// run, `empty_limit` ([`DOWNLOAD_EMPTY_LIMIT`]) while it holds none, as one
+/// that never showed its window is the helper's to report (its exit 21).
+/// Data only ever moves the start of the wait later: with it a downloader is
+/// never stopped sooner than by its folder alone.
+struct GrowthClock {
+    limit: Duration,
+    resume_limit: Duration,
+    empty_limit: Duration,
+    state: Option<FolderState>,
+    /// The received bytes at the last activity.
+    received: Option<u64>,
+    changed: bool,
+    since: Instant,
+}
+
+impl GrowthClock {
+    fn new(limit: Duration, resume_limit: Duration, empty_limit: Duration, now: Instant) -> Self {
+        Self {
+            limit,
+            resume_limit,
+            empty_limit,
+            state: None,
+            received: None,
+            changed: false,
+            since: now,
+        }
+    }
+
+    fn observe(&mut self, state: FolderState, received: Option<u64>, now: Instant) -> bool {
+        let first = self.state.is_none();
+        let folder = !first && self.state != Some(state);
+        let data = match (received, self.received) {
+            (Some(now_received), Some(mark)) => {
+                now_received.saturating_sub(mark) >= DOWNLOAD_ACTIVITY_BYTES
+                    // A count that went down started again (a restarted host).
+                    || now_received < mark
+            }
+            _ => false,
+        };
+        if first || folder || data {
+            self.state = Some(state);
+            self.since = now;
+        }
+        // Only the folder says the downloader writes: data alone keeps the
+        // longer limits before that.
+        self.changed |= folder;
+        // The mark moves when data counted, so a slow trickle adds up; a
+        // count that appears later starts it.
+        if first || data || self.received.is_none() {
+            self.received = received;
+        }
+        let limit = if self.changed {
+            self.limit
+        } else if state.files > 0 {
+            self.resume_limit
+        } else {
+            self.empty_limit
+        };
+        now.saturating_duration_since(self.since) >= limit
+    }
+
+    /// The bytes received since the data last counted, when the host counts them.
+    fn received_since_mark(&self, received: Option<u64>) -> Option<u64> {
+        Some(received?.saturating_sub(self.received?))
     }
 }
 
@@ -5334,6 +5841,7 @@ mod tests {
             size: SizePolicy::Exact(bytes.len() as u64),
             integrity: IntegrityPolicy::Sha256(digest),
             expected_filename: None,
+            fallback_urls: &[],
         }
     }
 
@@ -5345,6 +5853,7 @@ mod tests {
             size: SizePolicy::Bounded { min: 64, max: 256 },
             integrity: IntegrityPolicy::PeExecutable,
             expected_filename: Some("Diablo-II-Setup.exe"),
+            fallback_urls: &[],
         }
     }
 
@@ -5460,6 +5969,44 @@ mod tests {
         fs::write(directory.path().join(PAYLOAD_TOME), tome).unwrap();
         fs::write(directory.path().join("unexpected"), b"preserve").unwrap();
         assert!(validate_complete_payload_directory(&opened, identity, false).is_err());
+        fs::remove_file(directory.path().join("unexpected")).unwrap();
+
+        // Each failure names its file and check: an unfinished download
+        // (missing, partial) apart from finished files that differ.
+        let check = || check_complete_payload_directory(&opened, identity, false).unwrap_err();
+        fs::write(directory.path().join(PAYLOAD_TOME), b"wrong size").unwrap();
+        let problem = check();
+        assert_eq!(
+            (problem.file.as_str(), problem.check, problem.size),
+            (PAYLOAD_TOME, "size", Some(10))
+        );
+        assert!(!problem.incomplete());
+        fs::write(
+            directory.path().join(PAYLOAD_TOME),
+            b"fixture installer tomb",
+        )
+        .unwrap();
+        assert_eq!(check(), PayloadProblem::new(PAYLOAD_TOME, "sha256"));
+        fs::remove_file(directory.path().join(PAYLOAD_TOME)).unwrap();
+        fs::write(directory.path().join("Installer Tome.mpq.part"), b"half").unwrap();
+        let problem = check();
+        assert_eq!(
+            problem,
+            PayloadProblem::new("Installer Tome.mpq.part", "partial")
+        );
+        assert!(problem.incomplete());
+        fs::remove_file(directory.path().join("Installer Tome.mpq.part")).unwrap();
+        assert_eq!(check(), PayloadProblem::new(PAYLOAD_TOME, "missing"));
+        fs::write(directory.path().join(PAYLOAD_TOME), tome).unwrap();
+        fs::write(
+            directory.path().join(DIRECTX_DIRECTORY).join("fixture.cab"),
+            b"fixture DirectY",
+        )
+        .unwrap();
+        assert_eq!(
+            check(),
+            PayloadProblem::new(format!("{DIRECTX_DIRECTORY}/fixture.cab"), "sha256")
+        );
     }
 
     #[test]
@@ -7269,6 +7816,41 @@ mod tests {
             "https://release-assets.githubusercontent.com/asset",
             2,
         ));
+        // Launchpad's file link: one redirect, to the librarian's copy.
+        let files = catalog
+            .spec(ArtifactKind::FexPackage)
+            .sources()
+            .nth(1)
+            .unwrap();
+        let librarian = format!(
+            "https://launchpadlibrarian.net/877920512/{}",
+            files.request_url().rsplit_once('/').unwrap().1
+        );
+        assert!(approved_redirect(&files, &librarian, 1));
+        assert!(!approved_redirect(&files, &librarian, 2));
+        assert!(!approved_redirect(
+            &files,
+            "https://launchpadlibrarian.net/877920512/other.deb",
+            1
+        ));
+        // The mirror: one redirect, to GitHub's asset host.
+        let mirror = catalog
+            .spec(ArtifactKind::FexPackage)
+            .sources()
+            .next()
+            .unwrap();
+        assert!(approved_redirect(
+            &mirror,
+            "https://release-assets.githubusercontent.com/asset",
+            1
+        ));
+        // The pool: none.
+        let pool = catalog
+            .spec(ArtifactKind::FexPackage)
+            .sources()
+            .nth(2)
+            .unwrap();
+        assert!(!approved_redirect(&pool, &librarian, 1));
     }
 
     fn run_helper_invocation(host: Arc<LifetimeHost>) -> Result<(), AdapterFailure> {
@@ -7301,6 +7883,7 @@ mod tests {
             mutation_lease: &lease,
             control,
             ui_helper: Some(UiHelper::Downloader),
+            stall: None,
             accepted_exit_codes: &[],
         })
     }
@@ -7426,8 +8009,21 @@ mod tests {
 
         let (publisher, receiver) = crate::operation::progress_channel();
         let control = OperationControl::with_progress(publisher);
-        let watcher =
-            DownloadFolderWatcher::start(folder, 1_000, WorkPhase::BaseGameInstall, control);
+        let stall = DownloadStall::default();
+        let watcher = DownloadFolderWatcher::start(
+            folder,
+            1_000,
+            WorkPhase::BaseGameInstall,
+            control,
+            GrowthClock::new(
+                DOWNLOAD_STALL_LIMIT,
+                DOWNLOAD_RESUME_LIMIT,
+                DOWNLOAD_EMPTY_LIMIT,
+                Instant::now(),
+            ),
+            stall.clone(),
+            None,
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         let progress = loop {
             if let Some(progress) = receiver.take_latest() {
@@ -7437,6 +8033,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         };
         drop(watcher);
+        assert!(!stall.is_stalled());
         assert_eq!(progress.phase(), WorkPhase::BaseGameInstall);
         let bytes = progress.file_bytes().unwrap();
         assert_eq!((bytes.completed(), bytes.total()), (500, Some(1_000)));
@@ -7481,6 +8078,7 @@ mod tests {
                     mutation_lease: &lease,
                     control: &OperationControl::default(),
                     ui_helper: Some(UiHelper::Vendor),
+                    stall: None,
                     accepted_exit_codes: &[],
                 },
                 &helper_exit,
@@ -7514,6 +8112,7 @@ mod tests {
                         mutation_lease: &lease,
                         control: &control,
                         ui_helper: Some(UiHelper::Vendor),
+                        stall: None,
                         accepted_exit_codes: &[],
                     },
                     &helper_exit,
@@ -7816,6 +8415,7 @@ mod tests {
                 mutation_lease: &lease,
                 control: &OperationControl::default(),
                 ui_helper: None,
+                stall: None,
                 accepted_exit_codes: &[],
             })
             .unwrap();
@@ -8125,8 +8725,9 @@ mod tests {
         let failure = ProductionInstallDriver::new(host.clone())
             .install_vendor(request, &lease, &OperationControl::default())
             .unwrap_err();
-        // No installer ran, so the stage may fetch a fresh wrapper once.
-        assert_eq!(failure, VendorFailure::WrapperDownload);
+        // An unfinished download; no installer ran, so the stage may fetch a
+        // fresh wrapper once.
+        assert_eq!(failure, VendorFailure::PayloadIncomplete);
         let requests = host.requests.lock().unwrap();
         assert_eq!(requests.len(), 3, "helper, wrapper, wineserver -w");
         assert_guest_preloader(&requests[0]);
@@ -8180,6 +8781,345 @@ mod tests {
         ));
     }
 
+    /// The helper and Blizzard's downloader run until they are stopped, as at
+    /// its "Lost Internet Connection!"; every later process completes.
+    #[derive(Default)]
+    struct StalledDownloadHost {
+        spawns: AtomicUsize,
+        terminated: Arc<AtomicUsize>,
+    }
+
+    impl HostExecution for StalledDownloadHost {
+        fn spawn(&self, _: ProcessRequest) -> io::Result<Box<dyn SupervisedProcess>> {
+            if self.spawns.fetch_add(1, Ordering::AcqRel) < 2 {
+                Ok(Box::new(WaitingProcess {
+                    terminated: Arc::clone(&self.terminated),
+                }))
+            } else {
+                Ok(Box::new(CompleteProcess))
+            }
+        }
+    }
+
+    struct WaitingProcess {
+        terminated: Arc<AtomicUsize>,
+    }
+
+    impl SupervisedProcess for WaitingProcess {
+        fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
+            Ok(None)
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.terminated.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn wait(&mut self) -> io::Result<ProcessExit> {
+            Ok(ProcessExit::new(false, None))
+        }
+    }
+
+    #[test]
+    fn a_download_that_stops_changing_ends_the_downloader_as_stalled() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let artifact = verified_test_artifact(
+            ArtifactKind::BaseGameWrapper,
+            fixture.path().join("wrapper.exe"),
+        );
+        let host = Arc::new(StalledDownloadHost::default());
+        let lease = fixture_lease(fixture.path());
+
+        // A limit of zero: the first look once the downloader runs finds
+        // the folder unchanged. Bounded, so a regression fails instead of
+        // waiting for the install timeout.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let driver_host = host.clone();
+        thread::spawn(move || {
+            let failure = ProductionInstallDriver::new(driver_host)
+                .with_download_stall_limit(Duration::ZERO)
+                .download_vendor_payload(&paths, &artifact, &lease, &OperationControl::default())
+                .unwrap_err();
+            let _ = sender.send(failure);
+            drop(fixture);
+        });
+        let failure = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stalled downloader was not stopped");
+
+        // A lost connection, not an expired wrapper: no fresh one is fetched.
+        assert_eq!(failure, VendorFailure::DownloadStalled);
+        // The downloader and its helper were both stopped.
+        assert_eq!(host.terminated.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_downloader_that_receives_data_is_not_stopped_however_slowly_it_writes() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let artifact = verified_test_artifact(
+            ArtifactKind::BaseGameWrapper,
+            fixture.path().join("wrapper.exe"),
+        );
+        let counter = fixture.path().join("received-bytes");
+        fs::write(&counter, "0\n").unwrap();
+        let host = Arc::new(StalledDownloadHost::default());
+        let lease = fixture_lease(fixture.path());
+        // Data comes in for six seconds; nothing is written to the folder.
+        let feeder = {
+            let counter = counter.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let mut bytes = 0u64;
+                while started.elapsed() < Duration::from_secs(6) {
+                    bytes += 128 * 1024;
+                    fs::write(&counter, format!("{bytes}\n")).unwrap();
+                    thread::sleep(Duration::from_millis(300));
+                }
+                Instant::now()
+            })
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let driver_host = host.clone();
+        thread::spawn(move || {
+            let failure = ProductionInstallDriver::new(driver_host)
+                .with_download_stall_limit(Duration::from_secs(1))
+                .with_received_bytes(counter)
+                .download_vendor_payload(&paths, &artifact, &lease, &OperationControl::default())
+                .unwrap_err();
+            let _ = sender.send((failure, Instant::now()));
+            drop(fixture);
+        });
+        let (failure, stopped) = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the downloader was not stopped once the data stopped");
+        let fed_until = feeder.join().unwrap();
+        assert_eq!(failure, VendorFailure::DownloadStalled);
+        // Stopped only once no data came for the limit after the feed ended:
+        // with the folder alone it would have stopped a second after arming.
+        assert!(
+            stopped >= fed_until + Duration::from_millis(500),
+            "stopped {:?} before the feed ended",
+            fed_until.saturating_duration_since(stopped)
+        );
+    }
+
+    /// The downloader's helper exits 23 at once (Blizzard's downloader
+    /// showed a message box); the downloader itself would run on.
+    #[derive(Default)]
+    struct DownloaderErrorHost {
+        spawns: AtomicUsize,
+        terminated: Arc<AtomicUsize>,
+    }
+
+    impl HostExecution for DownloaderErrorHost {
+        fn spawn(&self, _: ProcessRequest) -> io::Result<Box<dyn SupervisedProcess>> {
+            match self.spawns.fetch_add(1, Ordering::AcqRel) {
+                0 => Ok(Box::new(ExitedProcess(ProcessExit::new(false, Some(23))))),
+                1 => Ok(Box::new(WaitingProcess {
+                    terminated: Arc::clone(&self.terminated),
+                })),
+                _ => Ok(Box::new(CompleteProcess)),
+            }
+        }
+    }
+
+    struct ExitedProcess(ProcessExit);
+
+    impl SupervisedProcess for ExitedProcess {
+        fn try_wait(&mut self) -> io::Result<Option<ProcessExit>> {
+            Ok(Some(self.0))
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_helper_error_in_the_same_poll_wins_over_a_stall_that_has_passed() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let host = Arc::new(DownloaderErrorHost::default());
+        // The downloader is the second spawn: skip the helper's slot.
+        host.spawns.store(1, Ordering::Release);
+        let stall = DownloadStall::default();
+        stall.mark_stalled();
+        let mut helper: Option<Box<dyn SupervisedProcess>> =
+            Some(Box::new(ExitedProcess(ProcessExit::new(false, Some(23)))));
+        let result = ProductionInstallDriver::new(host.clone()).spawn_and_wait_accepting(
+            "wine BaseGameWrapper",
+            ProcessRequest::guest("/bin/false"),
+            Instant::now() + Duration::from_secs(30),
+            Some(&stall),
+            &OperationControl::default(),
+            &mut helper,
+            false,
+            &[],
+        );
+        assert!(result.is_err());
+        // The helper's error ended it, not the stall.
+        assert!(!stall.ended_it());
+        assert_eq!(host.terminated.load(Ordering::Acquire), 1, "the downloader");
+        drop((fixture, paths));
+    }
+
+    #[test]
+    fn a_finished_file_that_differs_is_recorded_and_removed_so_the_retry_downloads_it() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let artifact = verified_test_artifact(
+            ArtifactKind::BaseGameWrapper,
+            fixture.path().join("wrapper.exe"),
+        );
+        let identity = complete_payload_identity(ArtifactKind::BaseGameWrapper).unwrap();
+        let payload = paths
+            .root()
+            .join(WRAPPER_DOWNLOADS)
+            .join(identity.source_directory);
+        fs::create_dir_all(payload.join(DIRECTX_DIRECTORY)).unwrap();
+        fs::write(payload.join(PAYLOAD_INSTALLER), b"not the installer").unwrap();
+        fs::write(payload.join(PAYLOAD_TOME), b"tome").unwrap();
+        let host = Arc::new(RecordingHost::default());
+        let lease = fixture_lease(fixture.path());
+        let failure = ProductionInstallDriver::new(host)
+            .download_vendor_payload(&paths, &artifact, &lease, &OperationControl::default())
+            .unwrap_err();
+        assert_eq!(failure, VendorFailure::PayloadRejected);
+        // The wrong-sized installer is gone; the rest is kept for the retry.
+        assert!(!payload.join(PAYLOAD_INSTALLER).exists());
+        assert!(payload.join(PAYLOAD_TOME).exists());
+    }
+
+    #[test]
+    fn an_error_box_the_helper_saw_is_reported_as_the_downloaders_error() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let artifact = verified_test_artifact(
+            ArtifactKind::BaseGameWrapper,
+            fixture.path().join("wrapper.exe"),
+        );
+        let host = Arc::new(DownloaderErrorHost::default());
+        let lease = fixture_lease(fixture.path());
+        let failure = ProductionInstallDriver::new(host.clone())
+            .with_download_stall_limit(Duration::ZERO)
+            .download_vendor_payload(&paths, &artifact, &lease, &OperationControl::default())
+            .unwrap_err();
+        assert_eq!(failure, VendorFailure::DownloaderErrorDialog);
+        assert_eq!(host.terminated.load(Ordering::Acquire), 1, "the downloader");
+    }
+
+    #[test]
+    fn a_download_folder_stalls_a_minute_after_its_last_change_and_later_before_its_first() {
+        let start = Instant::now();
+        let minute = Duration::from_secs(60);
+        let resume = Duration::from_secs(5 * 60);
+        let empty = Duration::from_secs(11 * 60);
+        let folder = |files, length| FolderState {
+            files,
+            length,
+            blocks: length / 512,
+        };
+        let clock = || GrowthClock::new(minute, resume, empty, start);
+        // Nothing yet: the downloader has not started, so the longest limit.
+        let mut never = clock();
+        assert!(!never.observe(folder(0, 0), None, start));
+        assert!(!never.observe(folder(0, 0), None, start + minute * 5));
+        assert!(never.observe(folder(0, 0), None, start + empty));
+
+        // Parts kept from an earlier run: time to start and check them first.
+        let mut resumed = clock();
+        assert!(!resumed.observe(folder(12, 4096), None, start));
+        assert!(!resumed.observe(folder(12, 4096), None, start + minute * 4));
+        assert!(resumed.observe(folder(12, 4096), None, start + resume));
+        // Once it writes, a minute without a change is enough.
+        let mut writing = clock();
+        assert!(!writing.observe(folder(12, 4096), None, start));
+        assert!(!writing.observe(folder(12, 8192), None, start + minute * 3));
+        assert!(writing.observe(folder(12, 8192), None, start + minute * 4));
+
+        // A fresh download: its (empty) parts appear, then nothing comes.
+        let mut clock = clock();
+        assert!(!clock.observe(folder(0, 0), None, start));
+        assert!(!clock.observe(folder(12, 0), None, start + Duration::from_secs(5)));
+        assert!(!clock.observe(folder(12, 0), None, start + Duration::from_secs(64)));
+        assert!(clock.observe(folder(12, 0), None, start + Duration::from_secs(65)));
+        assert!(!clock.observe(folder(12, 8192), None, start + Duration::from_secs(66)));
+        assert!(!clock.observe(folder(12, 1024), None, start + Duration::from_secs(90)));
+        assert!(clock.observe(folder(12, 1024), None, start + Duration::from_secs(150)));
+    }
+
+    #[test]
+    fn data_coming_in_counts_as_activity_while_the_folder_does_not_change() {
+        let start = Instant::now();
+        let minute = Duration::from_secs(60);
+        let resume = Duration::from_secs(5 * 60);
+        let empty = Duration::from_secs(11 * 60);
+        let parts = FolderState {
+            files: 12,
+            length: 4096,
+            blocks: 8,
+        };
+        let writing = FolderState {
+            length: 8192,
+            ..parts
+        };
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let clock = || GrowthClock::new(minute, resume, empty, start);
+
+        // Writing, then a slow connection: 80 KB in each 50 s, nothing written.
+        let mut slow = clock();
+        assert!(!slow.observe(parts, Some(1_000_000), at(0)));
+        assert!(!slow.observe(writing, Some(1_000_000), at(10)));
+        assert!(!slow.observe(writing, Some(1_081_920), at(60)));
+        assert!(!slow.observe(writing, Some(1_163_840), at(110)));
+        // A lost connection's retries: a few KB, then nothing.
+        assert!(!slow.observe(writing, Some(1_170_000), at(140)));
+        assert!(slow.observe(writing, Some(1_172_000), at(170)));
+        assert_eq!(slow.received_since_mark(Some(1_172_000)), Some(8_160));
+
+        // Data before the first write only moves the wait later: kept parts
+        // still get the resume limit from the last data.
+        let mut resumed = clock();
+        assert!(!resumed.observe(parts, Some(0), at(0)));
+        assert!(!resumed.observe(parts, Some(100_000), at(20)));
+        assert!(!resumed.observe(parts, Some(100_000), at(20 + 299)));
+        assert!(resumed.observe(parts, Some(100_000), at(20 + 300)));
+
+        // A trickle below the threshold adds up to it.
+        let mut trickle = clock();
+        assert!(!trickle.observe(parts, Some(0), at(0)));
+        assert!(!trickle.observe(writing, Some(0), at(1)));
+        assert!(!trickle.observe(writing, Some(40_000), at(40)));
+        assert!(!trickle.observe(writing, Some(70_000), at(60)));
+        assert!(!trickle.observe(writing, Some(70_000), at(119)));
+        assert!(trickle.observe(writing, Some(70_000), at(120)));
+
+        // A count that appears later starts the mark; one missing for a read
+        // keeps it; one that goes down (a restarted host) counts once.
+        let mut late = clock();
+        assert!(!late.observe(writing, None, at(0)));
+        assert!(!late.observe(writing, Some(500_000), at(30)));
+        assert_eq!(late.received_since_mark(Some(500_000)), Some(0));
+        assert!(!late.observe(writing, None, at(40)));
+        assert_eq!(late.received_since_mark(Some(510_000)), Some(10_000));
+        assert!(!late.observe(writing, Some(1_000), at(50)));
+        assert_eq!(late.received_since_mark(Some(1_000)), Some(0));
+
+        // No count from the host (the desktop): only the folder counts.
+        let mut folder_only = clock();
+        assert!(!folder_only.observe(parts, None, at(0)));
+        assert!(!folder_only.observe(parts, None, at(240)));
+        assert!(folder_only.observe(parts, None, at(300)));
+    }
+
+    #[test]
+    fn the_hosts_count_is_one_number_in_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("received-bytes");
+        assert_eq!(received_bytes(&file), None);
+        fs::write(&file, "123456\n").unwrap();
+        assert_eq!(received_bytes(&file), Some(123_456));
+        fs::write(&file, "half").unwrap();
+        assert_eq!(received_bytes(&file), None);
+    }
+
     #[test]
     fn a_downloaded_payload_runs_only_after_it_verifies_and_is_kept_otherwise() {
         let (fixture, paths) = managed_paths_with_runtime();
@@ -8207,8 +9147,9 @@ mod tests {
         let failure = ProductionInstallDriver::new(host.clone())
             .install_vendor(request, &lease, &OperationControl::default())
             .unwrap_err();
-        // No installer ran, so the stage may fetch a fresh wrapper once.
-        assert_eq!(failure, VendorFailure::WrapperDownload);
+        // The Tome is still a .part: an unfinished download. No installer
+        // ran, so the stage may fetch a fresh wrapper once.
+        assert_eq!(failure, VendorFailure::PayloadIncomplete);
         let requests = host.requests.lock().unwrap();
         assert_eq!(requests.len(), 3, "only the wrapper ran");
         assert!(requests.iter().all(|request| {
@@ -8303,10 +9244,10 @@ mod tests {
     fn downloader_ui_helper_has_the_frozen_sealed_pe_identity() {
         // Frozen deliberately: rebuilding tools/downloader-ui-helper.c must
         // be a reviewed change to both this test and the pinned constants.
-        assert_eq!(DOWNLOADER_UI_HELPER_SIZE, 3_584);
+        assert_eq!(DOWNLOADER_UI_HELPER_SIZE, 4_096);
         assert_eq!(
             DOWNLOADER_UI_HELPER_SHA256,
-            "d9dfecd9f200be6848d8a6319fc5f3a9edd4c4ce06b82f9d2a354ebbbd0fde9f"
+            "85416beb66fe49804766e5a2d007f2e822cb160ee8122e2de0a7d4fa524eb46e"
         );
         let mut helper = UiHelper::Downloader.sealed_file().unwrap();
         let mut bytes = Vec::new();
@@ -8833,6 +9774,221 @@ mod tests {
                 retry_after: None,
                 body: Box::new(Cursor::new(bytes.to_vec())),
             })),
+        }
+    }
+
+    /// Serves each URL from its own queue of responses (a URL with none left
+    /// fails the request), records every URL requested, and may stop the job
+    /// at its first request.
+    #[derive(Default)]
+    struct RoutedHttp {
+        routes: Mutex<std::collections::HashMap<String, VecDeque<ArtifactHttpResponse>>>,
+        requested: Arc<Mutex<Vec<String>>>,
+        stop_at_first_request: bool,
+    }
+
+    impl RoutedHttp {
+        fn route(self, url: &str, final_url: &str, bytes: &[u8]) -> Self {
+            self.routes
+                .lock()
+                .unwrap()
+                .entry(url.to_owned())
+                .or_default()
+                .push_back(
+                    served(final_url, bytes, None)
+                        .response
+                        .into_inner()
+                        .unwrap()
+                        .unwrap(),
+                );
+            self
+        }
+    }
+
+    impl ArtifactHttp for RoutedHttp {
+        fn get(
+            &self,
+            spec: &ArtifactSpec,
+            _range_start: Option<u64>,
+            control: &OperationControl,
+        ) -> Result<ArtifactHttpResponse, AdapterFailure> {
+            self.requested
+                .lock()
+                .unwrap()
+                .push(spec.request_url().to_owned());
+            if self.stop_at_first_request {
+                control.request_cancel();
+                return Err(AdapterFailure::here());
+            }
+            self.routes
+                .lock()
+                .unwrap()
+                .get_mut(spec.request_url())
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| AdapterFailure::here())
+        }
+    }
+
+    const MIRROR: &str = "https://github.com/fixture/fixture/releases/download/fex-0/fex.deb";
+    const LAUNCHPAD_FILES: &str =
+        "https://launchpad.net/~fixture/+archive/ubuntu/fixture/+files/fex_0-1~j_arm64.deb";
+    const LAUNCHPAD_POOL: &str = "https://ppa.launchpadcontent.net/fixture/fex_0-1~j_arm64.deb";
+
+    /// A built-in FEX file as the catalog has it: the mirror release, then
+    /// Launchpad's file link, then its pool.
+    fn mirrored_fixture_spec(bytes: &'static [u8]) -> ArtifactSpec {
+        ArtifactSpec {
+            kind: ArtifactKind::FexPackage,
+            request_url: Cow::Borrowed(MIRROR),
+            redirects: RedirectPolicy::GithubReleaseAsset,
+            fallback_urls: &[LAUNCHPAD_FILES, LAUNCHPAD_POOL],
+            ..fixed_fixture_spec(bytes)
+        }
+    }
+
+    fn requested_sources(requested: &Mutex<Vec<String>>) -> Vec<String> {
+        let mut sources = requested.lock().unwrap().clone();
+        sources.dedup();
+        sources
+    }
+
+    #[test]
+    fn a_mirrored_file_comes_from_the_mirror_when_it_has_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = b"the pinned package";
+        let spec = mirrored_fixture_spec(bytes);
+        let http = RoutedHttp::default()
+            .route(
+                MIRROR,
+                "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sig=3",
+                bytes,
+            )
+            .route(LAUNCHPAD_FILES, LAUNCHPAD_FILES, bytes);
+        let requested = Arc::clone(&http.requested);
+        let acquired = ProductionArtifactSource::with_http(http)
+            .acquire(&spec, cache.path(), &OperationControl::default())
+            .unwrap();
+        assert_eq!(requested_sources(&requested), [MIRROR]);
+        assert_eq!(acquired.requested_url, MIRROR);
+        let verified = verify_artifact(&spec, cache.path(), acquired).unwrap();
+        assert_eq!(fs::read(verified.path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn each_source_is_tried_in_order_until_one_gives_the_pinned_bytes() {
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = b"the pinned package";
+        let spec = mirrored_fixture_spec(bytes);
+        // The mirror does not answer; Launchpad's file link sends the request
+        // to a host it may not; the pool has the file.
+        let http = RoutedHttp::default()
+            .route(
+                LAUNCHPAD_FILES,
+                "https://elsewhere.invalid/fex_0-1~j_arm64.deb",
+                bytes,
+            )
+            .route(LAUNCHPAD_POOL, LAUNCHPAD_POOL, bytes);
+        let requested = Arc::clone(&http.requested);
+        let acquired = ProductionArtifactSource::with_http(http)
+            .acquire(&spec, cache.path(), &OperationControl::default())
+            .unwrap();
+        assert_eq!(
+            requested_sources(&requested),
+            [MIRROR, LAUNCHPAD_FILES, LAUNCHPAD_POOL]
+        );
+        assert_eq!(acquired.requested_url, LAUNCHPAD_POOL);
+        // The workflow's own check accepts a fallback's provenance.
+        let verified = verify_artifact(&spec, cache.path(), acquired).unwrap();
+        assert_eq!(fs::read(verified.path()).unwrap(), bytes);
+
+        // Launchpad's file link and its librarian's copy are accepted too,
+        // and other bytes from the mirror are not.
+        let cache = tempfile::tempdir().unwrap();
+        let http = RoutedHttp::default()
+            .route(
+                MIRROR,
+                "https://release-assets.githubusercontent.com/1/2",
+                b"not the pinned one",
+            )
+            .route(
+                LAUNCHPAD_FILES,
+                "https://launchpadlibrarian.net/877920585/fex_0-1~j_arm64.deb",
+                bytes,
+            );
+        let requested = Arc::clone(&http.requested);
+        let acquired = ProductionArtifactSource::with_http(http)
+            .acquire(&spec, cache.path(), &OperationControl::default())
+            .unwrap();
+        assert_eq!(requested_sources(&requested), [MIRROR, LAUNCHPAD_FILES]);
+        assert_eq!(
+            acquired.final_url,
+            "https://launchpadlibrarian.net/877920585/fex_0-1~j_arm64.deb"
+        );
+        verify_artifact(&spec, cache.path(), acquired).unwrap();
+    }
+
+    #[test]
+    fn a_mirrored_file_fails_only_when_every_source_failed_and_a_stop_tries_no_other() {
+        let cache = tempfile::tempdir().unwrap();
+        let bytes = b"the pinned package";
+        let spec = mirrored_fixture_spec(bytes);
+        let http = RoutedHttp::default().route(
+            LAUNCHPAD_FILES,
+            "https://launchpadlibrarian.net/1/fex_0-1~j_arm64.deb",
+            b"not the pinned one",
+        );
+        let requested = Arc::clone(&http.requested);
+        assert!(
+            ProductionArtifactSource::with_http(http)
+                .acquire(&spec, cache.path(), &OperationControl::default())
+                .is_err()
+        );
+        assert_eq!(
+            requested_sources(&requested),
+            [MIRROR, LAUNCHPAD_FILES, LAUNCHPAD_POOL]
+        );
+        assert!(!cache.path().join(cache_name(&spec)).exists());
+
+        // The player's Stop during the first source ends it there.
+        let http = RoutedHttp {
+            stop_at_first_request: true,
+            ..RoutedHttp::default()
+        };
+        let requested = Arc::clone(&http.requested);
+        let control = OperationControl::default();
+        assert!(
+            ProductionArtifactSource::with_http(http)
+                .acquire(&spec, cache.path(), &control)
+                .is_err()
+        );
+        assert!(control.is_cancelled());
+        assert_eq!(*requested.lock().unwrap(), [MIRROR]);
+    }
+
+    /// `cargo test -- --ignored --nocapture the_built_in_fex_packages_download`
+    /// downloads every CPU level's package from its real sources (standard
+    /// error names the host each came from).
+    #[test]
+    #[ignore = "downloads from the real sources"]
+    fn the_built_in_fex_packages_download_from_their_real_sources() {
+        use crate::builtin_fex::FexVariant;
+        for variant in [
+            FexVariant::Armv8_0,
+            FexVariant::Armv8_2,
+            FexVariant::Armv8_4,
+        ] {
+            let cache = tempfile::tempdir().unwrap();
+            let spec =
+                ArtifactCatalog::builtin_fex_spec(ArtifactKind::FexPackage, variant.package());
+            let acquired = ProductionArtifactSource::new()
+                .acquire(&spec, cache.path(), &OperationControl::default())
+                .unwrap();
+            eprintln!(
+                "{variant:?}: requested {}, served from {}",
+                acquired.requested_url, acquired.final_url
+            );
+            let verified = verify_artifact(&spec, cache.path(), acquired).unwrap();
+            assert_eq!(verified.content_sha256(), variant.package_sha256());
         }
     }
 
@@ -9627,6 +10783,7 @@ mod tests {
                 mutation_lease: &lease,
                 control: &OperationControl::default(),
                 ui_helper: None,
+                stall: None,
                 accepted_exit_codes: &[],
             })
             .unwrap();

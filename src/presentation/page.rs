@@ -2890,7 +2890,7 @@ impl LauncherView {
         let builtin = fex.source == super::FexSourceView::Builtin;
         let size = fex.builtin_download_bytes.div_ceil(1_000_000);
         let builtin_status: SharedString = if fex.builtin_installed {
-            format!("Installed: FEX {}.", crate::builtin_fex::FEX_VERSION).into()
+            format!("Installed: FEX {}.", crate::builtin_fex::fex_version()).into()
         } else {
             format!("Downloads in step 3, Download: about {size} MB, and about 2 GB once unpacked.")
                 .into()

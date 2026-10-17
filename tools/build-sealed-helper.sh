@@ -90,6 +90,7 @@ Sleep@4
 OpenProcess@12
 TerminateProcess@8
 WaitForSingleObject@8
+WideCharToMultiByte@32
 WriteFile@20
 DEF
 cat >"$work/user32.def" <<'DEF'

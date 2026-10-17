@@ -13,6 +13,9 @@
 # a draft release of the tag that targets it. To publish it, main moves to that
 # commit and publishing the draft makes the tag there; that push builds nothing,
 # because it finds no tag yet or the tag's release is published with its files.
+#
+# Before it builds, a release fills and checks the mirror release of the files
+# its built-in FEX downloads (mirror-fex.yml, from the same commit).
 name: Release
 
 on:
@@ -125,8 +128,17 @@ jobs:
             { echo "::error::main is not in the history of $GITHUB_SHA"; exit 1; }
           echo "commit=$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT"
 
-  executable:
+  # The mirror release holds every built-in FEX file this commit pins, checked,
+  # before anything is built.
+  mirror:
     needs: tag
+    if: needs.tag.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/mirror-fex.yml
+
+  executable:
+    needs: [tag, mirror]
     if: needs.tag.outputs.tag != ''
     strategy:
       matrix:

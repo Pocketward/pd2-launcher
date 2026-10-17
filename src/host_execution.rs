@@ -953,6 +953,12 @@ pub trait SupervisedProcess: Send {
     fn output(&self) -> ProcessOutput {
         ProcessOutput::default()
     }
+
+    /// The activity log's name for this process when it is the UI helper
+    /// supervised beside another program.
+    fn helper_label(&self) -> &'static str {
+        "installer UI helper"
+    }
 }
 
 /// Portable process-completion evidence.
@@ -3240,10 +3246,10 @@ mod tests {
             fex.join("installed.json"),
             serde_json::json!({
                 "schema": 1,
-                "fex_version": crate::builtin_fex::FEX_VERSION,
+                "fex_version": crate::builtin_fex::fex_version(),
                 "variant": variant,
                 "package_sha256": variant.package_sha256(),
-                "rootfs_sha256": crate::builtin_fex::ROOTFS_SHA256,
+                "rootfs_sha256": crate::builtin_fex::rootfs().sha256(),
             })
             .to_string(),
         )
