@@ -260,7 +260,7 @@ pub(crate) fn readiness(root: &Directory) -> DownloadReadiness {
     }
     for item in &record.items {
         match identify(root, &item.path) {
-            Ok(Some(current)) if current == *item => {}
+            Ok(Some(current)) if current.same(item) => {}
             _ => return DownloadReadiness::Incomplete,
         }
     }
@@ -313,6 +313,23 @@ fn collect(root: &Directory, path: &str, depth: usize, items: &mut Vec<Item>) ->
             io::ErrorKind::InvalidData,
             "a download is not a regular file",
         )),
+    }
+}
+
+impl Item {
+    /// The recorded file, unchanged. On the Android host the filesystem id is
+    /// not compared (see `safe_fs::same_recorded_file`).
+    fn same(&self, recorded: &Self) -> bool {
+        self.path == recorded.path
+            && self.size == recorded.size
+            && crate::safe_fs::same_recorded_file(
+                recorded.filesystem,
+                recorded.inode,
+                self.filesystem,
+                self.inode,
+            )
+            && self.modified == recorded.modified
+            && self.modified_nanos == recorded.modified_nanos
     }
 }
 

@@ -29,6 +29,33 @@ pub(crate) const RETAINED_DIRECTORY: &str = ".pd2launcher-retained";
 static OPENAT2_UNAVAILABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set on the Android host: f2fs makes `f_fsid` from the device number,
+/// which a reboot or a system update can change, so a recorded filesystem id
+/// is not compared there.
+static FILESYSTEM_ID_UNSTABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a file recorded as (`recorded_filesystem`, `recorded_inode`) is
+/// the file seen now: the same inode, and the same filesystem where its id
+/// is stable. On the Android host only the inode is compared; every record
+/// is in the app's own data or names its volume in its path.
+pub(crate) fn same_recorded_file(
+    recorded_filesystem: u64,
+    recorded_inode: u64,
+    filesystem: u64,
+    inode: u64,
+) -> bool {
+    same_file_identity(
+        (recorded_filesystem, recorded_inode),
+        (filesystem, inode),
+        FILESYSTEM_ID_UNSTABLE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn same_file_identity(recorded: (u64, u64), now: (u64, u64), filesystem_unstable: bool) -> bool {
+    recorded.1 == now.1 && (filesystem_unstable || recorded.0 == now.0)
+}
+
 /// The directories above the Launcher home that may be opened search-only
 /// (`O_PATH`) when a read-only open of them is refused: on the Android host
 /// an app may search `/`, `/data` and `/data/data` but not list them. Unset
@@ -48,6 +75,7 @@ thread_local! {
 /// cannot be read.
 pub(crate) fn use_android_host(home: Option<&Path>) {
     OPENAT2_UNAVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    FILESYSTEM_ID_UNSTABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(home) = home {
         let _ = SEARCH_ONLY_ANCESTORS.set(home_ancestors(home));
     }
@@ -1389,12 +1417,38 @@ pub(crate) enum AtomicIntentKind {
 /// never matches a live file. Such values must first be rebound through
 /// [`FileIdentity::migrate_legacy`], and the variant serializes exactly as
 /// schema 2 did so checksums over legacy payloads remain verifiable.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum FileIdentity {
     Filesystem { filesystem: u64, inode: u64 },
     LegacyDevice { device: u64, inode: u64 },
 }
+
+/// Current identities compare by [`same_recorded_file`]: on the Android host
+/// the filesystem id is not compared.
+impl PartialEq for FileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (
+                Self::Filesystem { filesystem, inode },
+                Self::Filesystem {
+                    filesystem: other_filesystem,
+                    inode: other_inode,
+                },
+            ) => same_recorded_file(filesystem, inode, other_filesystem, other_inode),
+            (
+                Self::LegacyDevice { device, inode },
+                Self::LegacyDevice {
+                    device: other_device,
+                    inode: other_inode,
+                },
+            ) => device == other_device && inode == other_inode,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FileIdentity {}
 
 impl FileIdentity {
     pub(crate) fn of(file: &File) -> io::Result<Self> {
@@ -1466,7 +1520,10 @@ impl FileIdentity {
     }
 }
 
-/// Reboot-stable filesystem id of an open descriptor.
+/// File system id (`f_fsid`) of an open descriptor. Stable across reboots on
+/// most file systems (btrfs, ext4: from the UUID), but f2fs, Android's data
+/// partition, makes it from the device number, which a reboot or a system
+/// update can change.
 pub(crate) fn filesystem_id(file: &File) -> io::Result<u64> {
     Ok(rustix::fs::fstatvfs(file)?.f_fsid)
 }
@@ -2781,6 +2838,15 @@ mod tests {
                 .unwrap();
             assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{path:?}");
         }
+    }
+
+    #[test]
+    fn an_unstable_filesystem_id_compares_the_inode_only() {
+        assert!(same_file_identity((65054, 7), (65042, 7), true));
+        assert!(!same_file_identity((65054, 7), (65042, 7), false));
+        assert!(same_file_identity((65054, 7), (65054, 7), false));
+        assert!(!same_file_identity((65054, 7), (65054, 8), true));
+        assert!(!same_file_identity((65054, 7), (65054, 8), false));
     }
 
     #[test]

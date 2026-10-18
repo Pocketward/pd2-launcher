@@ -30,8 +30,8 @@ mod adapters;
 
 pub(crate) use adapters::{
     InstallerMedia, ProductionArtifactSource, ProductionInstallDriver, UpdaterClientSynchronizer,
-    XINPUT_BRIDGE_PATH, XINPUT_BRIDGE_SHA256, XINPUT_BRIDGE_SIZE, fex_strict_settings,
-    gl_probe_helper, install_xinput_bridge, seed_verified_cache,
+    XINPUT_BRIDGE_PATH, XINPUT_BRIDGE_SHA256, XINPUT_BRIDGE_SIZE, android_gl_probe_copy,
+    fex_strict_settings, gl_probe_helper, install_xinput_bridge, seed_verified_cache,
 };
 
 /// A temporary authorization that deliberately cannot be cloned or serialized.

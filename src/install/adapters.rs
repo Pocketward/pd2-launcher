@@ -2571,11 +2571,18 @@ impl ProductionInstallDriver {
             .ui_helper
             .map(UiHelper::sealed_file)
             .transpose()?;
+        let helper_copy = match (invocation.ui_helper, &helper_image) {
+            (Some(kind), Some(helper)) if crate::android_host() => {
+                Some(android_helper_copy(invocation.paths, kind, helper)?)
+            }
+            _ => None,
+        };
         let helper_request = helper_image
             .as_ref()
             .map(|helper| {
                 self.ui_helper_request(
                     helper,
+                    helper_copy.as_ref().map(|(program, _)| program.clone()),
                     invocation.paths,
                     invocation.mutation_lease,
                     &handles,
@@ -2795,6 +2802,7 @@ impl ProductionInstallDriver {
     fn ui_helper_request(
         &self,
         helper: &File,
+        program: Option<OsString>,
         paths: &ManagedPaths,
         mutation_lease: &File,
         handles: &RuntimeHandles,
@@ -2802,11 +2810,13 @@ impl ProductionInstallDriver {
     ) -> Result<ProcessRequest, AdapterFailure> {
         let mut request = ProcessRequest::guest(format!("/proc/self/fd/{CHILD_PRELOADER_FD}"))
             .with_arguments(loader_arguments(handles.runtime))
-            .with_argument(format!(
-                "/proc/{}/fd/{}",
-                std::process::id(),
-                helper.as_raw_fd()
-            ))
+            .with_argument(program.unwrap_or_else(|| {
+                OsString::from(format!(
+                    "/proc/{}/fd/{}",
+                    std::process::id(),
+                    helper.as_raw_fd()
+                ))
+            }))
             .with_working_directory_handle(
                 paths.root(),
                 paths
@@ -3341,6 +3351,22 @@ impl UiHelper {
         }
     }
 
+    /// The file name of its copy on the Android host
+    /// ([`android_helper_copy`]).
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Vendor => "pd2launcher-vendor-ui-helper.exe",
+            Self::Downloader => "pd2launcher-downloader-ui-helper.exe",
+        }
+    }
+
+    fn sha256(self) -> &'static str {
+        match self {
+            Self::Vendor => VENDOR_UI_HELPER_SHA256,
+            Self::Downloader => DOWNLOADER_UI_HELPER_SHA256,
+        }
+    }
+
     fn sealed_file(self) -> Result<File, AdapterFailure> {
         match self {
             Self::Vendor => sealed_helper_file(
@@ -3462,6 +3488,101 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
+    }
+}
+
+/// On the Android host, the sealed UI helper is copied to
+/// [`ANDROID_PROGRAM_COPIES`] under its own name, checked again there, and
+/// started by that name: Wine on Android 17 cannot start it as
+/// `/proc/<pid>/fd/N` (start.exe: "ShellExecuteEx failed: File not found"),
+/// so a fresh download stopped at once. The copy is removed when the
+/// returned guard drops.
+fn android_helper_copy(
+    paths: &ManagedPaths,
+    helper: UiHelper,
+    sealed: &File,
+) -> Result<(OsString, RemoveOnDrop), AdapterFailure> {
+    let mut source = sealed.try_clone().map_err(|_| AdapterFailure::here())?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AdapterFailure::here())?;
+    android_program_copy(
+        paths.directory(),
+        paths.root(),
+        &mut source,
+        helper.file_name(),
+        helper.sha256(),
+    )
+}
+
+/// The GL probe ([`gl_probe_helper`]) for the Android host: copied to
+/// [`ANDROID_PROGRAM_COPIES`] of the managed root `root` (opened as
+/// `directory`) and checked again there; returns its Windows path and the
+/// guard that removes it. Wine on Android 17 cannot start the sealed probe
+/// as `/proc/<pid>/fd/N`, as with the UI helpers ([`android_helper_copy`]),
+/// so the probe found no renderer there.
+pub(crate) fn android_gl_probe_copy(
+    directory: &Directory,
+    root: &Path,
+    probe: &File,
+) -> Result<(OsString, RemoveOnDrop), AdapterFailure> {
+    let mut source = probe.try_clone().map_err(|_| AdapterFailure::here())?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| AdapterFailure::here())?;
+    android_program_copy(
+        directory,
+        root,
+        &mut source,
+        "pd2launcher-gl-probe.exe",
+        GL_PROBE_HELPER_SHA256,
+    )
+}
+
+/// Where the Android host keeps the checked copies of programs it starts by
+/// name ([`android_program_copy`]): a Launcher-owned folder of the prefix's
+/// `C:` drive. It is not [`WRAPPER_DOWNLOADS`], whose files the download
+/// watch counts (a helper there would look like parts of an earlier
+/// download).
+const ANDROID_PROGRAM_COPIES: &str = "prefix/drive_c/pd2launcher-programs";
+const WINDOWS_ANDROID_PROGRAM_COPIES: &str = r"C:\pd2launcher-programs";
+
+/// Copy `source` to [`ANDROID_PROGRAM_COPIES`] as `name`, check the copy's
+/// SHA-256 against `sha256`, and return its Windows path with a guard that
+/// removes it (and the folder, once empty) when it drops.
+fn android_program_copy(
+    directory: &Directory,
+    root: &Path,
+    source: &mut File,
+    name: &str,
+    sha256: &str,
+) -> Result<(OsString, RemoveOnDrop), AdapterFailure> {
+    directory
+        .ensure_directory(Path::new(ANDROID_PROGRAM_COPIES))
+        .map_err(|_| AdapterFailure::here())?;
+    let copy = RemoveOnDrop(root.join(ANDROID_PROGRAM_COPIES).join(name));
+    let _ = fs::remove_file(&copy.0);
+    let mut out = File::create(&copy.0).map_err(|_| AdapterFailure::here())?;
+    io::copy(source, &mut out).map_err(|_| AdapterFailure::here())?;
+    out.sync_all().map_err(|_| AdapterFailure::here())?;
+    drop(out);
+    let mut written = File::open(&copy.0).map_err(|_| AdapterFailure::here())?;
+    if sha256_open_file(&mut written)? != sha256 {
+        return Err(AdapterFailure::here());
+    }
+    let program = OsString::from(format!("{WINDOWS_ANDROID_PROGRAM_COPIES}\\{name}"));
+    Ok((program, copy))
+}
+
+/// A program copy removed when this drops, with its folder once empty.
+pub(crate) struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        if let Some(folder) = self.0.parent() {
+            let _ = fs::remove_dir(folder);
+        }
     }
 }
 
@@ -10465,6 +10586,57 @@ mod tests {
         assert!(!abandoned_prefix(&open()));
     }
 
+    #[test]
+    fn an_android_ui_helper_runs_as_a_checked_copy_that_is_removed_after() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = ManagedPaths::prepare(fixture.path()).unwrap();
+        let folder = paths.root().join(ANDROID_PROGRAM_COPIES);
+        for helper in [UiHelper::Vendor, UiHelper::Downloader] {
+            let sealed = helper.sealed_file().unwrap();
+            let copy = folder.join(helper.file_name());
+            let (program, guard) = android_helper_copy(&paths, helper, &sealed).unwrap();
+            assert_eq!(
+                program,
+                OsString::from(format!(
+                    "{WINDOWS_ANDROID_PROGRAM_COPIES}\\{}",
+                    helper.file_name()
+                ))
+            );
+            let mut written = File::open(&copy).unwrap();
+            assert_eq!(sha256_open_file(&mut written).unwrap(), helper.sha256());
+            // The download watch never sees it.
+            assert_eq!(
+                folder_state(&paths.root().join(WRAPPER_DOWNLOADS), 8),
+                FolderState::default()
+            );
+            drop(guard);
+            assert!(!copy.exists());
+            assert!(!folder.exists());
+        }
+    }
+
+    #[test]
+    fn an_android_program_copy_that_does_not_match_is_refused_and_removed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = ManagedPaths::prepare(fixture.path()).unwrap();
+        let mut sealed = UiHelper::Vendor.sealed_file().unwrap();
+        let result = android_program_copy(
+            paths.directory(),
+            paths.root(),
+            &mut sealed,
+            "copy.exe",
+            UiHelper::Downloader.sha256(),
+        );
+        assert!(result.is_err());
+        assert!(
+            !paths
+                .root()
+                .join(ANDROID_PROGRAM_COPIES)
+                .join("copy.exe")
+                .exists()
+        );
+    }
+
     fn initialized_prefix_fixture(root: &Path) -> PathBuf {
         let prefix = root.join("prefix");
         fs::create_dir_all(&prefix).unwrap();
@@ -10513,6 +10685,32 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == name)
             .map(|(_, value)| value.as_os_str())
+    }
+
+    #[test]
+    fn the_android_gl_probe_runs_as_a_checked_copy_that_is_removed_after() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = ManagedPaths::prepare(fixture.path()).unwrap();
+        let probe = gl_probe_helper().unwrap();
+        let copy = paths
+            .root()
+            .join(ANDROID_PROGRAM_COPIES)
+            .join("pd2launcher-gl-probe.exe");
+        let (program, guard) =
+            android_gl_probe_copy(paths.directory(), paths.root(), &probe).unwrap();
+        assert_eq!(
+            program,
+            OsString::from(format!(
+                "{WINDOWS_ANDROID_PROGRAM_COPIES}\\pd2launcher-gl-probe.exe"
+            ))
+        );
+        let mut written = File::open(&copy).unwrap();
+        assert_eq!(
+            sha256_open_file(&mut written).unwrap(),
+            GL_PROBE_HELPER_SHA256
+        );
+        drop(guard);
+        assert!(!copy.exists());
     }
 
     #[test]

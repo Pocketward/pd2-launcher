@@ -526,11 +526,26 @@ impl GameSupervisor {
         let retained = probe
             .try_clone()
             .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?;
+        // On the Android host it runs as a checked copy under its own name
+        // instead, removed when `copy` drops: Wine on Android 17 cannot start
+        // a program by another process's descriptor.
+        let copy = if crate::android_host() {
+            Some(
+                crate::install::android_gl_probe_copy(&root, managed_root, &probe)
+                    .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
+            )
+        } else {
+            None
+        };
+        let program = copy.as_ref().map_or_else(
+            || format!("/proc/{}/fd/{}", std::process::id(), retained.as_raw_fd()),
+            |(program, _)| program.to_string_lossy().into_owned(),
+        );
         let request = game_profile_request(
             &root,
             &leases,
             runtime,
-            &format!("/proc/{}/fd/{}", std::process::id(), retained.as_raw_fd()),
+            &program,
             (&paths.root, working_directory),
         )?
         .with_inherited_file(probe, CHILD_GL_PROBE_FD)
@@ -552,6 +567,7 @@ impl GameSupervisor {
             }
         };
         drop(retained);
+        drop(copy);
         let output = process.output();
         Ok(String::from_utf8_lossy(output.stdout())
             .lines()

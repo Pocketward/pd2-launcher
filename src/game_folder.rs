@@ -7,7 +7,10 @@
 //! used in place is recorded by `prefix/.pd2launcher-game-folder.json` with
 //! its path and identity (filesystem id and inode); it is opened by that path with
 //! no symbolic link in any component and must still be the same directory,
-//! or it is unavailable and nothing runs until it is back. Because the
+//! or it is unavailable and nothing runs until it is back. On Android only the
+//! inode must match: the filesystem id of f2fs comes from the device number,
+//! which a reboot or a system update can change, and the path already names
+//! the volume (`/storage/<volume UUID>/` for a card). Because the
 //! record lives in the Managed prefix, Start over forgets it together with
 //! the prefix and never touches the folder itself.
 //!
@@ -115,7 +118,8 @@ pub(crate) enum GameFolder {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExternalGameFolder {
     path: PathBuf,
-    /// `f_fsid`: stable across reboots, unlike `st_dev` on btrfs.
+    /// `f_fsid`: stable across reboots on desktop file systems (btrfs, ext4),
+    /// unlike `st_dev` on btrfs. Not compared on Android (see the module).
     filesystem: u64,
     inode: u64,
 }
@@ -141,9 +145,12 @@ impl ExternalGameFolder {
     pub(crate) fn open(&self) -> io::Result<Directory> {
         let directory = Directory::open(&self.path)?;
         let file = directory.try_clone_file()?;
-        if crate::safe_fs::filesystem_id(&file)? != self.filesystem
-            || file.metadata()?.ino() != self.inode
-        {
+        if !crate::safe_fs::same_recorded_file(
+            self.filesystem,
+            self.inode,
+            crate::safe_fs::filesystem_id(&file)?,
+            file.metadata()?.ino(),
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "the game folder is not the one that was chosen",
