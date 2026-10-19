@@ -1413,7 +1413,8 @@ impl Auditor {
                     unconfigured_custom_runtime(root, policy)
                         .unwrap_or_else(|| check_runtime(root, policy))
                 });
-                let (prefix, components) = check_prefix(root, policy, request);
+                let (prefix, components) =
+                    check_prefix(root, policy, request, crate::android_host());
                 results.push(prefix);
                 prefix_components = components;
                 match (game_folder.as_ref(), import.as_ref()) {
@@ -2307,11 +2308,13 @@ fn absent(root: &Directory, relative: &str) -> bool {
 
 /// The prefix check: Wine's own prefix plus each Launcher-installed prefix
 /// component, reported separately so an existing prefix can be completed in
-/// place instead of recreated.
+/// place instead of recreated. `android`: the Android host, whose prefix has
+/// no Wine Gecko and no Wine Mono.
 fn check_prefix(
     root: &Directory,
     policy: &AuditPolicy,
     request: &AuditRequest,
+    android: bool,
 ) -> (CheckResult, PrefixComponents) {
     let base = aggregate(
         AuditCheck::Prefix,
@@ -2322,12 +2325,21 @@ fn check_prefix(
             inspect_regular(root, "prefix/userdef.reg"),
         ],
     );
-    let gecko = check_gecko(root, policy, request.custom_source(CustomComponent::Gecko));
-    let mono = check_prefix_dependency(
-        root,
-        PrefixDependency::WineMono,
-        request.custom_source(CustomComponent::WineMono),
-    );
+    let (gecko, mono) = if android {
+        // The Android app's prefix has no Wine Gecko and no Wine Mono: no
+        // program the Launcher runs there needs them, and every Wine
+        // process there has mscoree and mshtml off.
+        (satisfied(AuditCheck::Prefix), satisfied(AuditCheck::Prefix))
+    } else {
+        (
+            check_gecko(root, policy, request.custom_source(CustomComponent::Gecko)),
+            check_prefix_dependency(
+                root,
+                PrefixDependency::WineMono,
+                request.custom_source(CustomComponent::WineMono),
+            ),
+        )
+    };
     // For the official PD2 launcher, on every host.
     let dotnet = check_prefix_dependency(
         root,
@@ -2340,7 +2352,15 @@ fn check_prefix(
         mono: mono.status,
         dotnet: dotnet.status,
     };
-    let mut parts = vec![base, gecko, mono, dotnet];
+    // On Android only Wine's own prefix and the .NET Desktop Runtime make the
+    // status: accepted Gecko and Mono parts among missing ones would make a
+    // prefix that is not there (a stop before its first Wine start) Invalid
+    // instead of Missing.
+    let mut parts = if android {
+        vec![base, dotnet]
+    } else {
+        vec![base, gecko, mono, dotnet]
+    };
     // Only a rejected bridge changes the prefix's status.
     if request.xinput_bridge {
         parts.extend(check_xinput_bridge(root));
@@ -3047,6 +3067,16 @@ fn aggregate(check: AuditCheck, evidence: impl IntoIterator<Item = ItemEvidence>
     }
 }
 
+/// A part of `check` that is accepted without inspection.
+fn satisfied(check: AuditCheck) -> CheckResult {
+    CheckResult {
+        check,
+        status: CheckStatus::Satisfied,
+        findings: Vec::new(),
+        custom_sources: Vec::new(),
+    }
+}
+
 fn single_finding(
     check: AuditCheck,
     status: CheckStatus,
@@ -3530,6 +3560,48 @@ mod tests {
         // The game start puts the sealed bridge back.
         crate::install::install_xinput_bridge(&root).unwrap();
         assert_eq!(status(&root), CheckStatus::Satisfied);
+    }
+
+    #[test]
+    fn the_android_prefix_needs_no_wine_gecko_or_mono() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = fixture.path().join("prefix");
+        std::fs::create_dir_all(prefix.join("drive_c/windows")).unwrap();
+        for hive in ["system.reg", "user.reg", "userdef.reg"] {
+            std::fs::write(prefix.join(hive), b"WINE REGISTRY").unwrap();
+        }
+        let root = Directory::open(fixture.path()).unwrap();
+        let policy = AuditPolicy::pinned();
+        let request = AuditRequest::new(fixture.path().to_owned(), ActivityEvidence::Idle);
+        // Neither Gecko's nor Mono's receipt or files: accepted on Android,
+        // missing on the desktop, which installs both.
+        let (_, android) = check_prefix(&root, &policy, &request, true);
+        assert_eq!(android.base, CheckStatus::Satisfied);
+        assert_eq!(android.gecko, CheckStatus::Satisfied);
+        assert_eq!(android.mono, CheckStatus::Satisfied);
+        assert_eq!(android.dotnet, CheckStatus::Missing);
+        let (_, desktop) = check_prefix(&root, &policy, &request, false);
+        assert_eq!(desktop.gecko, CheckStatus::Missing);
+        assert_eq!(desktop.mono, CheckStatus::Missing);
+        // A leftover receipt of an older release changes nothing on Android.
+        std::fs::write(prefix.join(".pd2launcher-mono.sha256"), b"older").unwrap();
+        let (_, android) = check_prefix(&root, &policy, &request, true);
+        assert_eq!(android.mono, CheckStatus::Satisfied);
+    }
+
+    #[test]
+    fn a_missing_android_prefix_is_missing_not_invalid() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = Directory::open(fixture.path()).unwrap();
+        let policy = AuditPolicy::pinned();
+        let request = AuditRequest::new(fixture.path().to_owned(), ActivityEvidence::Idle);
+        // No prefix at all: a stop before Wine's first start in a new one.
+        for android in [true, false] {
+            let (result, components) = check_prefix(&root, &policy, &request, android);
+            assert_eq!(result.status, CheckStatus::Missing, "android: {android}");
+            assert_eq!(components.base, CheckStatus::Missing);
+            assert_eq!(components.dotnet, CheckStatus::Missing);
+        }
     }
 
     #[test]

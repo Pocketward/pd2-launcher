@@ -3586,6 +3586,76 @@ impl Drop for RemoveOnDrop {
     }
 }
 
+/// What older releases put in the Android app's prefix for Wine Gecko and
+/// Wine Mono, below `prefix`: the Launcher's receipts, Wine Mono's folder,
+/// and the folders that hold each version of Gecko.
+const ANDROID_RETIRED_RECEIPTS: [&str; 4] = [
+    GECKO_RECEIPT,
+    CUSTOM_GECKO_RECEIPT,
+    MONO_RECEIPT,
+    CUSTOM_MONO_RECEIPT,
+];
+const ANDROID_RETIRED_MONO: (&str, &str) = ("drive_c/windows", "mono");
+const ANDROID_RETIRED_GECKO_PARENTS: [&str; 2] = [
+    "drive_c/windows/syswow64/gecko",
+    "drive_c/windows/system32/gecko",
+];
+
+/// Removes Wine Gecko and Wine Mono from the Android app's prefix (`prefix`,
+/// opened beneath the managed root): no program the Launcher runs there
+/// needs them, and every Wine process there has mscoree and mshtml off. The
+/// Launcher's receipts for them go first, then Wine Mono's folder and each
+/// Gecko version folder (a name of digits and dots; Wine's own `plugin`
+/// folder stays). Nothing else is touched, links are never followed, and a
+/// stop part way leaves only parts of them, which the next call removes.
+/// Whether anything was removed. The caller holds the installation
+/// exclusively.
+pub(crate) fn remove_wine_gecko_and_mono(prefix: &Directory) -> io::Result<bool> {
+    let mut removed = false;
+    for name in ANDROID_RETIRED_RECEIPTS {
+        match prefix.open_file(Path::new(name)) {
+            Ok(file) => {
+                prefix.remove_open_file_bounded(OsStr::new(name), &file)?;
+                removed = true;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (parent, mono) = ANDROID_RETIRED_MONO;
+    removed |= remove_tree_if_present(prefix, parent, |name| name == mono)?;
+    for parent in ANDROID_RETIRED_GECKO_PARENTS {
+        removed |= remove_tree_if_present(prefix, parent, |name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        })?;
+    }
+    Ok(removed)
+}
+
+/// Removes each directory of `parent` (below `prefix`) whose name `matches`.
+fn remove_tree_if_present(
+    prefix: &Directory,
+    parent: &str,
+    matches: impl Fn(&str) -> bool,
+) -> io::Result<bool> {
+    let parent = match prefix.open_directory(Path::new(parent)) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut removed = false;
+    for name in parent.names()? {
+        if name.to_str().is_some_and(&matches) {
+            parent.remove_owned_tree(&name)?;
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
 fn open_verified_program(artifact: &VerifiedArtifact) -> Result<File, AdapterFailure> {
     let mut file = open(
         artifact.path(),
@@ -3813,23 +3883,25 @@ fn dotnet_desktop_arguments(android: bool) -> Vec<OsString> {
 }
 
 /// The components a new prefix is made with, or `None` when one it needs is
-/// missing, before anything runs: Gecko and Wine Mono always, and the .NET
-/// Desktop Runtime always on the desktop; on the Android host only where the
-/// audit asks for it.
+/// missing, before anything runs: on the desktop Gecko, Wine Mono and the
+/// .NET Desktop Runtime, all three; on the Android host only the .NET
+/// Desktop Runtime where the audit asks for it, and never Gecko or Wine
+/// Mono, which no program the Launcher runs there needs.
 fn new_prefix_components<'a>(
     gecko: Option<&'a VerifiedArtifact>,
     mono: Option<&'a VerifiedArtifact>,
     dotnet: Option<&'a VerifiedArtifact>,
     android: bool,
 ) -> Option<(
-    &'a VerifiedArtifact,
-    &'a VerifiedArtifact,
+    Option<&'a VerifiedArtifact>,
+    Option<&'a VerifiedArtifact>,
     Option<&'a VerifiedArtifact>,
 )> {
+    if android {
+        return Some((None, None, dotnet));
+    }
     match (gecko, mono, dotnet) {
-        (Some(gecko), Some(mono), dotnet) if dotnet.is_some() || android => {
-            Some((gecko, mono, dotnet))
-        }
+        (Some(gecko), Some(mono), Some(dotnet)) => Some((Some(gecko), Some(mono), Some(dotnet))),
         _ => None,
     }
 }
@@ -4270,10 +4342,14 @@ impl InstallDriver for ProductionInstallDriver {
                 return Err(AdapterFailure::here());
             }
         }
-        parts.start(EnvironmentPart::WebComponents);
-        self.install_gecko(paths, runtime, gecko, mutation_lease, control)?;
-        parts.start(EnvironmentPart::Dotnet);
-        self.install_mono(paths, runtime, mono, mutation_lease, control)?;
+        if let Some(gecko) = gecko {
+            parts.start(EnvironmentPart::WebComponents);
+            self.install_gecko(paths, runtime, gecko, mutation_lease, control)?;
+        }
+        if let Some(mono) = mono {
+            parts.start(EnvironmentPart::Dotnet);
+            self.install_mono(paths, runtime, mono, mutation_lease, control)?;
+        }
         match dotnet {
             Some(dotnet) => {
                 parts.start(EnvironmentPart::LauncherSupport);
@@ -10586,6 +10662,223 @@ mod tests {
         assert!(!abandoned_prefix(&open()));
     }
 
+    /// A prefix an older release set up on Android: Wine's files, the game,
+    /// the .NET Desktop Runtime, and Wine Gecko and Wine Mono with their
+    /// receipts.
+    fn older_android_prefix(root: &Path) -> PathBuf {
+        let prefix = root.join("prefix");
+        let write = |relative: &str| {
+            let path = prefix.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        };
+        for receipt in [
+            GECKO_RECEIPT,
+            MONO_RECEIPT,
+            DOTNET_DESKTOP_RECEIPT,
+            "system.reg",
+            "user.reg",
+            "userdef.reg",
+        ] {
+            write(receipt);
+        }
+        write("drive_c/windows/mono/mono-2.0/lib/mono/4.5/mscorlib.dll");
+        write("drive_c/windows/mono/mono-2.0/support/installinf-x86.exe");
+        write("drive_c/windows/syswow64/gecko/2.47.4/wine_gecko/xul.dll");
+        fs::create_dir_all(prefix.join("drive_c/windows/syswow64/gecko/plugin")).unwrap();
+        fs::create_dir_all(prefix.join("drive_c/windows/system32/gecko/plugin")).unwrap();
+        write("drive_c/windows/system32/kernel32.dll");
+        write("drive_c/Program Files (x86)/Diablo II/Game.exe");
+        write("drive_c/Program Files (x86)/Diablo II/ProjectD2/PD2Launcher.exe");
+        write("drive_c/Program Files (x86)/dotnet/dotnet.exe");
+        prefix
+    }
+
+    #[test]
+    fn wine_gecko_and_mono_leave_an_android_prefix_and_nothing_else_does() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        // Wine maps a read-only attribute onto a folder's mode.
+        fs::set_permissions(
+            prefix.join("drive_c/windows/mono/mono-2.0/support"),
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        let open = || Directory::open(&prefix).unwrap();
+        assert!(remove_wine_gecko_and_mono(&open()).unwrap());
+        for gone in [
+            GECKO_RECEIPT,
+            MONO_RECEIPT,
+            "drive_c/windows/mono",
+            "drive_c/windows/syswow64/gecko/2.47.4",
+        ] {
+            assert!(!prefix.join(gone).exists(), "{gone} is still there");
+        }
+        for kept in [
+            DOTNET_DESKTOP_RECEIPT,
+            "system.reg",
+            "drive_c/windows/syswow64/gecko/plugin",
+            "drive_c/windows/system32/gecko/plugin",
+            "drive_c/windows/system32/kernel32.dll",
+            "drive_c/Program Files (x86)/Diablo II/Game.exe",
+            "drive_c/Program Files (x86)/Diablo II/ProjectD2/PD2Launcher.exe",
+            "drive_c/Program Files (x86)/dotnet/dotnet.exe",
+        ] {
+            assert!(prefix.join(kept).exists(), "{kept} was removed");
+        }
+        // Again: nothing left to remove, and nothing else goes.
+        assert!(!remove_wine_gecko_and_mono(&open()).unwrap());
+        assert!(prefix.join(DOTNET_DESKTOP_RECEIPT).exists());
+    }
+
+    #[test]
+    fn a_removal_of_wine_gecko_and_mono_that_stopped_part_way_is_finished_later() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        // The receipts went and half of Mono's folder, then the app stopped.
+        fs::remove_file(prefix.join(GECKO_RECEIPT)).unwrap();
+        fs::remove_file(prefix.join(MONO_RECEIPT)).unwrap();
+        fs::remove_dir_all(prefix.join("drive_c/windows/mono/mono-2.0/lib")).unwrap();
+        let open = || Directory::open(&prefix).unwrap();
+        assert!(remove_wine_gecko_and_mono(&open()).unwrap());
+        assert!(!prefix.join("drive_c/windows/mono").exists());
+        assert!(
+            !prefix
+                .join("drive_c/windows/syswow64/gecko/2.47.4")
+                .exists()
+        );
+        assert!(
+            prefix
+                .join("drive_c/Program Files (x86)/Diablo II/Game.exe")
+                .exists()
+        );
+        assert!(!remove_wine_gecko_and_mono(&open()).unwrap());
+    }
+
+    #[test]
+    fn a_linked_mono_folder_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let outside = fixture.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        fs::remove_dir_all(prefix.join("drive_c/windows/mono")).unwrap();
+        symlink(&outside, prefix.join("drive_c/windows/mono")).unwrap();
+        let prefix_directory = Directory::open(&prefix).unwrap();
+        assert!(remove_wine_gecko_and_mono(&prefix_directory).is_err());
+        assert!(outside.join("keep.txt").exists());
+    }
+
+    /// A folder outside the prefix with one file in it, for the link tests.
+    fn outside_folder(root: &Path) -> PathBuf {
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        outside
+    }
+
+    #[test]
+    fn a_link_inside_the_mono_tree_goes_and_its_target_stays() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let outside = outside_folder(fixture.path());
+        symlink(
+            &outside,
+            prefix.join("drive_c/windows/mono/mono-2.0/lib/linked"),
+        )
+        .unwrap();
+        symlink(
+            outside.join("keep.txt"),
+            prefix.join("drive_c/windows/mono/mono-2.0/linked.txt"),
+        )
+        .unwrap();
+        assert!(remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).unwrap());
+        assert!(!prefix.join("drive_c/windows/mono").exists());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_linked_gecko_version_folder_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let outside = outside_folder(fixture.path());
+        let gecko = prefix.join("drive_c/windows/syswow64/gecko/2.47.4");
+        fs::remove_dir_all(&gecko).unwrap();
+        symlink(&outside, &gecko).unwrap();
+        assert!(remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).is_err());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_linked_syswow64_or_drive_c_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        for linked in ["drive_c/windows/syswow64", "drive_c"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let prefix = older_android_prefix(fixture.path());
+            let outside = fixture.path().join("outside");
+            // The linked folder's contents, Gecko's version folder among them,
+            // moved outside the prefix.
+            fs::rename(prefix.join(linked), &outside).unwrap();
+            symlink(&outside, prefix.join(linked)).unwrap();
+            assert!(
+                remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).is_err(),
+                "{linked}"
+            );
+            let gecko = if linked == "drive_c" {
+                outside.join("windows/syswow64/gecko/2.47.4/wine_gecko/xul.dll")
+            } else {
+                outside.join("gecko/2.47.4/wine_gecko/xul.dll")
+            };
+            assert!(gecko.exists(), "{linked}");
+        }
+    }
+
+    #[test]
+    fn a_linked_or_hard_linked_receipt_stops_the_removal_and_its_target_stays() {
+        use std::os::unix::fs::symlink;
+        // A symbolic link as Gecko's receipt.
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let outside = outside_folder(fixture.path());
+        fs::remove_file(prefix.join(GECKO_RECEIPT)).unwrap();
+        symlink(outside.join("keep.txt"), prefix.join(GECKO_RECEIPT)).unwrap();
+        assert!(remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).is_err());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        // A hard link as Mono's receipt: not a unique file, so it is left, and
+        // the other name keeps its contents.
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let outside = outside_folder(fixture.path());
+        fs::remove_file(prefix.join(MONO_RECEIPT)).unwrap();
+        fs::hard_link(outside.join("keep.txt"), prefix.join(MONO_RECEIPT)).unwrap();
+        assert!(remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).is_err());
+        assert_eq!(fs::read(outside.join("keep.txt")).unwrap(), b"keep");
+        assert!(prefix.join(MONO_RECEIPT).exists());
+    }
+
+    #[test]
+    fn a_system32_gecko_version_folder_goes_too() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = older_android_prefix(fixture.path());
+        let version = prefix.join("drive_c/windows/system32/gecko/2.47.4/wine_gecko");
+        fs::create_dir_all(&version).unwrap();
+        fs::write(version.join("xul.dll"), b"x").unwrap();
+        assert!(remove_wine_gecko_and_mono(&Directory::open(&prefix).unwrap()).unwrap());
+        assert!(
+            !prefix
+                .join("drive_c/windows/system32/gecko/2.47.4")
+                .exists()
+        );
+        assert!(
+            prefix
+                .join("drive_c/windows/system32/gecko/plugin")
+                .exists()
+        );
+    }
+
     #[test]
     fn an_android_ui_helper_runs_as_a_checked_copy_that_is_removed_after() {
         let fixture = tempfile::tempdir().unwrap();
@@ -11029,7 +11322,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_prefix_may_lack_the_dotnet_runtime_only_on_android() {
+    fn a_new_desktop_prefix_needs_all_three_and_an_android_one_no_gecko_or_mono() {
         let fixture = tempfile::tempdir().unwrap();
         let gecko = verified_test_artifact(ArtifactKind::Gecko, fixture.path().join("g.msi"));
         let mono = verified_test_artifact(ArtifactKind::WineMono, fixture.path().join("m.msi"));
@@ -11037,17 +11330,27 @@ mod tests {
             ArtifactKind::DotnetDesktop,
             fixture.path().join("dotnet.exe"),
         );
-        for android in [false, true] {
-            assert!(
-                new_prefix_components(Some(&gecko), Some(&mono), Some(&dotnet), android).is_some()
-            );
-            assert!(new_prefix_components(None, Some(&mono), Some(&dotnet), android).is_none());
-            assert!(new_prefix_components(Some(&gecko), None, Some(&dotnet), android).is_none());
-        }
-        assert!(new_prefix_components(Some(&gecko), Some(&mono), None, false).is_none());
+        // The desktop: Gecko, Wine Mono and the .NET Desktop Runtime.
         assert!(matches!(
-            new_prefix_components(Some(&gecko), Some(&mono), None, true),
-            Some((_, _, None))
+            new_prefix_components(Some(&gecko), Some(&mono), Some(&dotnet), false),
+            Some((Some(_), Some(_), Some(_)))
+        ));
+        assert!(new_prefix_components(None, Some(&mono), Some(&dotnet), false).is_none());
+        assert!(new_prefix_components(Some(&gecko), None, Some(&dotnet), false).is_none());
+        assert!(new_prefix_components(Some(&gecko), Some(&mono), None, false).is_none());
+        // The Android host: the .NET Desktop Runtime when the audit asks for
+        // it, and never Gecko or Wine Mono, even when they are given.
+        assert!(matches!(
+            new_prefix_components(None, None, Some(&dotnet), true),
+            Some((None, None, Some(_)))
+        ));
+        assert!(matches!(
+            new_prefix_components(Some(&gecko), Some(&mono), Some(&dotnet), true),
+            Some((None, None, Some(_)))
+        ));
+        assert!(matches!(
+            new_prefix_components(None, None, None, true),
+            Some((None, None, None))
         ));
     }
 

@@ -31,7 +31,8 @@ mod adapters;
 pub(crate) use adapters::{
     InstallerMedia, ProductionArtifactSource, ProductionInstallDriver, UpdaterClientSynchronizer,
     XINPUT_BRIDGE_PATH, XINPUT_BRIDGE_SHA256, XINPUT_BRIDGE_SIZE, android_gl_probe_copy,
-    fex_strict_settings, gl_probe_helper, install_xinput_bridge, seed_verified_cache,
+    fex_strict_settings, gl_probe_helper, install_xinput_bridge, remove_wine_gecko_and_mono,
+    seed_verified_cache,
 };
 
 /// A temporary authorization that deliberately cannot be cloned or serialized.
@@ -888,9 +889,13 @@ impl InstallAudit {
         }
     }
 
-    /// The Android host.
+    /// The Android host. Its prefix never gets Wine Gecko or Wine Mono: no
+    /// program the Launcher runs there needs them, so neither is downloaded
+    /// or installed.
     pub(crate) fn with_android_host(mut self) -> Self {
         self.android_host = true;
+        self.prefix_needs.gecko = false;
+        self.prefix_needs.mono = false;
         self
     }
 
@@ -3160,8 +3165,9 @@ mod tests {
     }
 
     /// The Android host's audit, as `ProductionAuditor` reports it there:
-    /// the prefix needs every component, the .NET Desktop Runtime included
-    /// (for the official PD2 launcher).
+    /// the prefix needs the .NET Desktop Runtime (for the official PD2
+    /// launcher), and never Wine Gecko or Wine Mono, whatever the audit of
+    /// the prefix says.
     fn android_audit(status: InstallationStatus, runtime: CheckStatus) -> InstallAudit {
         audit(status, runtime)
             .with_prefix_needs(PrefixNeeds {
@@ -3201,13 +3207,11 @@ mod tests {
             )
             .expect("downloads verified");
         // Download keeps Blizzard's wrappers, verified, and runs nothing: no
-        // Wine (the app provides it, and the prefix components in the
-        // download cache), no downloader.
+        // Wine (the app provides it, and the .NET installer in the download
+        // cache), no downloader, and no Wine Gecko or Wine Mono.
         assert_eq!(
             *source.acquisitions.borrow(),
             [
-                ArtifactKind::Gecko,
-                ArtifactKind::WineMono,
                 ArtifactKind::DotnetDesktop,
                 ArtifactKind::BaseGameWrapper,
                 ArtifactKind::ExpansionWrapper,

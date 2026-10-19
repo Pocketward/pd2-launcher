@@ -8,7 +8,7 @@ set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 output_directory=${1:-"$repository_root/dist"}
-package_version=0.1.3
+package_version=0.1.4
 architecture=${PD2_TARGET_ARCHITECTURE:-$(uname -m)}
 case "$architecture" in
   aarch64) cargo_features= ;;

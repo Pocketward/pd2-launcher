@@ -94,7 +94,11 @@ const ANDROID: [&str; 1] = ["PD2_GAMEPAD_FILE"];
 /// falls back to the host's resolver. The driver runs in `winedevice.exe`,
 /// which the first Wine process of a prefix starts with its own environment,
 /// so every Wine process carries the override.
-const ANDROID_DLL_OVERRIDES: &str = ";xinput1_4=n;nsiproxy.sys=d";
+/// Also no `mscoree` and no `mshtml`: the Android app's prefix has no Wine
+/// Mono and no Wine Gecko (no program the Launcher runs there needs them),
+/// and with both off Wine never offers to install them, also when it
+/// updates the prefix for a new runtime.
+const ANDROID_DLL_OVERRIDES: &str = ";xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=";
 
 /// Set on the Android host: Wine's esync, so waits on events, mutexes and
 /// semaphores are eventfd reads instead of wineserver round trips (about
@@ -160,8 +164,20 @@ fn compose_on(
         environment.insert(OsString::from(name), OsString::from(value));
     }
     // The game's XInput is the Launcher's bridge in the prefix, never Wine's.
-    if android && let Some(overrides) = environment.get_mut(OsStr::new("WINEDLLOVERRIDES")) {
-        overrides.push(ANDROID_DLL_OVERRIDES);
+    // A Wine process started without the Launcher's overrides gets the
+    // Android ones alone: with mshtml on, Wine updating the prefix (its first
+    // start after the runtime changed, say) would open Gecko's dialog, which
+    // nobody can answer on Android.
+    if android {
+        match environment.get_mut(OsStr::new("WINEDLLOVERRIDES")) {
+            Some(overrides) => overrides.push(ANDROID_DLL_OVERRIDES),
+            None => {
+                environment.insert(
+                    OsString::from("WINEDLLOVERRIDES"),
+                    OsString::from(ANDROID_DLL_OVERRIDES.trim_start_matches(';')),
+                );
+            }
+        }
     }
     environment.into_iter().collect()
 }
@@ -251,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_android_host_loads_the_xinput_bridge_and_no_nsiproxy() {
+    fn only_the_android_host_loads_the_xinput_bridge_and_no_nsiproxy_mono_or_gecko() {
         let settings = [Setting::new(
             "WINEDLLOVERRIDES",
             "winemenubuilder.exe=;ddraw=n",
@@ -261,7 +277,7 @@ mod tests {
         let android = compose_on(host.clone(), &settings, true);
         assert_eq!(
             get(&android, "WINEDLLOVERRIDES"),
-            Some("winemenubuilder.exe=;ddraw=n;xinput1_4=n;nsiproxy.sys=d")
+            Some("winemenubuilder.exe=;ddraw=n;xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=")
         );
         // The installers' and Blizzard's downloader's too: the first Wine
         // process of a prefix starts winedevice.exe with its environment.
@@ -272,7 +288,10 @@ mod tests {
         )];
         assert_eq!(
             get(&compose_on(Vec::new(), &install, true), "WINEDLLOVERRIDES"),
-            Some("winemenubuilder.exe=;dsound=;winedbg.exe=d;xinput1_4=n;nsiproxy.sys=d")
+            Some(
+                "winemenubuilder.exe=;dsound=;winedbg.exe=d;xinput1_4=n;nsiproxy.sys=d;\
+                 mscoree=;mshtml="
+            )
         );
         assert_eq!(
             get(&compose_on(Vec::new(), &install, false), "WINEDLLOVERRIDES"),
@@ -283,9 +302,14 @@ mod tests {
             get(&desktop, "WINEDLLOVERRIDES"),
             Some("winemenubuilder.exe=;ddraw=n")
         );
-        // Without the Launcher's overrides there is nothing to add to.
+        // Without the Launcher's overrides, the Android ones alone; the
+        // desktop sets none.
         assert_eq!(
             get(&compose_on(Vec::new(), &[], true), "WINEDLLOVERRIDES"),
+            Some("xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=")
+        );
+        assert_eq!(
+            get(&compose_on(Vec::new(), &[], false), "WINEDLLOVERRIDES"),
             None
         );
     }

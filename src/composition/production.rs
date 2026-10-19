@@ -380,13 +380,6 @@ struct ReadyBackend {
     put_aside: Mutex<crate::save_keeper::PutAside>,
 }
 
-/// Proton-based Wine (Wine-GE among them) saves the registry through a
-/// temporary file of a fixed name that it refuses to replace, so one left
-/// by a Wine that was killed stops every later save ("Failed flushing
-/// registry"). It is removed only while this Launcher holds the
-/// installation exclusively (no setup step or game of any Launcher runs)
-/// and no wineserver of the prefix answers: a game left running by a
-/// Launcher that stopped keeps its server, and its save, untouched.
 /// Add the Launcher to the desktop's app menu, or take it out (`app_menu`);
 /// a failure is only reported.
 fn sync_app_menu(enabled: bool) {
@@ -405,6 +398,42 @@ fn sync_app_menu(enabled: bool) {
     }
 }
 
+/// On the Android host: Wine Gecko and Wine Mono that an older release put
+/// in the prefix are removed (`install::remove_wine_gecko_and_mono`), only
+/// while this Launcher holds the installation lease exclusively: no setup
+/// step, official launcher session or game of any Launcher runs. (Wine under
+/// the app's FEX keeps its wineserver socket in the RootFS's /tmp, so the
+/// host's /tmp shows none; the lease is the guard.)
+fn remove_android_wine_gecko_and_mono(managed_root: &Path) {
+    let Ok(root) = Directory::open(managed_root) else {
+        return;
+    };
+    let Ok(_lease) = InstallationMutationLease::acquire(&root) else {
+        return;
+    };
+    let Ok(prefix) = root.open_directory(Path::new("prefix")) else {
+        return;
+    };
+    match crate::install::remove_wine_gecko_and_mono(&prefix) {
+        Ok(true) => eprintln!("pd2-launcher: removed Wine Gecko and Wine Mono from the prefix"),
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!(
+                "pd2-launcher: Wine Gecko and Wine Mono not removed from the prefix: {error}"
+            );
+        }
+    }
+}
+
+/// Proton-based Wine (Wine-GE among them) saves the registry through a
+/// temporary file of a fixed name that it refuses to replace, so one left
+/// by a Wine that was killed stops every later save ("Failed flushing
+/// registry"). It is removed only while this Launcher holds the
+/// installation exclusively (no setup step or game of any Launcher runs)
+/// and no wineserver of the prefix answers: a game left running by a
+/// Launcher that stopped keeps its server, and its save, untouched.
+/// On Android the installation lease is the guard: the wineserver check
+/// cannot see the server there.
 fn remove_stale_registry_save(managed_root: &Path) {
     let Ok(root) = Directory::open(managed_root) else {
         return;
@@ -487,6 +516,9 @@ impl ReadyBackend {
         };
         let settings = SettingsStore::new(paths.settings_file());
         remove_stale_registry_save(&paths.managed_root());
+        if crate::android_host() {
+            remove_android_wine_gecko_and_mono(&paths.managed_root());
+        }
         if mode == LaunchMode::Interactive {
             sync_app_menu(
                 settings
@@ -3806,7 +3838,7 @@ mod tests {
         );
         assert!(!paths.settings_file().exists(), "nothing was saved");
         // On Android the prefix needs the .NET Desktop Runtime too, for the
-        // official PD2 launcher.
+        // official PD2 launcher, but never Wine Gecko or Wine Mono.
         use crate::install::{InstallationAuditor as _, ManagedPaths};
         let root = paths.managed_root();
         let managed = ManagedPaths::prepare(&root).unwrap();
@@ -3820,7 +3852,8 @@ mod tests {
                 .unwrap_or_else(|_| panic!("audit"))
         };
         let android = audit(&backend);
-        assert!(android.prefix_needs().gecko && android.prefix_needs().dotnet);
+        assert!(android.prefix_needs().dotnet);
+        assert!(!android.prefix_needs().gecko && !android.prefix_needs().mono);
         assert!(android.android_host());
         // The desktop offers it (on its ARM64 builds).
         let desktop = ReadyBackend::new(
@@ -3834,6 +3867,7 @@ mod tests {
         // Its plan is the desktop's.
         let desktop = audit(&desktop);
         assert!(desktop.prefix_needs().dotnet && !desktop.android_host());
+        assert!(desktop.prefix_needs().gecko && desktop.prefix_needs().mono);
     }
 
     #[test]
