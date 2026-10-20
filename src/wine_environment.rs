@@ -79,8 +79,21 @@ const GRAPHICS_PREFIXES: [&str; 11] = [
 const SYSTEM: [&str; 3] = ["GLIBC_TUNABLES", "DISABLE_GAMESCOPE_WSI", "DRI_PRIME"];
 
 /// What the Android app's guests also keep: the gamepad file of the XInput
-/// bridge. PulseAudio's `PULSE_SERVER` is in [`SESSION`].
-const ANDROID: [&str; 1] = ["PD2_GAMEPAD_FILE"];
+/// bridge, the game's present counter and direct-present socket (read by the
+/// app userland's Mesa in the game's own process), the userland's font and
+/// X locale configuration, and Box64's own settings (`BOX64_*`, for
+/// `wowbox64.dll` in every Wine process). PulseAudio's `PULSE_SERVER` is in
+/// [`SESSION`].
+const ANDROID: [&str; 5] = [
+    "PD2_GAMEPAD_FILE",
+    "PD2_PRESENT_COUNTER",
+    "PD2_PRESENT_SOCKET",
+    "FONTCONFIG_FILE",
+    "XLOCALEDIR",
+];
+/// Prefixes of what the Android app's guests also keep: Box64's settings and
+/// PanVK's (the Mali driver's).
+const ANDROID_PREFIXES: [&str; 2] = ["BOX64_", "PAN_"];
 
 /// Added to the Launcher's DLL overrides on the Android host: the XInput
 /// bridge (`tools/xinput-bridge.c`) installed as `xinput1_4.dll`, and no
@@ -97,16 +110,43 @@ const ANDROID: [&str; 1] = ["PD2_GAMEPAD_FILE"];
 /// Also no `mscoree` and no `mshtml`: the Android app's prefix has no Wine
 /// Mono and no Wine Gecko (no program the Launcher runs there needs them),
 /// and with both off Wine never offers to install them, also when it
-/// updates the prefix for a new runtime.
-const ANDROID_DLL_OVERRIDES: &str = ";xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=";
+/// updates the prefix for a new runtime. And none of Wine's HID and
+/// Bluetooth drivers (`winebus.sys`, `winehid.sys`, `hidclass.sys`,
+/// `winebth.sys`): the game's controller is the XInput bridge, and without
+/// them every Wine process of the prefix uses less memory.
+const ANDROID_DLL_OVERRIDES: &str = ";xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=;\
+winebus.sys=d;winehid.sys=d;hidclass.sys=d;winebth.sys=d";
 
-/// Set on the Android host: Wine's esync, so waits on events, mutexes and
-/// semaphores are eventfd reads instead of wineserver round trips (about
-/// half of the game's wineserver requests). Its shared memory is the
-/// RootFS's `/dev/shm`, where the app's FEX creates the file. Every Wine
-/// process of a prefix needs the same value: a client with esync refuses a
-/// wineserver without it.
-const ANDROID_ESYNC: (&str, &str) = ("WINEESYNC", "1");
+/// `PD2_APP_COMPATIBILITY_<NAME>=<value>` in the Launcher engine's own
+/// environment: a value of the Android app's Compatibility graphics driver,
+/// which a Wine process gets as `<NAME>=<value>` (over a value of the same
+/// name) while that driver is in use ([`use_compatibility_driver`]).
+const ANDROID_COMPATIBILITY_PREFIX: &str = "PD2_APP_COMPATIBILITY_";
+
+/// The Android app's last Play asked for its Compatibility graphics driver.
+static COMPATIBILITY_DRIVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Held by the tests that change the graphics driver in use, which is the
+/// whole process's.
+#[cfg(test)]
+pub(crate) static DRIVER_IN_USE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The Android app's graphics driver for every Wine process started from
+/// now on: the Compatibility driver's values, or the standard ones. The
+/// engine sets it at its start from the last Play's driver, and again at
+/// each Play.
+pub(crate) fn use_compatibility_driver(compatibility: bool) {
+    COMPATIBILITY_DRIVER.store(compatibility, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "pd2-launcher: graphics driver {}",
+        if compatibility {
+            "compatibility"
+        } else {
+            "standard"
+        }
+    );
+}
 
 /// Set by the AppImage's entry point when it, not the host, set
 /// `DISABLE_GAMESCOPE_WSI` (for the Launcher's own window).
@@ -117,6 +157,10 @@ fn passes_through(name: &OsStr, value: &OsStr, android: bool) -> bool {
     let name = name.as_bytes();
     let known = SESSION.iter().any(|known| name == known.as_bytes())
         || (android && ANDROID.iter().any(|known| name == known.as_bytes()))
+        || (android
+            && ANDROID_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_bytes())))
         || SYSTEM.iter().any(|known| name == known.as_bytes())
         || GRAPHICS_PREFIXES
             .iter()
@@ -137,15 +181,30 @@ pub(crate) fn compose(
     compose_on(host, settings, crate::android_host())
 }
 
-fn compose_on(
+/// [`compose`] on the Android host (`android`) or the desktop.
+pub(crate) fn compose_on(
     host: impl IntoIterator<Item = (OsString, OsString)>,
     settings: &[Setting],
     android: bool,
 ) -> Vec<(OsString, OsString)> {
     let host = host.into_iter().collect::<BTreeMap<_, _>>();
     let launcher_set_wsi = host.contains_key(OsStr::new(LAUNCHER_SET_GAMESCOPE_WSI));
+    let compatibility =
+        if android && COMPATIBILITY_DRIVER.load(std::sync::atomic::Ordering::Relaxed) {
+            host.iter()
+                .filter_map(|(name, value)| {
+                    let name = name
+                        .as_bytes()
+                        .strip_prefix(ANDROID_COMPATIBILITY_PREFIX.as_bytes())?;
+                    Some((OsStr::from_bytes(name).to_owned(), value.clone()))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
     let mut environment = host
         .into_iter()
+        .chain(compatibility)
         .filter(|(name, value)| passes_through(name, value, android))
         .collect::<BTreeMap<_, _>>();
     // The AppImage turns gamescope's Vulkan layer off for the Launcher's own
@@ -158,10 +217,6 @@ fn compose_on(
             continue;
         }
         environment.insert(setting.name.clone(), setting.value.clone());
-    }
-    if android {
-        let (name, value) = ANDROID_ESYNC;
-        environment.insert(OsString::from(name), OsString::from(value));
     }
     // The game's XInput is the Launcher's bridge in the prefix, never Wine's.
     // A Wine process started without the Launcher's overrides gets the
@@ -247,8 +302,11 @@ mod tests {
         let app = host(&[
             ("PD2_GAMEPAD_FILE", "/data/gamepad.bin"),
             ("PULSE_SERVER", "unix:/data/run/pulse/native"),
-            ("PD2_APP_FEX", "/data/pd2-fex"),
-            ("PD2_APP_FEX_HOSTENV_VK_DRIVER_FILES", "/data/icd.json"),
+            ("PD2_PRESENT_COUNTER", "/data/run/presents"),
+            ("BOX64_NOBANNER", "1"),
+            ("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1"),
+            ("PD2_ANDROID_APP", "1"),
+            ("PD2_APP_COMPATIBILITY_TU_DEBUG", "sysmem,noubwc"),
         ]);
         let android = compose_on(app.clone(), &[], true);
         assert_eq!(get(&android, "PD2_GAMEPAD_FILE"), Some("/data/gamepad.bin"));
@@ -256,14 +314,47 @@ mod tests {
             get(&android, "PULSE_SERVER"),
             Some("unix:/data/run/pulse/native")
         );
-        assert_eq!(get(&android, "PD2_APP_FEX"), None);
-        assert_eq!(get(&android, "PD2_APP_FEX_HOSTENV_VK_DRIVER_FILES"), None);
+        assert_eq!(
+            get(&android, "PD2_PRESENT_COUNTER"),
+            Some("/data/run/presents")
+        );
+        assert_eq!(get(&android, "BOX64_NOBANNER"), Some("1"));
+        assert_eq!(
+            get(&android, "PAN_I_WANT_A_BROKEN_VULKAN_DRIVER"),
+            Some("1")
+        );
+        assert_eq!(get(&android, "PD2_ANDROID_APP"), None);
+        assert_eq!(get(&android, "PD2_APP_COMPATIBILITY_TU_DEBUG"), None);
         let desktop = compose_on(app, &[], false);
         assert_eq!(get(&desktop, "PD2_GAMEPAD_FILE"), None);
+        assert_eq!(get(&desktop, "PD2_PRESENT_COUNTER"), None);
+        assert_eq!(get(&desktop, "BOX64_NOBANNER"), None);
         assert_eq!(
             get(&desktop, "PULSE_SERVER"),
             Some("unix:/data/run/pulse/native")
         );
+    }
+
+    #[test]
+    fn the_compatibility_driver_values_reach_wine_only_while_it_is_in_use() {
+        let _driver = DRIVER_IN_USE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let app = host(&[
+            ("TU_DEBUG", "sysmem"),
+            ("PD2_APP_COMPATIBILITY_TU_DEBUG", "sysmem,noubwc,nolrz"),
+        ]);
+        assert_eq!(
+            get(&compose_on(app.clone(), &[], true), "TU_DEBUG"),
+            Some("sysmem")
+        );
+        use_compatibility_driver(true);
+        let compatibility = compose_on(app.clone(), &[], true);
+        let desktop = compose_on(app.clone(), &[], false);
+        use_compatibility_driver(false);
+        assert_eq!(get(&compatibility, "TU_DEBUG"), Some("sysmem,noubwc,nolrz"));
+        assert_eq!(get(&desktop, "TU_DEBUG"), Some("sysmem"));
+        assert_eq!(get(&compose_on(app, &[], true), "TU_DEBUG"), Some("sysmem"));
     }
 
     #[test]
@@ -277,7 +368,10 @@ mod tests {
         let android = compose_on(host.clone(), &settings, true);
         assert_eq!(
             get(&android, "WINEDLLOVERRIDES"),
-            Some("winemenubuilder.exe=;ddraw=n;xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=")
+            Some(
+                "winemenubuilder.exe=;ddraw=n;xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=;\
+                 winebus.sys=d;winehid.sys=d;hidclass.sys=d;winebth.sys=d"
+            )
         );
         // The installers' and Blizzard's downloader's too: the first Wine
         // process of a prefix starts winedevice.exe with its environment.
@@ -290,7 +384,7 @@ mod tests {
             get(&compose_on(Vec::new(), &install, true), "WINEDLLOVERRIDES"),
             Some(
                 "winemenubuilder.exe=;dsound=;winedbg.exe=d;xinput1_4=n;nsiproxy.sys=d;\
-                 mscoree=;mshtml="
+                 mscoree=;mshtml=;winebus.sys=d;winehid.sys=d;hidclass.sys=d;winebth.sys=d"
             )
         );
         assert_eq!(
@@ -306,22 +400,15 @@ mod tests {
         // desktop sets none.
         assert_eq!(
             get(&compose_on(Vec::new(), &[], true), "WINEDLLOVERRIDES"),
-            Some("xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=")
+            Some(
+                "xinput1_4=n;nsiproxy.sys=d;mscoree=;mshtml=;winebus.sys=d;winehid.sys=d;\
+                 hidclass.sys=d;winebth.sys=d"
+            )
         );
         assert_eq!(
             get(&compose_on(Vec::new(), &[], false), "WINEDLLOVERRIDES"),
             None
         );
-    }
-
-    #[test]
-    fn only_the_android_host_turns_on_esync() {
-        let host = host(&[("WINEESYNC", "0")]);
-        assert_eq!(
-            get(&compose_on(host.clone(), &[], true), "WINEESYNC"),
-            Some("1")
-        );
-        assert_eq!(get(&compose_on(host, &[], false), "WINEESYNC"), None);
     }
 
     #[test]

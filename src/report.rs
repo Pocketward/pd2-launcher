@@ -995,6 +995,10 @@ fn host_json(host: &HostEvidence) -> Value {
             "fex_rootfs_ready": rootfs_ready,
             "builtin_fex_pending": pending,
         }),
+        GuestExecutionEvidence::AppProvided { page_size_4k } => json!({
+            "kind": "app_provided",
+            "page_size_4k": page_size_4k,
+        }),
         GuestExecutionEvidence::Unavailable => json!({"kind": "unavailable"}),
     };
     json!({
@@ -1057,6 +1061,11 @@ fn audit_json(report: &InstallationReport) -> Value {
         })).collect::<Vec<_>>(),
         "runtime": match report.installed_runtime() {
             crate::runtime::InstalledRuntime::Custom => json!({"kind": "custom"}),
+            crate::runtime::InstalledRuntime::App => json!({
+                "kind": "app",
+                "identity": crate::runtime::APP_RUNTIME_DIRECTORY,
+                "name": crate::runtime::APP_RUNTIME_DISPLAY_NAME,
+            }),
             crate::runtime::InstalledRuntime::BuiltIn(runtime) => json!({
                 "kind": if crate::runtime::retained().is_some_and(|retained| std::ptr::eq(retained, runtime)) {
                     "retained"

@@ -39,6 +39,7 @@ const MAX_CUSTOM_RECEIPT_BYTES: u64 = 8 * 1024;
 /// Larger than any `xinput1_4.dll` Wine puts in a prefix.
 const MAX_XINPUT_DLL_BYTES: u64 = 4 * 1024 * 1024;
 const CUSTOM_RUNTIME_BASE: &str = "runner/custom-wine";
+const APP_RUNTIME_BASE: &str = "runner/wine-11.0-arm64";
 const BUILTIN_GECKO_RECEIPT: &str = "prefix/.pd2launcher-gecko.sha256";
 const CUSTOM_GECKO_RECEIPT: &str = "prefix/.pd2launcher-gecko-custom.json";
 const BUILTIN_MONO_RECEIPT: &str = "prefix/.pd2launcher-mono.sha256";
@@ -501,8 +502,7 @@ pub enum GuestExecutionEvidence {
         /// without one (before `FEXRootFSFetcher`) runs no guest at all.
         rootfs_ready: bool,
         /// FEX or its RootFS comes with the Download step: the player chose
-        /// the built-in FEX and it is not installed yet, or the
-        /// Android host's App-provided FEX has no RootFS yet.
+        /// the built-in FEX and it is not installed yet.
         pending: bool,
     },
     Native {
@@ -518,6 +518,13 @@ pub enum GuestExecutionEvidence {
         missing_wine_libraries: Vec<WineLibrary>,
         libunwind_present: bool,
         x11_display_available: bool,
+    },
+    /// The Android host: the app's ARM64 Wine runs every guest directly,
+    /// and its x86 code runs in Box64's `wowbox64.dll`. The runtime
+    /// preflight is the evidence that it runs.
+    AppProvided {
+        /// The kernel's memory pages are 4 KB, which Wine and Box64 need.
+        page_size_4k: bool,
     },
     Unavailable,
 }
@@ -1338,6 +1345,9 @@ impl Auditor {
         });
         let custom_runtime =
             selected_runtime.is_some_and(crate::runtime::InstalledRuntime::is_custom);
+        // The Android app's runtime: provided by the app, audited by its
+        // structure and its exact `wine --version`.
+        let app_runtime = selected_runtime == Some(crate::runtime::InstalledRuntime::App);
         // A prefix the row's earlier pinned runtime made stays on it, and the
         // installation is audited against that runtime's own pins.
         let retained_runtime = match selected_runtime {
@@ -1353,6 +1363,8 @@ impl Auditor {
         let policy = retained_policy.as_ref().unwrap_or(&self.policy);
         let (runtime_base, loader_name, loader_takes_wine_path) = if custom_runtime {
             (CUSTOM_RUNTIME_BASE.to_owned(), "wine", false)
+        } else if app_runtime {
+            (APP_RUNTIME_BASE.to_owned(), "wine", false)
         } else {
             (
                 format!("runner/{}", policy.runtime_identity),
@@ -1369,6 +1381,9 @@ impl Auditor {
         .with_loader_takes_wine_path(loader_takes_wine_path);
         if custom_runtime {
             runtime_preflight = runtime_preflight.with_any_wine_version();
+        } else if app_runtime {
+            runtime_preflight =
+                runtime_preflight.with_wine_version(crate::runtime::APP_RUNTIME_VERSION);
         } else if let Some(runtime) = retained_runtime {
             runtime_preflight = runtime_preflight.with_wine_version(runtime.version);
         }
@@ -1409,6 +1424,8 @@ impl Auditor {
                     .expect("satisfied root retains its descriptor");
                 results.push(if custom_runtime {
                     check_custom_runtime(root)
+                } else if app_runtime {
+                    check_app_runtime(root)
                 } else {
                     unconfigured_custom_runtime(root, policy)
                         .unwrap_or_else(|| check_runtime(root, policy))
@@ -1466,7 +1483,9 @@ impl Auditor {
                 .as_ref()
                 .expect("execution requires a retained managed root");
             let bound = if custom_runtime {
-                bind_custom_runtime_preflight(root)
+                bind_unpinned_runtime_preflight(root, CUSTOM_RUNTIME_BASE)
+            } else if app_runtime {
+                bind_unpinned_runtime_preflight(root, APP_RUNTIME_BASE)
             } else {
                 bind_runtime_preflight(root, policy)
             };
@@ -1554,6 +1573,10 @@ impl Auditor {
             _ => MarkerState::Absent,
         };
         let installation_status = classify_installation(&checks, prefix_components.base, marker);
+        // The Android app has no window to show why: its log says it, once per changed result.
+        if crate::android_host() {
+            log_android_audit(installation_status, &findings);
+        }
         let launch_preflight = if installation_status == InstallationStatus::Ready
             && checks[AuditCheck::Transaction.index()] == CheckStatus::Satisfied
             && request.activity == ActivityEvidence::Idle
@@ -1603,6 +1626,7 @@ impl Auditor {
             protected_files,
             custom_sources,
             custom_runtime,
+            app_runtime,
             retained_runtime,
             prefix_components,
             official_launcher,
@@ -1668,6 +1692,8 @@ pub struct InstallationReport {
     protected_files: Vec<ProtectedFileInventoryEntry>,
     custom_sources: Vec<CustomSourceEvidence>,
     custom_runtime: bool,
+    /// The audited runtime is the Android app's.
+    app_runtime: bool,
     retained_runtime: Option<&'static crate::runtime::ManagedRuntime>,
     prefix_components: PrefixComponents,
     official_launcher: OfficialLauncherTrust,
@@ -1740,6 +1766,8 @@ impl InstallationReport {
     pub(crate) fn installed_runtime(&self) -> crate::runtime::InstalledRuntime {
         if self.custom_runtime {
             crate::runtime::InstalledRuntime::Custom
+        } else if self.app_runtime {
+            crate::runtime::InstalledRuntime::App
         } else {
             crate::runtime::InstalledRuntime::BuiltIn(
                 self.retained_runtime
@@ -1891,6 +1919,8 @@ fn check_host(
 enum HostCapability {
     DisplaySession,
     TranslatorInterpreter,
+    /// 4 KB memory pages for the translator: FEX on the desktop's ARM64
+    /// row, the app's Wine and Box64 on the Android host.
     TranslatorPageSize,
     TranslatorRootFs,
     DirectGuest,
@@ -1971,7 +2001,7 @@ const HOST_ROWS: [HostRow; 3] = [
         ],
     },
     // Android ARM64: the standalone ARM64 Launcher inside the Android app,
-    // run as its engine, with App-provided FEX and the app's host facts.
+    // run as its engine, with the app's ARM64 Wine and its host facts.
     // No display session: Check needs no X screen, and the app starts its
     // X screen for Install and Play.
     HostRow {
@@ -1979,11 +2009,10 @@ const HOST_ROWS: [HostRow; 3] = [
         android: true,
         artifacts: &[LauncherArtifactEvidence::NativeAarch64StandaloneBinary],
         certified: true,
-        capabilities: &[
-            HostCapability::TranslatorInterpreter,
-            HostCapability::TranslatorPageSize,
-            HostCapability::TranslatorRootFs,
-        ],
+        // The app provides the runtime, its ARM64 Wine; the runtime
+        // preflight shows that it runs. A kernel whose pages are not 4 KB
+        // is told before setup, not by a failed preflight.
+        capabilities: &[HostCapability::TranslatorPageSize],
     },
 ];
 
@@ -2045,7 +2074,7 @@ fn host_prerequisite_findings(
 }
 
 fn capability_gap(host: &HostEvidence, capability: HostCapability) -> Option<FindingReason> {
-    use GuestExecutionEvidence::{Native, Translated};
+    use GuestExecutionEvidence::{AppProvided, Native, Translated};
 
     let guest = &host.guest_execution;
     // Translation-detail and direct-execution-detail gaps are reported only
@@ -2075,6 +2104,8 @@ fn capability_gap(host: &HostEvidence, capability: HostCapability) -> Option<Fin
                 Translated {
                     page_size_4k: false,
                     ..
+                } | AppProvided {
+                    page_size_4k: false
                 }
             ),
             FindingReason::PageSizeUnsupported,
@@ -2180,15 +2211,17 @@ fn bind_runtime_preflight(
     )
 }
 
-/// A custom runtime is executed through `bin/wine` itself; its identity is
-/// not pinned, but the preflight still runs the exact retained descriptor.
-fn bind_custom_runtime_preflight(
+/// A custom runtime, or the Android app's, is executed through `bin/wine`
+/// itself; its identity is not pinned, but the preflight still runs the
+/// exact retained descriptor.
+fn bind_unpinned_runtime_preflight(
     root: &Directory,
+    base: &str,
 ) -> Result<RuntimePreflightHandles, FindingReason> {
-    let wine = format!("{CUSTOM_RUNTIME_BASE}/bin/wine");
+    let wine = format!("{base}/bin/wine");
     bind_runtime_handles(
         root,
-        CUSTOM_RUNTIME_BASE,
+        base,
         bind_runtime_file(root, &wine, None)?,
         bind_runtime_file(root, &wine, None)?,
     )
@@ -2275,6 +2308,21 @@ fn check_custom_runtime(root: &Directory) -> CheckResult {
     result
 }
 
+/// The Android app's runtime: presence and executable structure only. The
+/// app made it for its own data folder, so it has no pinned digest; the
+/// preflight checks its exact version.
+fn check_app_runtime(root: &Directory) -> CheckResult {
+    aggregate(
+        AuditCheck::Runtime,
+        [
+            inspect_directory(root, APP_RUNTIME_BASE),
+            inspect_executable(root, &format!("{APP_RUNTIME_BASE}/bin/wine")),
+            inspect_magic(root, &format!("{APP_RUNTIME_BASE}/bin/wine"), b"\x7fELF"),
+            inspect_executable(root, &format!("{APP_RUNTIME_BASE}/bin/wineserver")),
+        ],
+    )
+}
+
 /// With the built-in Wine source configured, a runtime installed from a
 /// custom source (and no pinned runtime) is reported for replacement instead
 /// of being accepted or silently treated as missing.
@@ -2325,11 +2373,16 @@ fn check_prefix(
             inspect_regular(root, "prefix/userdef.reg"),
         ],
     );
-    let (gecko, mono) = if android {
+    let (gecko, mono, dotnet) = if android {
         // The Android app's prefix has no Wine Gecko and no Wine Mono: no
         // program the Launcher runs there needs them, and every Wine
-        // process there has mscoree and mshtml off.
-        (satisfied(AuditCheck::Prefix), satisfied(AuditCheck::Prefix))
+        // process there has mscoree and mshtml off. It reaches the app's
+        // .NET (for the official PD2 launcher) through a link.
+        (
+            satisfied(AuditCheck::Prefix),
+            satisfied(AuditCheck::Prefix),
+            check_app_dotnet(&request.managed_root),
+        )
     } else {
         (
             check_gecko(root, policy, request.custom_source(CustomComponent::Gecko)),
@@ -2338,14 +2391,14 @@ fn check_prefix(
                 PrefixDependency::WineMono,
                 request.custom_source(CustomComponent::WineMono),
             ),
+            // For the official PD2 launcher.
+            check_prefix_dependency(
+                root,
+                PrefixDependency::DotnetDesktop,
+                request.custom_source(CustomComponent::DotnetDesktop),
+            ),
         )
     };
-    // For the official PD2 launcher, on every host.
-    let dotnet = check_prefix_dependency(
-        root,
-        PrefixDependency::DotnetDesktop,
-        request.custom_source(CustomComponent::DotnetDesktop),
-    );
     let components = PrefixComponents {
         base: base.status,
         gecko: gecko.status,
@@ -2392,6 +2445,23 @@ fn check_prefix(
         result.custom_sources.extend(part.custom_sources);
     }
     (result, components)
+}
+
+/// The Android app's .NET as the prefix reaches it: its link (which the
+/// safe walk never follows) leads to the app's Windows Desktop runtime.
+fn check_app_dotnet(managed_root: &Path) -> CheckResult {
+    let desktop = managed_root
+        .join(crate::runtime::APP_DOTNET_LINK)
+        .join("shared/Microsoft.WindowsDesktop.App/6.0.36");
+    match std::fs::metadata(&desktop) {
+        Ok(metadata) if metadata.is_dir() => satisfied(AuditCheck::Prefix),
+        _ => single_finding(
+            AuditCheck::Prefix,
+            CheckStatus::Missing,
+            FindingReason::Missing,
+            Some(relative_path(crate::runtime::APP_DOTNET_LINK)),
+        ),
+    }
 }
 
 /// The Android host's XInput bridge: `None` for
@@ -2907,6 +2977,30 @@ fn check_transaction(probe: &dyn TransactionProbe) -> CheckResult {
                 None,
             ),
         },
+    }
+}
+
+/// The Android host's log line for an audit: its status and findings, only when they differ
+/// from the last audit's, so a steady installation adds nothing.
+fn log_android_audit(status: InstallationStatus, findings: &[AuditFinding]) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let line = format!(
+        "{status:?}: {}",
+        findings
+            .iter()
+            .map(|finding| match &finding.path {
+                Some(path) => format!("{:?} {:?} {}", finding.check, finding.reason, path.as_str()),
+                None => format!("{:?} {:?}", finding.check, finding.reason),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let mut last = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *last != line {
+        eprintln!("pd2-launcher: audit {line}");
+        *last = line;
     }
 }
 
@@ -3605,39 +3699,10 @@ mod tests {
     }
 
     #[test]
-    fn an_android_host_needs_no_display_session_and_waits_for_its_rootfs() {
-        // App-provided FEX before the RootFS is unpacked: pending, as the
-        // built-in FEX on a fresh install.
-        let pending = android_host(GuestExecutionEvidence::Translated {
-            interpreter_present: true,
-            page_size_4k: true,
-            rootfs_ready: true,
-            pending: true,
-        });
-        assert_eq!(reasons(&pending), []);
-        // With the RootFS and a passing probe.
-        let ready = android_host(GuestExecutionEvidence::Translated {
-            interpreter_present: true,
-            page_size_4k: true,
-            rootfs_ready: true,
-            pending: false,
-        });
+    fn an_android_host_needs_no_display_session_and_no_fex() {
+        // The app's ARM64 Wine: the runtime preflight is its evidence.
+        let ready = android_host(GuestExecutionEvidence::AppProvided { page_size_4k: true });
         assert_eq!(reasons(&ready), []);
-        // A failing probe, and no entry point at all.
-        let failed = android_host(GuestExecutionEvidence::Translated {
-            interpreter_present: true,
-            page_size_4k: true,
-            rootfs_ready: false,
-            pending: false,
-        });
-        assert_eq!(reasons(&failed), [FindingReason::FexRootFsUnavailable]);
-        let missing = android_host(GuestExecutionEvidence::Translated {
-            interpreter_present: false,
-            page_size_4k: true,
-            rootfs_ready: false,
-            pending: false,
-        });
-        assert_eq!(reasons(&missing), [FindingReason::FexUnavailable]);
         // Only the standalone ARM64 Launcher runs inside the app.
         assert_eq!(
             host_prerequisite_findings(&ready, LauncherArtifactEvidence::NativeAarch64DebPackage)
@@ -3646,6 +3711,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [FindingReason::LauncherArtifactUnverified]
         );
+    }
+
+    #[test]
+    fn a_kernel_without_4_kb_pages_is_a_host_finding_on_the_android_host_too() {
+        // Wine and Box64 need 4 KB pages: the player is told before setup.
+        let pages = |page_size_4k| {
+            reasons(&android_host(GuestExecutionEvidence::AppProvided {
+                page_size_4k,
+            }))
+        };
+        assert_eq!(pages(false), [FindingReason::PageSizeUnsupported]);
+        assert_eq!(pages(true), []);
+        // The desktop's ARM64 row keeps its own check, for FEX.
+        let desktop = |page_size_4k| HostEvidence {
+            os_id: "rocknix".to_owned(),
+            display_session: DisplaySession::Wayland,
+            ..android_host(GuestExecutionEvidence::Translated {
+                interpreter_present: true,
+                page_size_4k,
+                rootfs_ready: page_size_4k,
+                pending: false,
+            })
+        };
+        assert_eq!(
+            reasons(&desktop(false)),
+            [FindingReason::PageSizeUnsupported]
+        );
+        assert_eq!(reasons(&desktop(true)), []);
     }
 
     #[test]

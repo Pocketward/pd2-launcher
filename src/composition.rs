@@ -11,9 +11,7 @@ use crate::{
     automation::AutomationRequest,
     control_channel::HostFacts,
     coordinator::ServiceRuntime,
-    host_execution::{
-        GuestExecutor, GuestExecutorUnavailable, SystemHostExecution, SystemHostProbe,
-    },
+    host_execution::{GuestExecutor, SystemHostExecution, SystemHostProbe},
     persistence::LauncherPaths,
     presentation::{
         self, DomainEvent, GraphicsSnapshot, HostView, OperationPhase, OperationStatusView,
@@ -78,21 +76,25 @@ pub(crate) fn run_engine() -> u8 {
     })
 }
 
-/// Whether `environment` is the Android app's engine environment: it names
-/// App-provided FEX (`PD2_APP_FEX`, an absolute path), which the app gives
-/// every engine process it starts and the desktop never sets. The app-only
-/// switches below put the process on the Android host, so they refuse
-/// without it, before they touch anything.
+/// The variable the Android app sets to `1` for every engine process it
+/// starts; the desktop never sets it.
+const ANDROID_APP: &str = "PD2_ANDROID_APP";
+
+/// Whether `environment` is the Android app's engine environment
+/// ([`ANDROID_APP`]). The app-only switches below put the process on the
+/// Android host, so they refuse without it, before they touch anything.
 fn android_app_environment(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> bool {
-    crate::builtin_fex::AppFex::from_environment(environment).is_some()
+    environment
+        .into_iter()
+        .any(|(name, value)| name == ANDROID_APP && value == "1")
 }
 
 /// `--stop-wine` (the Android app only): `wineserver -k` for the Managed
-/// prefix through App-provided FEX, as the engine runs its guests. The app
+/// prefix with the app's Wine, as the engine runs its guests. The app
 /// runs it when it stops the game environment and after an engine exit, so
-/// no Wine or FEX guest outlives them. Returns the process exit status: 1
+/// no Wine process outlives them. Returns the process exit status: 1
 /// outside the Android app's environment.
 pub(crate) fn stop_wine() -> u8 {
     stop_wine_in(std::env::vars_os().collect())
@@ -108,7 +110,7 @@ fn stop_wine_in(environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> u
         return 1;
     };
     crate::use_android_host(paths.home());
-    let host = SystemHostExecution::new(guest_executor(true, Some(&paths), || environment));
+    let host = SystemHostExecution::new(guest_executor(true, Some(&paths)));
     match crate::process::stop_wine(&paths.managed_root(), &host) {
         Ok(()) => 0,
         Err(error) => {
@@ -188,7 +190,7 @@ fn start_service(
         // Before the backend's first lookup.
         crate::use_android_host(paths.as_ref().and_then(|paths| paths.home()));
     }
-    let guest = guest_executor(android.is_some(), paths.as_ref(), std::env::vars_os);
+    let guest = guest_executor(android.is_some(), paths.as_ref());
     let mut probe = SystemHostProbe::new(graphics, guest.clone());
     if let Some(facts) = android {
         probe = probe.with_android_host(facts);
@@ -229,23 +231,11 @@ fn start_service(
 /// the host preflight and every guest process start. On ARM64 the FEX set in
 /// Settings comes first, and the built-in FEX replaces it once chosen and
 /// installed; the paths are the backend's own, so a moved
-/// installation is followed. An Android host never uses the built-in FEX
-/// (it is the desktop's PPA build) nor a FEX of its own finding, only
-/// App-provided FEX, which the app names in `environment` (`PD2_APP_FEX`);
-/// the desktop never reads it.
-fn guest_executor<E>(
-    android_host: bool,
-    paths: Option<&LauncherPaths>,
-    environment: impl FnOnce() -> E,
-) -> GuestExecutor
-where
-    E: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-{
+/// installation is followed. An Android host never uses FEX: the app's
+/// runtime is an ARM64 Wine, which runs directly.
+fn guest_executor(android_host: bool, paths: Option<&LauncherPaths>) -> GuestExecutor {
     if android_host {
-        return match paths {
-            Some(paths) => GuestExecutor::app_provided(environment(), paths.clone()),
-            None => GuestExecutor::Unavailable(GuestExecutorUnavailable::TranslatorMissing),
-        };
+        return GuestExecutor::Direct;
     }
     let guest = GuestExecutor::discover(saved_fex().as_deref());
     match paths {
@@ -287,7 +277,7 @@ mod tests {
     use super::*;
 
     fn app_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-        vec![("PD2_APP_FEX".into(), "/app/userland/usr/bin/pd2-fex".into())]
+        vec![("PD2_ANDROID_APP".into(), "1".into())]
     }
 
     #[test]
@@ -314,10 +304,9 @@ mod tests {
 
     #[test]
     fn the_android_app_switches_refuse_outside_its_environment() {
-        // The desktop's environment, and one whose PD2_APP_FEX is not an
-        // absolute path.
+        // The desktop's environment, and one whose PD2_ANDROID_APP is not 1.
         let refused: [Vec<(std::ffi::OsString, std::ffi::OsString)>; 2] =
-            [Vec::new(), vec![("PD2_APP_FEX".into(), "pd2-fex".into())]];
+            [Vec::new(), vec![("PD2_ANDROID_APP".into(), "0".into())]];
         for environment in refused {
             assert!(!android_app_environment(environment.clone()));
             assert_eq!(stop_wine_in(environment.clone()), 1);
@@ -330,34 +319,14 @@ mod tests {
     }
 
     #[test]
-    fn an_android_host_never_runs_the_built_in_fex() {
+    fn an_android_host_runs_its_guests_directly_never_through_fex() {
         // A fresh managed root: on the desktop's ARM64 row the built-in FEX
         // is the step 1 default there, reported pending until Download.
         let fixture = tempfile::tempdir().unwrap();
         let paths = LauncherPaths::from_home(fixture.path().join("launcher"));
-        let guest = guest_executor(true, Some(&paths), Vec::new);
-        assert_eq!(
-            guest,
-            GuestExecutor::Unavailable(GuestExecutorUnavailable::TranslatorMissing)
-        );
+        let guest = guest_executor(true, Some(&paths));
+        assert_eq!(guest, GuestExecutor::Direct);
         assert_eq!(guest.interpreter(), None);
-    }
-
-    #[test]
-    fn app_provided_fex_is_selected_only_on_an_android_host() {
-        let fixture = tempfile::tempdir().unwrap();
-        let paths = LauncherPaths::from_home(fixture.path().join("launcher"));
-        let guest = guest_executor(true, Some(&paths), app_environment);
-        assert!(matches!(guest, GuestExecutor::AppProvided(_)), "{guest:?}");
-        // Its entry point, never the built-in FEX in the managed root.
-        assert_eq!(
-            guest.interpreter().as_deref(),
-            Some(std::path::Path::new("/app/userland/usr/bin/pd2-fex"))
-        );
-        // The desktop never reads the app's name.
-        let desktop = guest_executor(false, Some(&paths), || -> Vec<_> {
-            panic!("the desktop read PD2_APP_FEX")
-        });
-        assert!(!matches!(desktop, GuestExecutor::AppProvided(_)));
+        assert_eq!(guest_executor(true, None), GuestExecutor::Direct);
     }
 }

@@ -401,9 +401,9 @@ fn sync_app_menu(enabled: bool) {
 /// On the Android host: Wine Gecko and Wine Mono that an older release put
 /// in the prefix are removed (`install::remove_wine_gecko_and_mono`), only
 /// while this Launcher holds the installation lease exclusively: no setup
-/// step, official launcher session or game of any Launcher runs. (Wine under
-/// the app's FEX keeps its wineserver socket in the RootFS's /tmp, so the
-/// host's /tmp shows none; the lease is the guard.)
+/// step, official launcher session or game of any Launcher runs. (The app's
+/// Wine keeps its wineserver socket in the prefix's `.wineserver` folder, so
+/// the host's /tmp shows none; the lease is the guard.)
 fn remove_android_wine_gecko_and_mono(managed_root: &Path) {
     let Ok(root) = Directory::open(managed_root) else {
         return;
@@ -518,6 +518,12 @@ impl ReadyBackend {
         remove_stale_registry_save(&paths.managed_root());
         if crate::android_host() {
             remove_android_wine_gecko_and_mono(&paths.managed_root());
+        }
+        // The last Play's graphics driver, for every Wine process of this
+        // engine from the first one on: the official launcher's game too,
+        // before any Play.
+        if host_probe.android_host().is_some() && compatibility_driver_saved(paths.config_root()) {
+            crate::wine_environment::use_compatibility_driver(true);
         }
         if mode == LaunchMode::Interactive {
             sync_app_menu(
@@ -1235,7 +1241,7 @@ impl ReadyBackend {
         let result = (|| {
             reject_cancelled(cancellation)?;
             // The built-in FEX is the desktop's; an Android host
-            // runs App-provided FEX.
+            // runs the app's ARM64 Wine.
             let builtin_fex_offered = !self.auditor.android_host();
             if builtin_fex_offered {
                 keep_default_fex_choice(&self.settings, &self.paths.managed_root());
@@ -1284,8 +1290,6 @@ impl ReadyBackend {
         )?;
         let result = (|| {
             reject_cancelled(cancellation)?;
-            // The job's audit refuses it when the probe failed.
-            self.auditor.host.inner.probe_app_fex_again();
             let plan = if import.is_some() {
                 DownloadPlan::ExistingInstall
             } else {
@@ -1352,8 +1356,6 @@ impl ReadyBackend {
         )?;
         let result = (|| {
             reject_cancelled(cancellation)?;
-            // The job's audit refuses it when the probe failed.
-            self.auditor.host.inner.probe_app_fex_again();
             let managed_root = self.paths.managed_root();
             // Everything comes from the verified downloads when they hold
             // it; an installation from before the Download step (a Wine
@@ -1873,15 +1875,18 @@ impl ReadyBackend {
             .settings
             .load()
             .map_err(|_| backend_failure("settings-load-failed"))?;
-        // Before the probe, whose FEX run writes the same configuration.
-        let compatibility = driver == GraphicsDriver::Compatibility;
-        if let Some(Err(_)) = self.auditor.host.inner.use_graphics_driver(compatibility) {
-            self.record(DiagnosticCode::GameLaunchFailed)?;
-            return Err(backend_failure("game-launch-failed"));
-        }
-        if self.auditor.host.inner.probe_app_fex_again() == Some(false) {
-            self.record(DiagnosticCode::GameLaunchFailed)?;
-            return Err(backend_failure("game-launch-failed"));
+        // The Android app's graphics driver: its Compatibility values reach
+        // every Wine process started from now on, and from the next engine's
+        // start (`GRAPHICS_DRIVER_RECORD`), until a Play asks for the other
+        // driver.
+        if self.auditor.android_host() {
+            let compatibility = driver == GraphicsDriver::Compatibility;
+            if let Err(error) = keep_graphics_driver(self.paths.config_root(), compatibility) {
+                eprintln!(
+                    "pd2-launcher: the graphics driver is not kept for the next start: {error}"
+                );
+            }
+            crate::wine_environment::use_compatibility_driver(compatibility);
         }
         let mut options = game_launch_options(&settings);
         if let Some(display) = display {
@@ -2502,10 +2507,16 @@ impl ProductionAuditor {
             report.check(AuditCheck::Runtime),
             report.check(AuditCheck::Prefix),
         )
-        .with_prefix_needs(PrefixNeeds {
-            gecko: fresh || components.gecko != CheckStatus::Satisfied,
-            mono: fresh || components.mono != CheckStatus::Satisfied,
-            dotnet: fresh || components.dotnet != CheckStatus::Satisfied,
+        .with_prefix_needs(if android {
+            // The app provides the prefix (its template) and its .NET; the
+            // Launcher installs neither Gecko nor Mono there.
+            PrefixNeeds::default()
+        } else {
+            PrefixNeeds {
+                gecko: fresh || components.gecko != CheckStatus::Satisfied,
+                mono: fresh || components.mono != CheckStatus::Satisfied,
+                dotnet: fresh || components.dotnet != CheckStatus::Satisfied,
+            }
         })
         .with_builtin_fex_needed(!android && builtin_fex_pending(&self.settings, paths.root()));
         Ok(if android {
@@ -2516,7 +2527,7 @@ impl ProductionAuditor {
     }
 
     /// Whether this backend's host is the Android app's: it runs
-    /// App-provided FEX, never the built-in FEX.
+    /// ARM64 Wine, never FEX.
     fn android_host(&self) -> bool {
         self.host.inner.android_host().is_some()
     }
@@ -3212,6 +3223,7 @@ fn game_graphics_key(runtime: crate::runtime::InstalledRuntime) -> String {
     let mut hasher = Sha256::new();
     hasher.update(match runtime {
         crate::runtime::InstalledRuntime::Custom => "custom",
+        crate::runtime::InstalledRuntime::App => crate::runtime::APP_RUNTIME_DIRECTORY,
         crate::runtime::InstalledRuntime::BuiltIn(runtime) => runtime.identity,
     });
     let mut cache = Vec::new();
@@ -3265,6 +3277,36 @@ fn write_game_graphics(path: &Path, key: &str, renderer: Option<&str>) -> io::Re
     crate::persistence::atomic_write(
         path,
         &serde_json::to_vec(&record).map_err(io::Error::other)?,
+    )
+}
+
+/// The Android app's graphics driver of the last Play, in the Launcher's
+/// config directory: `compatibility` or `standard`. The engine starts with
+/// it, so every Wine process gets that driver's values, the official
+/// launcher's game too before any Play of the engine.
+const GRAPHICS_DRIVER_RECORD: &str = "graphics-driver";
+
+/// Whether the last Play asked for the Compatibility driver, by the record
+/// in the config directory `config` (none: the standard driver).
+fn compatibility_driver_saved(config: &Path) -> bool {
+    crate::persistence::read_bounded_regular(&config.join(GRAPHICS_DRIVER_RECORD), 64)
+        .is_ok_and(|text| text.trim_ascii() == b"compatibility")
+}
+
+/// Keeps this Play's graphics driver in the record in `config` for the
+/// next start; written only when it changes.
+fn keep_graphics_driver(config: &Path, compatibility: bool) -> io::Result<()> {
+    if compatibility_driver_saved(config) == compatibility {
+        return Ok(());
+    }
+    let driver = if compatibility {
+        "compatibility\n"
+    } else {
+        "standard\n"
+    };
+    Directory::ensure_absolute(config)?.atomic_write(
+        std::ffi::OsStr::new(GRAPHICS_DRIVER_RECORD),
+        driver.as_bytes(),
     )
 }
 
@@ -3383,10 +3425,14 @@ fn managed_runtime_detail(
     installed: crate::runtime::InstalledRuntime,
 ) -> String {
     // A prefix the row's earlier runtime made is named with that runtime.
-    let runtime = match installed {
-        crate::runtime::InstalledRuntime::BuiltIn(runtime) => runtime.display_name,
-        crate::runtime::InstalledRuntime::Custom => crate::runtime::current().display_name,
-    };
+    let runtime = installed.display_name();
+    if installed == crate::runtime::InstalledRuntime::App {
+        // The app provides it; the Launcher never downloads it.
+        return match status {
+            CheckStatus::Satisfied => format!("{runtime} from the app verified"),
+            _ => format!("{runtime} from the app is not ready"),
+        };
+    }
     match status {
         CheckStatus::Satisfied => format!("Launcher-managed {runtime} verified"),
         CheckStatus::Missing => format!("Not installed yet — Launcher will download {runtime}"),
@@ -3807,10 +3853,7 @@ mod tests {
             page_size: 4096,
             data_dir: "/data/data/com.pd2launcher.app".to_owned(),
         };
-        let guest = crate::host_execution::GuestExecutor::app_provided(
-            [("PD2_APP_FEX".into(), "/app/bin/pd2-fex".into())],
-            paths.clone(),
-        );
+        let guest = crate::host_execution::GuestExecutor::Direct;
         let backend = ReadyBackend::new(
             SystemHostProbe::new(None, guest.clone()).with_android_host(facts),
             SystemHostExecution::new(guest),
@@ -3837,8 +3880,9 @@ mod tests {
             Some("fex-setting-unavailable".to_owned())
         );
         assert!(!paths.settings_file().exists(), "nothing was saved");
-        // On Android the prefix needs the .NET Desktop Runtime too, for the
-        // official PD2 launcher, but never Wine Gecko or Wine Mono.
+        // On Android the app provides the runtime, its prefix template and
+        // its .NET: nothing of the prefix is downloaded, and never Wine Gecko
+        // or Wine Mono.
         use crate::install::{InstallationAuditor as _, ManagedPaths};
         let root = paths.managed_root();
         let managed = ManagedPaths::prepare(&root).unwrap();
@@ -3852,8 +3896,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("audit"))
         };
         let android = audit(&backend);
-        assert!(android.prefix_needs().dotnet);
-        assert!(!android.prefix_needs().gecko && !android.prefix_needs().mono);
+        assert_eq!(
+            android.prefix_needs(),
+            crate::install::PrefixNeeds::default()
+        );
         assert!(android.android_host());
         // The desktop offers it (on its ARM64 builds).
         let desktop = ReadyBackend::new(
@@ -3868,6 +3914,81 @@ mod tests {
         let desktop = audit(&desktop);
         assert!(desktop.prefix_needs().dotnet && !desktop.android_host());
         assert!(desktop.prefix_needs().gecko && desktop.prefix_needs().mono);
+    }
+
+    #[test]
+    fn the_last_plays_graphics_driver_is_in_use_from_the_next_engines_start() {
+        /// The standard driver again when the test ends, also after a failed
+        /// assertion, so the next test starts from it.
+        struct Standard;
+        impl Drop for Standard {
+            fn drop(&mut self) {
+                crate::wine_environment::use_compatibility_driver(false);
+            }
+        }
+        let _driver = crate::wine_environment::DRIVER_IN_USE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _standard = Standard;
+        let fixture = TempDir::new().unwrap();
+        let paths = LauncherPaths::from_home(fixture.path().join("launcher"));
+        // A new engine, on the Android host or the desktop.
+        let engine = |android: bool| {
+            let guest = crate::host_execution::GuestExecutor::Direct;
+            let mut probe = SystemHostProbe::new(None, guest.clone());
+            if android {
+                probe = probe.with_android_host(crate::control_channel::HostFacts {
+                    android_release: "13".to_owned(),
+                    sdk: 33,
+                    device_model: "Retroid Pocket Nova".to_owned(),
+                    gpu_name: "Adreno (TM) 740".to_owned(),
+                    chip_id: 0x4305_0a01,
+                    kernel_release: "5.15.153-android13-8".to_owned(),
+                    page_size: 4096,
+                    data_dir: "/data/data/com.pd2launcher.app".to_owned(),
+                });
+            }
+            ReadyBackend::new(
+                probe,
+                SystemHostExecution::new(guest),
+                LaunchMode::Engine,
+                Some(paths.clone()),
+            )
+            .unwrap_or_else(|_| panic!("backend"))
+        };
+        // Whether a Wine process started now gets the Compatibility values.
+        let in_use = || {
+            let app = vec![(
+                std::ffi::OsString::from("PD2_APP_COMPATIBILITY_TU_DEBUG"),
+                std::ffi::OsString::from("sysmem,noubwc"),
+            )];
+            crate::wine_environment::compose_on(app, &[], true)
+                .iter()
+                .any(|(name, value)| name == "TU_DEBUG" && value == "sysmem,noubwc")
+        };
+        // A new process starts with the standard driver in use.
+        let restart = || crate::wine_environment::use_compatibility_driver(false);
+        // A Play with the Compatibility driver (no game starts here).
+        let _ = engine(true).launch_game(None, GraphicsDriver::Compatibility, None);
+        assert!(in_use());
+        // The next engine uses it from its start: the official launcher's
+        // game gets it before any Play.
+        restart();
+        let _next = engine(true);
+        assert!(in_use());
+        // A Play with the standard driver, and the engine after it.
+        let _ = engine(true).launch_game(None, GraphicsDriver::Standard, None);
+        assert!(!in_use());
+        restart();
+        let _next = engine(true);
+        assert!(!in_use());
+        // The desktop keeps no driver and uses none.
+        let _ = engine(true).launch_game(None, GraphicsDriver::Compatibility, None);
+        restart();
+        let desktop = engine(false);
+        assert!(!in_use());
+        let _ = desktop.launch_game(None, GraphicsDriver::Standard, None);
+        assert!(compatibility_driver_saved(paths.config_root()));
     }
 
     #[test]

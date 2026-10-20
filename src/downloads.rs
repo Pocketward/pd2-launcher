@@ -4,9 +4,9 @@
 //! it records each downloaded file below the managed root with its size and
 //! identity (filesystem id, inode, modification time) in `cache/downloads.json`.
 //! "Downloads complete" is derived from that record and the files as they
-//! are now: every recorded file must still be the very file that was
-//! verified. Nothing is re-hashed here; every file is verified again, by
-//! its own rules, right before it is used.
+//! are now: every recorded file the current plan downloads on this host must
+//! still be the very file that was verified. Nothing is re-hashed here; every
+//! file is verified again, by its own rules, right before it is used.
 
 use std::{
     ffi::OsStr,
@@ -18,13 +18,25 @@ use std::{
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 
-use crate::{InstallationStatus, safe_fs::Directory};
+use crate::{InstallationStatus, install::ArtifactKind, safe_fs::Directory};
 
 pub(crate) const RECEIPT_NAME: &str = "downloads.json";
 const SCHEMA: u32 = 1;
 const RECEIPT_LIMIT: u64 = 4 * 1024 * 1024;
 const MAX_ITEMS: usize = 16_384;
 const MAX_DEPTH: usize = 4;
+/// The artifact cache, as a recorded path starts.
+const ARTIFACTS: &str = "cache/artifacts/";
+/// What the Download never fetches on the Android host: its app provides the
+/// Wine runtime, and the prefix with its components (the prefix template and
+/// .NET; `InstallAudit::needs_runtime_archive`, and the Android prefix needs
+/// of `ProductionAuditor::install_audit`).
+pub(crate) const PROVIDED_ON_ANDROID: [ArtifactKind; 4] = [
+    ArtifactKind::ManagedRuntime,
+    ArtifactKind::Gecko,
+    ArtifactKind::WineMono,
+    ArtifactKind::DotnetDesktop,
+];
 
 /// What the downloads were for.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -244,6 +256,13 @@ pub(crate) fn remove_installer_downloads(root: &Directory) -> io::Result<bool> {
 /// The recorded Download result, checked against the files as they are.
 /// Anything unexpected is simply `Incomplete`: downloading again is safe.
 pub(crate) fn readiness(root: &Directory) -> DownloadReadiness {
+    readiness_on(root, crate::android_host())
+}
+
+/// [`readiness`] on the Android host (`android`) or the desktop. Only the
+/// recorded files the current plan downloads on that host count
+/// ([`counted`]), and only their bytes.
+fn readiness_on(root: &Directory, android: bool) -> DownloadReadiness {
     let Some(record) = read(root) else {
         return DownloadReadiness::Incomplete;
     };
@@ -258,7 +277,12 @@ pub(crate) fn readiness(root: &Directory) -> DownloadReadiness {
             return DownloadReadiness::Incomplete;
         }
     }
+    let mut uncounted = 0_u64;
     for item in &record.items {
+        if !counted(&item.path, android) {
+            uncounted = uncounted.saturating_add(item.size);
+            continue;
+        }
         match identify(root, &item.path) {
             Ok(Some(current)) if current.same(item) => {}
             _ => return DownloadReadiness::Incomplete,
@@ -266,10 +290,26 @@ pub(crate) fn readiness(root: &Directory) -> DownloadReadiness {
     }
     DownloadReadiness::Complete {
         plan: record.plan,
-        total_bytes: record.total_bytes,
+        total_bytes: record.total_bytes.saturating_sub(uncounted),
         reach: record.reach,
         prefix: record.prefix,
     }
+}
+
+/// Whether the readiness check counts the recorded file `path`: only a part
+/// the current plan downloads on this host. The desktop's plan holds every
+/// part its Download records, so every recorded file counts there. On the
+/// Android host the parts its app provides ([`PROVIDED_ON_ANDROID`]) are
+/// never downloaded: an older release's records of them (the Wine Gecko,
+/// Wine Mono and .NET installer copies, which the update removes) do not
+/// count.
+fn counted(path: &str, android: bool) -> bool {
+    !android
+        || !path.strip_prefix(ARTIFACTS).is_some_and(|name| {
+            PROVIDED_ON_ANDROID
+                .into_iter()
+                .any(|kind| crate::install::recorded_cache_names(kind).contains(&name))
+        })
 }
 
 fn read(root: &Directory) -> Option<Record> {
@@ -581,5 +621,124 @@ mod tests {
         )
         .unwrap();
         assert_eq!(readiness(&root), made);
+    }
+
+    /// Where the Download records a verified `kind`: its pinned cache name,
+    /// or a custom source's (`custom`).
+    fn artifact(kind: ArtifactKind, custom: bool) -> String {
+        let [pinned, custom_name] = crate::install::recorded_cache_names(kind);
+        format!("{ARTIFACTS}{}", if custom { custom_name } else { pinned })
+    }
+
+    fn write_files(root: &Path, paths: &[String]) {
+        for path in paths {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"0123456789").unwrap();
+        }
+    }
+
+    #[test]
+    fn on_android_the_records_of_what_the_app_provides_do_not_count() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path();
+        // An older Android release's Download: the prefix components too
+        // (.NET from a custom source), Blizzard's wrappers, and Project
+        // Diablo 2's installer and client.
+        let provided = [
+            artifact(ArtifactKind::Gecko, false),
+            artifact(ArtifactKind::WineMono, false),
+            artifact(ArtifactKind::DotnetDesktop, true),
+        ];
+        let downloaded = [
+            artifact(ArtifactKind::BaseGameWrapper, false),
+            artifact(ArtifactKind::ExpansionWrapper, false),
+            artifact(ArtifactKind::ClientBootstrap, false),
+            "cache/client/manifest.json".to_owned(),
+        ];
+        let recorded: Vec<String> = provided.iter().chain(&downloaded).cloned().collect();
+        write_files(root_path, &recorded);
+        let root = Directory::open(root_path).unwrap();
+        let fresh = DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, true);
+        assert_eq!(
+            record(&root, DownloadPlan::Installers, fresh, &recorded).unwrap(),
+            70
+        );
+        let complete = |total_bytes| DownloadReadiness::Complete {
+            plan: DownloadPlan::Installers,
+            total_bytes,
+            reach: DownloadReach::BaseGame,
+            prefix: true,
+        };
+        // While every file is there, the desktop counts them all, and Android
+        // only what its Download fetches.
+        assert_eq!(readiness_on(&root, false), complete(70));
+        assert_eq!(readiness_on(&root, true), complete(40));
+
+        // The update removes the copies of what the app now provides: on
+        // Android the rest still serves the install, from either source.
+        for path in &provided {
+            fs::remove_file(root_path.join(path)).unwrap();
+        }
+        let android = readiness_on(&root, true);
+        assert_eq!(android, complete(40));
+        assert!(android.serves(DownloadPlan::Installers, fresh));
+        assert!(android.serves(DownloadPlan::ExistingInstall, fresh));
+        assert_eq!(android.for_need(fresh), android);
+        // The desktop's plan holds them: downloaded again there.
+        assert_eq!(readiness_on(&root, false), DownloadReadiness::Incomplete);
+
+        // What the Android Download fetches still counts, each file of it.
+        for gone in &downloaded {
+            write_files(root_path, &recorded);
+            record(&root, DownloadPlan::Installers, fresh, &recorded).unwrap();
+            for path in &provided {
+                fs::remove_file(root_path.join(path)).unwrap();
+            }
+            assert_eq!(readiness_on(&root, true), complete(40));
+            fs::remove_file(root_path.join(gone)).unwrap();
+            assert_eq!(
+                readiness_on(&root, true),
+                DownloadReadiness::Incomplete,
+                "{gone}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_desktop_still_counts_every_recorded_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root_path = fixture.path();
+        // Every part a desktop Download records, and a file no part names.
+        let recorded = [
+            artifact(ArtifactKind::ManagedRuntime, false),
+            artifact(ArtifactKind::Gecko, false),
+            artifact(ArtifactKind::WineMono, true),
+            artifact(ArtifactKind::DotnetDesktop, false),
+            "cache/artifacts/d2-payload/Installer.exe".to_owned(),
+            "cache/artifacts/lod-payload/Installer.exe".to_owned(),
+            artifact(ArtifactKind::ClientBootstrap, false),
+            "cache/client/manifest.json".to_owned(),
+            "cache/artifacts/other.verified".to_owned(),
+        ];
+        let root = Directory::open(root_path).unwrap();
+        let fresh = DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, true);
+        for gone in &recorded {
+            write_files(root_path, &recorded);
+            record(&root, DownloadPlan::Installers, fresh, &recorded).unwrap();
+            // These tests run the desktop's engine.
+            assert_eq!(readiness(&root), readiness_on(&root, false));
+            assert_eq!(
+                readiness(&root),
+                DownloadReadiness::Complete {
+                    plan: DownloadPlan::Installers,
+                    total_bytes: 90,
+                    reach: DownloadReach::BaseGame,
+                    prefix: true,
+                }
+            );
+            fs::remove_file(root_path.join(gone)).unwrap();
+            assert_eq!(readiness(&root), DownloadReadiness::Incomplete, "{gone}");
+        }
     }
 }

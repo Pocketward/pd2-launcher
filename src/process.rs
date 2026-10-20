@@ -36,6 +36,7 @@ const CHILD_GAME_EXECUTABLE_FD: i32 = 214;
 const CHILD_MANAGED_ROOT_FD: i32 = 215;
 const CHILD_RUNTIME_BIN_FD: i32 = 216;
 const CHILD_GL_PROBE_FD: i32 = 217;
+const CHILD_WINESERVER_FD: i32 = 218;
 /// `wineserver -k` under FEX ends within a second or two; the Android app
 /// waits 10 s for the whole `--stop-wine` run.
 const STOP_WINE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -876,7 +877,7 @@ fn game_profile_request(
 /// `wineserver -k` for the Managed prefix at `managed_root`: Wine's server
 /// and every Wine process of the prefix end. It runs the built-in runtime's
 /// `wineserver` with the game's Wine environment through `host`, so on the
-/// Android host it goes through App-provided FEX like the game itself (the
+/// Android host it runs the app's ARM64 Wine like the game itself (the
 /// app's `--stop-wine`, when it stops the game environment or cleans up
 /// after the engine). Its exit status proves nothing (nonzero when no
 /// server runs); it must only run and be reaped in time.
@@ -888,23 +889,24 @@ pub(crate) fn stop_wine(
         Directory::open(managed_root).map_err(|_| GameLaunchError::UnsafeManagedInstallation)?;
     let installed = crate::runtime::InstalledRuntime::select(&root, false);
     let bin_path = Path::new("runner").join(installed.directory()).join("bin");
-    // Opened to prove it is there and executable; started by its path in
-    // the inherited `bin/`, which WINESERVER names too.
-    drop(open_executable_beneath(&root, bin_path.join("wineserver"))?);
+    // Started through its own descriptor, as the installers start it: a
+    // direct guest (the Android host's) is checked through the descriptor
+    // it starts from, and a name in an inherited folder is not one. The
+    // folder goes too, for WINESERVER.
+    let wineserver = open_executable_beneath(&root, bin_path.join("wineserver"))?;
     let bin = root
         .open_directory(&bin_path)
         .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?;
     let home = required_directory_environment("HOME")?;
-    let mut request =
-        ProcessRequest::guest(format!("/proc/self/fd/{CHILD_RUNTIME_BIN_FD}/wineserver"))
-            .with_argument("-k")
-            .with_working_directory_handle(
-                managed_root,
-                root.try_clone_file()
-                    .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
-            )
-            .with_cleared_environment()
-            .with_output_limit(PROCESS_OUTPUT_LIMIT);
+    let mut request = ProcessRequest::guest(format!("/proc/self/fd/{CHILD_WINESERVER_FD}"))
+        .with_argument("-k")
+        .with_working_directory_handle(
+            managed_root,
+            root.try_clone_file()
+                .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
+        )
+        .with_cleared_environment()
+        .with_output_limit(PROCESS_OUTPUT_LIMIT);
     for (name, value) in crate::wine_environment::compose(env::vars_os(), &game_wine_settings(home))
     {
         request = request.with_environment(name, value);
@@ -921,6 +923,8 @@ pub(crate) fn stop_wine(
                 .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
             CHILD_RUNTIME_BIN_FD,
         )
+        .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?
+        .with_inherited_file(wineserver, CHILD_WINESERVER_FD)
         .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?;
     let mut process = host
         .spawn(request)
@@ -1669,9 +1673,10 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let request = snapshots.as_ref().expect("typed request was captured");
         assert!(request.guest);
+        // Its own descriptor: the only form a direct guest's check can open.
         assert_eq!(
             request.executable,
-            PathBuf::from(format!("/proc/self/fd/{CHILD_RUNTIME_BIN_FD}/wineserver"))
+            PathBuf::from(format!("/proc/self/fd/{CHILD_WINESERVER_FD}"))
         );
         assert_eq!(request.arguments, [OsString::from("-k")]);
         // The game's prefix and wineserver, through the inherited folders.
@@ -1689,7 +1694,11 @@ mod tests {
         );
         assert_eq!(
             request.inherited_descriptors,
-            [CHILD_MANAGED_ROOT_FD, CHILD_RUNTIME_BIN_FD]
+            [
+                CHILD_MANAGED_ROOT_FD,
+                CHILD_RUNTIME_BIN_FD,
+                CHILD_WINESERVER_FD
+            ]
         );
     }
 
@@ -1703,6 +1712,69 @@ mod tests {
             Err(GameLaunchError::UnsafeManagedInstallation)
         );
         assert!(host.snapshot.lock().unwrap().is_none());
+    }
+
+    /// The direct executor's host (the Android host's), noting whether the
+    /// last start failed on a program that was busy (ETXTBSY).
+    struct DirectHost {
+        host: crate::host_execution::SystemHostExecution,
+        busy: AtomicBool,
+    }
+
+    impl HostExecution for DirectHost {
+        fn spawn(&self, request: ProcessRequest) -> io::Result<Box<dyn SupervisedProcess>> {
+            self.host.spawn(request).inspect_err(|error| {
+                let busy = rustix::io::Errno::TXTBSY.raw_os_error();
+                self.busy
+                    .store(error.raw_os_error() == Some(busy), Ordering::Release);
+            })
+        }
+    }
+
+    #[test]
+    fn stop_wine_starts_wineserver_through_the_direct_executors_check() {
+        // The direct executor checks the image through the descriptor it
+        // starts from (`direct_guest_check`), the check that refused a name
+        // in an inherited folder on the phones. A native program stands in
+        // for the app's ARM64 wineserver, so a build machine runs it.
+        let fixture = Fixture::new();
+        let wineserver = fixture
+            .root()
+            .join("runner")
+            .join(crate::runtime::current().identity)
+            .join("bin/wineserver");
+        fs::copy("/usr/bin/true", &wineserver).expect("a native program as wineserver");
+        let host = DirectHost {
+            host: crate::host_execution::SystemHostExecution::new(
+                crate::host_execution::GuestExecutor::Direct,
+            ),
+            busy: AtomicBool::new(false),
+        };
+        // A child another test forked while the copy was being written keeps
+        // it open for writing until that child execs (ETXTBSY): only then
+        // is it started again.
+        let mut attempts = 0;
+        loop {
+            match stop_wine(fixture.root(), &host) {
+                Ok(()) => break,
+                Err(GameLaunchError::ProcessSpawnFailed)
+                    if host.busy.swap(false, Ordering::AcqRel) && attempts < 50 =>
+                {
+                    attempts += 1;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                other => panic!("wineserver -k did not run: {other:?}"),
+            }
+        }
+        // An image the check does not know never starts, not even through
+        // the shell.
+        let marker = fixture.root().join("shell-ran");
+        fs::write(&wineserver, format!("touch '{}'\n", marker.display())).unwrap();
+        assert_eq!(
+            stop_wine(fixture.root(), &host),
+            Err(GameLaunchError::ProcessSpawnFailed)
+        );
+        assert!(!marker.exists());
     }
 
     #[test]

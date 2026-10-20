@@ -101,44 +101,6 @@ impl SystemHostProbe {
     pub(crate) fn android_host(&self) -> Option<&HostFacts> {
         self.android.as_ref()
     }
-
-    /// Install or Play starts: App-provided FEX's probe runs again now,
-    /// and the audits that follow use its result.
-    /// `None` without App-provided FEX or before its RootFS is installed.
-    pub(crate) fn probe_app_fex_again(&self) -> Option<bool> {
-        let GuestExecutor::AppProvided(app) = &self.guest else {
-            return None;
-        };
-        if self.guest.resolved().pending {
-            return None;
-        }
-        app.probe_again();
-        Some(app.probe(|| translator_rootfs_ready(&self.guest)))
-    }
-
-    /// Play starts with the app's graphics driver: App-provided FEX's
-    /// configuration has the Compatibility driver's host values or not, now
-    /// and for every guest until the next Play. `None` without App-provided
-    /// FEX.
-    pub(crate) fn use_graphics_driver(&self, compatibility: bool) -> Option<io::Result<()>> {
-        let GuestExecutor::AppProvided(app) = &self.guest else {
-            return None;
-        };
-        app.compatibility
-            .store(compatibility, std::sync::atomic::Ordering::Relaxed);
-        if compatibility {
-            eprintln!(
-                "pd2-launcher: graphics driver compatibility ({})",
-                app.fex.compatibility_values().join(" ")
-            );
-        } else {
-            eprintln!("pd2-launcher: graphics driver standard");
-        }
-        Some(
-            app.fex
-                .write_config(&app.paths.managed_root(), compatibility),
-        )
-    }
 }
 
 impl HostProbe for SystemHostProbe {
@@ -183,20 +145,18 @@ impl HostProbe for SystemHostProbe {
         let resolved = self.guest.resolved();
         let guest = &resolved.executor;
         let guest_execution = match platform {
+            // The app's ARM64 Wine runs every guest directly, on 4 KB pages.
+            _ if self.android.is_some() => GuestExecutionEvidence::AppProvided {
+                page_size_4k: rustix::param::page_size() == 4096,
+            },
             HostPlatform::Aarch64 => {
                 let page_size_4k = rustix::param::page_size() == 4096;
                 if resolved.pending {
                     // The chosen built-in FEX, and its RootFS, come with the
                     // Download step; nothing on this device is needed (the
-                    // device's FEX, if any, runs only until then). App-provided
-                    // FEX needs only its entry point until its RootFS comes.
+                    // device's FEX, if any, runs only until then).
                     GuestExecutionEvidence::Translated {
-                        interpreter_present: match &self.guest {
-                            GuestExecutor::AppProvided(_) => guest
-                                .interpreter()
-                                .is_some_and(|interpreter| is_usable_executable(&interpreter)),
-                            _ => true,
-                        },
+                        interpreter_present: true,
                         page_size_4k,
                         rootfs_ready: page_size_4k,
                         pending: true,
@@ -206,16 +166,7 @@ impl HostProbe for SystemHostProbe {
                         .interpreter()
                         .is_some_and(|interpreter| is_usable_executable(&interpreter));
                     // FEX refuses other page sizes, which is its own finding.
-                    let rootfs_ready = page_size_4k
-                        && match &self.guest {
-                            // Through the App-provided executor, which writes
-                            // FEX's configuration first.
-                            GuestExecutor::AppProvided(app) => {
-                                interpreter_present
-                                    && app.probe(|| translator_rootfs_ready(&self.guest))
-                            }
-                            _ => translator_rootfs_ready(guest),
-                        };
+                    let rootfs_ready = page_size_4k && translator_rootfs_ready(guest);
                     GuestExecutionEvidence::Translated {
                         interpreter_present,
                         page_size_4k,
@@ -279,103 +230,6 @@ pub enum GuestExecutor {
     /// otherwise the device's. Looked up for every start, so a
     /// choice or a finished download counts at once.
     Chosen(FexChoice),
-    /// The Android host: App-provided FEX, never a
-    /// setting. Pending until the Launcher's RootFS is unpacked.
-    AppProvided(AppProvidedFex),
-}
-
-/// App-provided FEX with the managed root its RootFS, configuration and
-/// folders are in, whether its probe already passed in this engine, and
-/// whether the next probe must run FEX again (Install or Play starts).
-#[derive(Clone)]
-pub struct AppProvidedFex {
-    fex: crate::builtin_fex::AppFex,
-    paths: crate::persistence::LauncherPaths,
-    probe_passed: Arc<std::sync::atomic::AtomicBool>,
-    probe_again: Arc<std::sync::atomic::AtomicBool>,
-    /// The next runtime preflight must run Wine again (Install or Play
-    /// starts).
-    preflight_again: Arc<std::sync::atomic::AtomicBool>,
-    /// The last Play's graphics driver was Compatibility
-    /// ([`SystemHostProbe::use_graphics_driver`]).
-    compatibility: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl PartialEq for AppProvidedFex {
-    fn eq(&self, other: &Self) -> bool {
-        self.fex == other.fex && self.paths.managed_root() == other.paths.managed_root()
-    }
-}
-
-impl Eq for AppProvidedFex {}
-
-impl AppProvidedFex {
-    /// The FEX probe (an x86 program from the RootFS through the entry
-    /// point), logged. It runs once after the RootFS is installed and again
-    /// when Install or Play starts ([`Self::probe_again`]); its pass is kept
-    /// with the RootFS, so opening the app runs no FEX.
-    fn probe(&self, run: impl FnOnce() -> bool) -> bool {
-        use std::sync::atomic::Ordering;
-        if self.probe_passed.load(Ordering::Relaxed) {
-            return true;
-        }
-        let root = self.paths.managed_root();
-        if !self.probe_again.load(Ordering::Relaxed) && crate::builtin_fex::app_probe_passed(&root)
-        {
-            self.probe_passed.store(true, Ordering::Relaxed);
-            return true;
-        }
-        let passed = run();
-        eprintln!(
-            "pd2-launcher: FEX probe through App-provided FEX ({}): {}",
-            self.fex.entry_point().display(),
-            if passed { "passed" } else { "failed" }
-        );
-        if let Err(error) = crate::builtin_fex::record_app_probe(&root, passed) {
-            eprintln!("pd2-launcher: the FEX probe's result could not be kept: {error}");
-        }
-        self.probe_again.store(false, Ordering::Relaxed);
-        self.probe_passed.store(passed, Ordering::Relaxed);
-        passed
-    }
-
-    /// Install or Play starts: the next probe runs FEX again, and the next
-    /// runtime preflight Wine.
-    fn probe_again(&self) {
-        use std::sync::atomic::Ordering;
-        self.probe_passed.store(false, Ordering::Relaxed);
-        self.probe_again.store(true, Ordering::Relaxed);
-        self.preflight_again.store(true, Ordering::Relaxed);
-    }
-
-    /// The runtime preflight (`wine --version` through FEX). Its pass is kept
-    /// with the RootFS like the FEX probe's, so opening the app with an
-    /// existing prefix runs no Wine; it runs again when Install or Play
-    /// starts.
-    fn preflight(
-        &self,
-        run: impl FnOnce() -> RuntimeExecutionEvidence,
-    ) -> RuntimeExecutionEvidence {
-        use std::sync::atomic::Ordering;
-        let root = self.paths.managed_root();
-        if !self.preflight_again.load(Ordering::Relaxed)
-            && crate::builtin_fex::app_wine_preflight_passed(&root)
-        {
-            return RuntimeExecutionEvidence::Passed;
-        }
-        let evidence = run();
-        let passed = match evidence {
-            RuntimeExecutionEvidence::Passed => true,
-            RuntimeExecutionEvidence::Failed => false,
-            // Not run to an answer: it runs at the next audit.
-            _ => return evidence,
-        };
-        if let Err(error) = crate::builtin_fex::record_app_wine_preflight(&root, passed) {
-            eprintln!("pd2-launcher: the runtime preflight's result could not be kept: {error}");
-        }
-        self.preflight_again.store(false, Ordering::Relaxed);
-        evidence
-    }
 }
 
 /// The FEX the player chose in step 1 or Settings, and the device FEX used
@@ -395,8 +249,7 @@ impl PartialEq for FexChoice {
 impl Eq for FexChoice {}
 
 /// The executor a start uses, and whether its FEX or RootFS is still to be
-/// installed (by the Download step): the chosen built-in FEX, or App-provided
-/// FEX's RootFS.
+/// installed (by the Download step): the chosen built-in FEX.
 struct Resolved {
     executor: GuestExecutor,
     pending: bool,
@@ -460,10 +313,6 @@ impl fmt::Debug for GuestExecutor {
                 .debug_struct("Chosen")
                 .field("settings", &choice.paths.settings_file())
                 .field("device", &choice.device)
-                .finish(),
-            Self::AppProvided(app) => formatter
-                .debug_struct("AppProvided")
-                .field("entry_point", &app.fex.entry_point())
                 .finish(),
         }
     }
@@ -588,38 +437,8 @@ impl GuestExecutor {
         }
     }
 
-    /// App-provided FEX on the Android host, from the Launcher engine's
-    /// environment (`PD2_APP_FEX`); without it no guest runs there.
-    pub(crate) fn app_provided(
-        environment: impl IntoIterator<Item = (OsString, OsString)>,
-        paths: crate::persistence::LauncherPaths,
-    ) -> Self {
-        match crate::builtin_fex::AppFex::from_environment(environment) {
-            Some(fex) => Self::AppProvided(AppProvidedFex {
-                fex,
-                paths,
-                probe_passed: Arc::default(),
-                probe_again: Arc::default(),
-                preflight_again: Arc::default(),
-                compatibility: Arc::default(),
-            }),
-            None => Self::Unavailable(GuestExecutorUnavailable::TranslatorMissing),
-        }
-    }
-
     /// The executor this start uses.
     fn resolved(&self) -> Resolved {
-        if let Self::AppProvided(app) = self {
-            let root = app.paths.managed_root();
-            return Resolved {
-                executor: Self::Translated {
-                    interpreter: app.fex.entry_point().to_owned(),
-                    interpreter_arguments: Vec::new(),
-                    passthrough_environment: crate::builtin_fex::Layout::new(&root).environment(),
-                },
-                pending: !crate::builtin_fex::rootfs_present(&root),
-            };
-        }
         let Self::Chosen(choice) = self else {
             return Resolved {
                 executor: self.clone(),
@@ -653,7 +472,7 @@ impl GuestExecutor {
         match self {
             Self::Translated { interpreter, .. } => Some(interpreter.clone()),
             Self::Direct | Self::Unavailable(_) => None,
-            Self::Chosen(_) | Self::AppProvided(_) => self.resolved().executor.interpreter(),
+            Self::Chosen(_) => self.resolved().executor.interpreter(),
         }
     }
 
@@ -690,15 +509,6 @@ impl GuestExecutor {
                 "guest execution is unavailable on this host",
             )),
             Self::Chosen(_) => self.resolved().executor.shape(guest, arguments),
-            // FEX's configuration is the Launcher's: written before each start,
-            // so it follows the app's values and a removed managed root.
-            Self::AppProvided(app) => {
-                app.fex.write_config(
-                    &app.paths.managed_root(),
-                    app.compatibility.load(std::sync::atomic::Ordering::Relaxed),
-                )?;
-                self.resolved().executor.shape(guest, arguments)
-            }
         }
     }
 }
@@ -1315,14 +1125,18 @@ fn real_path(value: &OsStr, real: &[(i32, PathBuf)]) -> OsString {
 }
 
 /// Read the ELF header at offset zero without moving the shared file offset.
+/// An AArch64 ELF (the Android app's ARM64 Wine) runs directly as well.
 fn direct_guest_refusal(image: &File, ia32: Ia32Emulation) -> Option<DirectGuestRefusal> {
     let mut header = [0_u8; 20];
-    let target = image
+    let read = image
         .metadata()
         .is_ok_and(|metadata| metadata.is_file())
         .then(|| image.read_exact_at(&mut header, 0).ok())
-        .flatten()
-        .and_then(|()| elf_target(&header));
+        .flatten();
+    if cfg!(target_arch = "aarch64") && read.is_some() && is_aarch64_elf(&header) {
+        return None;
+    }
+    let target = read.and_then(|()| elf_target(&header));
     match target {
         None => Some(DirectGuestRefusal::UnrecognizedImage),
         Some(ElfTarget::I386) if ia32 == Ia32Emulation::Disabled => {
@@ -1718,6 +1532,14 @@ fn elf_matches(path: &Path, target: ElfTarget) -> bool {
     elf_target(&header) == Some(target)
 }
 
+/// A little-endian 64-bit AArch64 ELF (`EM_AARCH64`, 183).
+fn is_aarch64_elf(header: &[u8; 20]) -> bool {
+    header[..4] == *b"\x7fELF"
+        && header[4] == 2
+        && header[5] == 1
+        && u16::from_le_bytes([header[18], header[19]]) == 183
+}
+
 /// Classify a little-endian ELF identification and machine header.
 fn elf_target(header: &[u8; 20]) -> Option<ElfTarget> {
     if header[..4] != *b"\x7fELF" || header[5] != 1 {
@@ -1991,7 +1813,7 @@ fn runtime_execution_preflight(
         GuestExecutor::Translated { interpreter, .. } => is_usable_executable(interpreter),
         GuestExecutor::Direct => true,
         GuestExecutor::Unavailable(_) => false,
-        GuestExecutor::Chosen(_) | GuestExecutor::AppProvided(_) => guest
+        GuestExecutor::Chosen(_) => guest
             .interpreter()
             .is_some_and(|interpreter| is_usable_executable(&interpreter)),
     };
@@ -2003,12 +1825,7 @@ fn runtime_execution_preflight(
     {
         return RuntimeExecutionEvidence::Unavailable;
     }
-    match guest {
-        GuestExecutor::AppProvided(app) => {
-            app.preflight(|| run_runtime_execution_preflight(runtime, guest))
-        }
-        _ => run_runtime_execution_preflight(runtime, guest),
-    }
+    run_runtime_execution_preflight(runtime, guest)
 }
 
 /// `wine --version` through `guest`, once the runtime and prefix are there.
@@ -2780,7 +2597,13 @@ mod tests {
             Some(DirectGuestRefusal::Ia32ExecutionDisabled)
         );
         assert_eq!(direct_guest_refusal(&amd64, Ia32Emulation::Disabled), None);
-        for image in [&arm64, &mismatched, &script, &directory_handle] {
+        // An ARM64 build runs an AArch64 ELF directly (the Android app's ARM64 Wine); any other
+        // build refuses it.
+        assert_eq!(
+            direct_guest_refusal(&arm64, Ia32Emulation::NotDisabled),
+            (!cfg!(target_arch = "aarch64")).then_some(DirectGuestRefusal::UnrecognizedImage)
+        );
+        for image in [&mismatched, &script, &directory_handle] {
             assert_eq!(
                 direct_guest_refusal(image, Ia32Emulation::NotDisabled),
                 Some(DirectGuestRefusal::UnrecognizedImage)
@@ -2999,17 +2822,14 @@ mod tests {
             page_size: 4096,
             data_dir: "/data/data/com.pd2launcher.app".to_owned(),
         };
-        let evidence = SystemHostProbe::new(
-            None,
-            GuestExecutor::Unavailable(GuestExecutorUnavailable::TranslatorMissing),
-        )
-        .with_android_host(facts)
-        .probe(&RuntimePreflightRequest::new(
-            "/missing/wine".into(),
-            "/missing/wine-preloader".into(),
-            "/missing/prefix".into(),
-        ))
-        .unwrap();
+        let evidence = SystemHostProbe::new(None, GuestExecutor::Direct)
+            .with_android_host(facts)
+            .probe(&RuntimePreflightRequest::new(
+                "/missing/wine".into(),
+                "/missing/wine-preloader".into(),
+                "/missing/prefix".into(),
+            ))
+            .unwrap();
         // This machine's os-release names something else.
         assert_eq!(evidence.os_id, "android");
         assert_eq!(evidence.os_version, "33");
@@ -3020,189 +2840,14 @@ mod tests {
             rustix::system::uname().machine().to_string_lossy()
         );
         assert_eq!(evidence.fex_package, None);
-        if HostPlatform::current() == HostPlatform::Aarch64 {
-            assert!(matches!(
-                evidence.guest_execution,
-                GuestExecutionEvidence::Translated {
-                    interpreter_present: false,
-                    pending: false,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn app_provided_fex_is_pending_until_its_rootfs_and_writes_its_config() {
-        use crate::persistence::LauncherPaths;
-        let fixture = tempfile::tempdir().unwrap();
-        let paths = LauncherPaths::from_home(fixture.path());
-        let root = paths.managed_root();
-        let guest = GuestExecutor::app_provided(
-            [
-                ("PD2_APP_FEX".into(), "/app/bin/pd2-fex".into()),
-                (
-                    "PD2_APP_FEX_HOSTENV_MESA_LOADER_DRIVER_OVERRIDE".into(),
-                    "zink".into(),
-                ),
-                (
-                    "PD2_APP_FEX_COMPATIBILITY_HOSTENV_TU_DEBUG".into(),
-                    "sysmem".into(),
-                ),
-            ],
-            paths,
-        );
-        assert!(guest.resolved().pending);
-        crate::builtin_fex::install_test_app_rootfs(&root);
-        assert!(!guest.resolved().pending);
-        let invocation = guest
-            .shape(Path::new("/usr/bin/true"), &[OsString::from("x")])
-            .unwrap();
-        // The entry point heads the chain exactly as the built-in FEX does,
-        // with the Launcher's own FEX folders and RootFS.
-        assert_eq!(invocation.program, PathBuf::from("/app/bin/pd2-fex"));
+        // The app's ARM64 Wine runs the guests, on any build machine, and
+        // the page size is this kernel's own.
         assert_eq!(
-            invocation.arguments,
-            [OsString::from("/usr/bin/true"), OsString::from("x")]
+            evidence.guest_execution,
+            GuestExecutionEvidence::AppProvided {
+                page_size_4k: rustix::param::page_size() == 4096
+            }
         );
-        assert_eq!(
-            invocation.environment,
-            crate::builtin_fex::Layout::new(&root).environment()
-        );
-        let config = fs::read_to_string(root.join("fex/config/Config.json")).unwrap();
-        assert!(config.contains(r#""HostEnv": "MESA_LOADER_DRIVER_OVERRIDE=zink""#));
-        assert!(config.contains(r#""GL": 1"#));
-        assert!(!config.contains("TU_DEBUG"));
-        // A Play with the Compatibility driver writes its values at once, and
-        // every guest started after it (the probe's executor is shared) keeps
-        // them until a Play with the standard driver.
-        let probe = SystemHostProbe::new(None, guest.clone());
-        let config = || fs::read_to_string(root.join("fex/config/Config.json")).unwrap();
-        probe.use_graphics_driver(true).unwrap().unwrap();
-        assert!(config().contains(r#""HostEnv": "TU_DEBUG=sysmem""#));
-        guest.shape(Path::new("/usr/bin/true"), &[]).unwrap();
-        assert!(config().contains(r#""HostEnv": "TU_DEBUG=sysmem""#));
-        probe.use_graphics_driver(false).unwrap().unwrap();
-        guest.shape(Path::new("/usr/bin/true"), &[]).unwrap();
-        assert!(!config().contains("TU_DEBUG"));
-        assert!(
-            SystemHostProbe::new(
-                None,
-                GuestExecutor::Unavailable(GuestExecutorUnavailable::TranslatorMissing)
-            )
-            .use_graphics_driver(true)
-            .is_none()
-        );
-        // Without the app's name, no guest runs.
-        assert_eq!(
-            GuestExecutor::app_provided(
-                std::iter::empty(),
-                crate::persistence::LauncherPaths::from_home(fixture.path())
-            ),
-            GuestExecutor::Unavailable(GuestExecutorUnavailable::TranslatorMissing)
-        );
-    }
-
-    #[test]
-    fn the_fex_probe_runs_after_the_rootfs_and_at_install_or_play_never_on_open() {
-        use crate::persistence::LauncherPaths;
-        use std::cell::Cell;
-        let fixture = tempfile::tempdir().unwrap();
-        let paths = LauncherPaths::from_home(fixture.path());
-        let root = paths.managed_root();
-        let engine = || {
-            let GuestExecutor::AppProvided(app) = GuestExecutor::app_provided(
-                [("PD2_APP_FEX".into(), "/app/bin/pd2-fex".into())],
-                paths.clone(),
-            ) else {
-                panic!("App-provided FEX");
-            };
-            app
-        };
-        let runs = Cell::new(0);
-        let run = |passed: bool| {
-            runs.set(runs.get() + 1);
-            passed
-        };
-        crate::builtin_fex::install_test_app_rootfs(&root);
-        // After the RootFS is installed: it runs once and its pass is kept.
-        let first = engine();
-        assert!(first.probe(|| run(true)));
-        assert!(first.probe(|| run(true)));
-        assert_eq!(runs.get(), 1);
-        assert!(crate::builtin_fex::app_probe_passed(&root));
-        // Opening the app (a new engine, Check) runs no FEX.
-        let opened = engine();
-        assert!(opened.probe(|| run(true)));
-        assert_eq!(runs.get(), 1);
-        // Install or Play starts: it runs again, and a failure is kept too.
-        opened.probe_again();
-        assert!(!opened.probe(|| run(false)));
-        assert_eq!(runs.get(), 2);
-        assert!(!crate::builtin_fex::app_probe_passed(&root));
-        // A failed probe runs again on the next open.
-        assert!(engine().probe(|| run(true)));
-        assert_eq!(runs.get(), 3);
-    }
-
-    #[test]
-    fn the_runtime_preflight_runs_at_install_or_play_never_on_open_once_passed() {
-        use crate::persistence::LauncherPaths;
-        use std::cell::Cell;
-        let fixture = tempfile::tempdir().unwrap();
-        let paths = LauncherPaths::from_home(fixture.path());
-        let root = paths.managed_root();
-        let engine = || {
-            let GuestExecutor::AppProvided(app) = GuestExecutor::app_provided(
-                [("PD2_APP_FEX".into(), "/app/bin/pd2-fex".into())],
-                paths.clone(),
-            ) else {
-                panic!("App-provided FEX");
-            };
-            app
-        };
-        let runs = Cell::new(0);
-        let run = |evidence: RuntimeExecutionEvidence| {
-            runs.set(runs.get() + 1);
-            evidence
-        };
-        crate::builtin_fex::install_test_app_rootfs(&root);
-        // Before any pass it runs; an answer it could not get is not kept.
-        let first = engine();
-        assert_eq!(
-            first.preflight(|| run(RuntimeExecutionEvidence::Unavailable)),
-            RuntimeExecutionEvidence::Unavailable
-        );
-        assert_eq!(
-            first.preflight(|| run(RuntimeExecutionEvidence::Passed)),
-            RuntimeExecutionEvidence::Passed
-        );
-        assert_eq!(runs.get(), 2);
-        // Opening the app (a new engine, Check) runs no Wine.
-        let opened = engine();
-        assert_eq!(
-            opened.preflight(|| run(RuntimeExecutionEvidence::Failed)),
-            RuntimeExecutionEvidence::Passed
-        );
-        assert_eq!(runs.get(), 2);
-        // Install or Play starts: it runs again, once, and a failure is kept.
-        opened.probe_again();
-        assert_eq!(
-            opened.preflight(|| run(RuntimeExecutionEvidence::Failed)),
-            RuntimeExecutionEvidence::Failed
-        );
-        assert_eq!(runs.get(), 3);
-        assert!(!crate::builtin_fex::app_wine_preflight_passed(&root));
-        assert_eq!(
-            opened.preflight(|| run(RuntimeExecutionEvidence::Passed)),
-            RuntimeExecutionEvidence::Passed
-        );
-        assert_eq!(runs.get(), 4);
-        // A failed FEX probe forgets the pass.
-        assert!(crate::builtin_fex::app_wine_preflight_passed(&root));
-        crate::builtin_fex::record_app_probe(&root, true).unwrap();
-        crate::builtin_fex::record_app_probe(&root, false).unwrap();
-        assert!(!crate::builtin_fex::app_wine_preflight_passed(&root));
     }
 
     #[test]

@@ -105,11 +105,64 @@ const FEX_STRICT_ENVIRONMENT: [(&str, &str); 6] = [
     ("FEX_MULTIBLOCK", "0"),
 ];
 
-/// The strict FEX settings on ARM64, where x86 programs run through FEX.
+/// The strict FEX settings on ARM64, where x86 programs run through FEX
+/// (never on the Android host, whose x86 programs run in Box64).
 pub(crate) fn fex_strict_settings() -> Vec<crate::wine_environment::Setting> {
+    fex_strict_settings_on(crate::android_host())
+}
+
+/// [`fex_strict_settings`] on the Android host (`android`) or the desktop.
+fn fex_strict_settings_on(android: bool) -> Vec<crate::wine_environment::Setting> {
     use crate::wine_environment::{Kind, Setting};
-    if cfg!(target_arch = "aarch64") {
+    if cfg!(target_arch = "aarch64") && !android {
         FEX_STRICT_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| Setting::new(*name, *value, Kind::Preference))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Box64's dynamic recompiler settings for PD2's installer on the Android
+/// host: Inno Setup's program and the `.tmp` copy it runs need exact x86
+/// flags at every instruction (`BOX64_DYNAREC_SAFEFLAGS=2`), or they stop
+/// with an access violation. Only the programs `BOX64_DYNAREC_PROGRAMS`
+/// names get the settings (our Box64 patch 0006): the installer runs as
+/// [`ANDROID_CLIENT_INSTALLER`], so Inno Setup's copy is
+/// `ProjectD2Installer.tmp`. Only this installer's run gets them; every other
+/// program keeps Box64's defaults.
+const BOX64_INSTALLER_ENVIRONMENT: [(&str, &str); 2] = [
+    (
+        "BOX64_DYNAREC_PROGRAMS",
+        "ProjectD2Installer.exe;ProjectD2Installer.tmp",
+    ),
+    ("BOX64_DYNAREC_SAFEFLAGS", "2"),
+];
+
+/// Box64's settings for the Android host's official PD2 launcher and its
+/// updater: its multithreaded .NET (JIT-compiled code, the garbage
+/// collector, the thread pool) relies on x86 memory ordering
+/// (`BOX64_DYNAREC_STRONGMEM=1`), and code it writes must run at once
+/// (`BOX64_DYNAREC_WAIT=0`). Only these programs get them (as above).
+const BOX64_LAUNCHER_ENVIRONMENT: [(&str, &str); 3] = [
+    (
+        "BOX64_DYNAREC_PROGRAMS",
+        "PD2Launcher.exe;UpdateUtility.exe",
+    ),
+    ("BOX64_DYNAREC_STRONGMEM", "1"),
+    ("BOX64_DYNAREC_WAIT", "0"),
+];
+
+/// `environment` as Launcher settings on the Android host (`android`); none
+/// elsewhere.
+fn android_settings(
+    environment: &[(&str, &str)],
+    android: bool,
+) -> Vec<crate::wine_environment::Setting> {
+    use crate::wine_environment::{Kind, Setting};
+    if android {
+        environment
             .iter()
             .map(|(name, value)| Setting::new(*name, *value, Kind::Preference))
             .collect()
@@ -1976,7 +2029,18 @@ fn cache_name(spec: &ArtifactSpec) -> &'static str {
     if spec.is_custom() {
         return custom_cache_name(spec.kind);
     }
-    match spec.kind {
+    pinned_cache_name(spec.kind)
+}
+
+/// The names under which the artifact cache (`cache/artifacts`) holds a
+/// verified `kind`, as the Download records it: its pinned artifact's and a
+/// custom source's.
+pub(crate) fn recorded_cache_names(kind: ArtifactKind) -> [&'static str; 2] {
+    [pinned_cache_name(kind), custom_cache_name(kind)]
+}
+
+fn pinned_cache_name(kind: ArtifactKind) -> &'static str {
+    match kind {
         ArtifactKind::ManagedRuntime => managed_runtime().cache_name,
         ArtifactKind::Gecko => "wine-gecko-2.47.4-x86.verified",
         ArtifactKind::WineMono => "wine-mono-11.3.0-x86.verified",
@@ -2219,6 +2283,11 @@ pub(crate) struct ProductionInstallDriver {
     download_empty_limit: Duration,
     /// The host's received-byte count ([`RECEIVED_BYTES_FILE`]).
     received_bytes: Option<PathBuf>,
+    /// The Launcher engine runs on the Android host
+    /// ([`crate::android_host`], read when the driver is made): the app's
+    /// runtime, its prefix and the Android Wine settings. Tests set it for
+    /// either host.
+    android: bool,
 }
 
 impl ProductionInstallDriver {
@@ -2233,7 +2302,18 @@ impl ProductionInstallDriver {
             received_bytes: env::var_os(RECEIVED_BYTES_FILE)
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
+            android: crate::android_host(),
         }
+    }
+
+    /// The driver on the Android host (`android`) or the desktop, for tests:
+    /// the host switch is the whole process's. The functions of other
+    /// modules it calls still read that switch (the game folder copy of an
+    /// import, `game_folder`), so a test of those parts stays the desktop's.
+    #[cfg(test)]
+    fn on_android_host(mut self, android: bool) -> Self {
+        self.android = android;
+        self
     }
 
     /// Another [`DOWNLOAD_STALL_LIMIT`], also for an empty folder, for tests
@@ -2290,6 +2370,46 @@ impl ProductionInstallDriver {
         })
     }
 
+    /// GLX for the prefix's OpenGL ([`X11_DRIVER_KEY`]), set by Wine's
+    /// `reg add` unless its `user.reg` has it already. The app's prefix
+    /// template carries `"UseEGL"="N"`, so a copy of it needs no Wine for it.
+    /// This runs only while the audit rejects the runtime or the prefix: a
+    /// prefix the audit accepts (one kept from FEX 0.2.x, say) stays as it
+    /// is.
+    fn sync_x11_glx(
+        &self,
+        paths: &ManagedPaths,
+        runtime: InstalledRuntime,
+        mutation_lease: &File,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure> {
+        let mut user_reg = Vec::new();
+        if paths
+            .directory()
+            .open_beneath(Path::new("prefix/user.reg"), OFlags::RDONLY)
+            .and_then(|mut file| file.read_to_end(&mut user_reg))
+            .is_ok()
+            && x11_glx_set(&String::from_utf8_lossy(&user_reg))
+        {
+            return Ok(());
+        }
+        self.run_wine(WineInvocation {
+            paths,
+            runtime,
+            working_directory: paths.root(),
+            program: WineProgram::Builtin(OsString::from("reg")),
+            verified_argument: None,
+            arguments: x11_glx_arguments(),
+            profile: WineProfile::Install,
+            timeout: RUNTIME_TIMEOUT,
+            mutation_lease,
+            control,
+            ui_helper: None,
+            stall: None,
+            accepted_exit_codes: &[],
+        })
+    }
+
     /// Whether this job's Wine download source is custom. It
     /// selects the runtime exactly as the job's audit does.
     pub(crate) fn with_custom_wine(mut self, custom_wine: bool) -> Self {
@@ -2298,8 +2418,12 @@ impl ProductionInstallDriver {
     }
 
     /// The runtime later stages execute: the one the preceding audit
-    /// accepted for this installation and its configured Wine source.
+    /// accepted for this installation and its configured Wine source (on
+    /// the Android host the app's, as the audit selects it there).
     fn installed_runtime(&self, paths: &ManagedPaths) -> InstalledRuntime {
+        if self.android {
+            return InstalledRuntime::App;
+        }
         InstalledRuntime::select(paths.directory(), self.custom_wine)
     }
 
@@ -2406,7 +2530,7 @@ impl ProductionInstallDriver {
             working_directory: paths.root(),
             program: WineProgram::Verified(dotnet),
             verified_argument: None,
-            arguments: dotnet_desktop_arguments(crate::android_host()),
+            arguments: dotnet_desktop_arguments(self.android),
             profile: WineProfile::Install,
             timeout: RUNTIME_TIMEOUT,
             mutation_lease,
@@ -2450,9 +2574,16 @@ impl ProductionInstallDriver {
             .and_then(|file| {
                 let mut text = String::new();
                 file.take(64).read_to_string(&mut text).ok()?;
-                text.trim().parse::<i64>().ok()
+                Some(text.trim().to_owned())
             });
-        if recorded == Some(inf_mtime) || !initialized_prefix(&prefix) {
+        // "disable" (the Android app's prefix template): Wine never updates
+        // the prefix by itself, and on the app's runtime neither does the
+        // Launcher. For any other runtime (the desktop's) it is no timestamp
+        // of that Wine, so the update runs.
+        if (runtime == InstalledRuntime::App && recorded.as_deref() == Some("disable"))
+            || recorded.and_then(|text| text.parse::<i64>().ok()) == Some(inf_mtime)
+            || !initialized_prefix(&prefix)
+        {
             return Ok(());
         }
         self.run_wine(WineInvocation {
@@ -2499,6 +2630,10 @@ impl ProductionInstallDriver {
                 format!("wine {:?}", artifact.kind())
             }
         };
+        let client_bootstrap = matches!(
+            &invocation.program,
+            WineProgram::Builtin(program) if program == ANDROID_CLIENT_INSTALLER
+        );
         let mut managed_program = None;
         let (program, verified_object) = match (invocation.program, invocation.verified_argument) {
             (WineProgram::Builtin(program), None) => (program, None),
@@ -2572,7 +2707,7 @@ impl ProductionInstallDriver {
             .map(UiHelper::sealed_file)
             .transpose()?;
         let helper_copy = match (invocation.ui_helper, &helper_image) {
-            (Some(kind), Some(helper)) if crate::android_host() => {
+            (Some(kind), Some(helper)) if self.android => {
                 Some(android_helper_copy(invocation.paths, kind, helper)?)
             }
             _ => None,
@@ -2614,7 +2749,10 @@ impl ProductionInstallDriver {
                     WINE_DLL_OVERRIDES,
                     Kind::Required,
                 ));
-                settings.extend(fex_strict_settings());
+                settings.extend(fex_strict_settings_on(self.android));
+                if client_bootstrap {
+                    settings.extend(android_settings(&BOX64_INSTALLER_ENVIRONMENT, self.android));
+                }
             }
             WineProfile::PrefixInitialization => {
                 // Creating the prefix must not run Wine's interactive Mono or
@@ -2625,22 +2763,24 @@ impl ProductionInstallDriver {
                     PREFIX_INITIALIZATION_DLL_OVERRIDES,
                     Kind::Required,
                 ));
-                settings.extend(fex_strict_settings());
+                settings.extend(fex_strict_settings_on(self.android));
             }
             WineProfile::OfficialLauncher => {
                 // The game's, with Android's.
                 settings.push(Setting::new(
                     "WINEDLLOVERRIDES",
-                    crate::process::game_dll_overrides(crate::android_host()),
+                    crate::process::game_dll_overrides(self.android),
                     Kind::Preference,
                 ));
                 // Its .NET runtime is multithreaded x86 code that relies on
                 // x86 memory ordering (JIT-compiled code, the garbage
                 // collector, the thread pool), and a game it starts inherits
                 // this environment.
-                settings.extend(fex_strict_settings());
-                // Only where its .NET runs translated by FEX (ARM64); on
-                // x86-64 it runs natively and needs neither.
+                settings.extend(fex_strict_settings_on(self.android));
+                settings.extend(android_settings(&BOX64_LAUNCHER_ENVIRONMENT, self.android));
+                // Only where its .NET runs translated (ARM64: FEX, or Box64
+                // on the Android host); on x86-64 it runs natively and needs
+                // neither.
                 if TRANSLATED_DOTNET {
                     settings.push(Setting::new(
                         DOTNET_WRITE_XOR_EXECUTE,
@@ -2655,7 +2795,9 @@ impl ProductionInstallDriver {
                 }
             }
         }
-        for (name, value) in crate::wine_environment::compose(env::vars_os(), &settings) {
+        for (name, value) in
+            crate::wine_environment::compose_on(env::vars_os(), &settings, self.android)
+        {
             request = request.with_environment(name, value);
         }
         for argument in invocation.arguments {
@@ -2832,8 +2974,10 @@ impl ProductionInstallDriver {
             WINE_DLL_OVERRIDES,
             crate::wine_environment::Kind::Required,
         ));
-        settings.extend(fex_strict_settings());
-        for (name, value) in crate::wine_environment::compose(env::vars_os(), &settings) {
+        settings.extend(fex_strict_settings_on(self.android));
+        for (name, value) in
+            crate::wine_environment::compose_on(env::vars_os(), &settings, self.android)
+        {
             request = request.with_environment(name, value);
         }
         request = request
@@ -2948,7 +3092,8 @@ impl ProductionInstallDriver {
             )
             .with_cleared_environment()
             .with_output_limit(PROCESS_OUTPUT_LIMIT);
-        for (name, value) in crate::wine_environment::compose(env::vars_os(), &wine_settings(home))
+        for (name, value) in
+            crate::wine_environment::compose_on(env::vars_os(), &wine_settings(home), self.android)
         {
             request = request.with_environment(name, value);
         }
@@ -3403,6 +3548,82 @@ pub(crate) fn gl_probe_helper() -> Option<File> {
     .ok()
 }
 
+/// Copies the Android app's prefix template (`runtime::APP_PREFIX_TEMPLATE`)
+/// to `prefix` in the managed root `root`: folders, files with their modes,
+/// and links as they are (most of its files are relative links into the
+/// app's Wine). The copy is made under a temporary name, every file and
+/// folder of it is synced, and only then is it renamed into place, so a
+/// stop or a crash part way leaves no prefix, and never a short hive under
+/// the prefix's name. A folder gets its mode after its entries, so a
+/// template folder without the owner's write is copied too.
+fn copy_app_prefix_template(root: &Path) -> io::Result<()> {
+    fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+        fs::create_dir(to)?;
+        // Opened while the owner can write it: its mode comes last.
+        let folder = File::open(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let target = to.join(entry.file_name());
+            if kind.is_symlink() {
+                std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
+            } else if kind.is_dir() {
+                copy_tree(&entry.path(), &target)?;
+            } else if kind.is_file() {
+                fs::copy(entry.path(), &target)?;
+                File::open(&target)?.sync_all()?;
+            }
+        }
+        folder.set_permissions(fs::metadata(from)?.permissions())?;
+        folder.sync_all()
+    }
+    let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+    if !template.join("system.reg").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the app's prefix template is not there",
+        ));
+    }
+    let partial = OsStr::new(".prefix.partial");
+    // A copy cut short before, whose folders may lack the owner's write.
+    let directory = Directory::open(root)?;
+    match directory.remove_owned_tree(partial) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    copy_tree(&template, &root.join(partial))?;
+    fs::rename(root.join(partial), root.join("prefix"))?;
+    // The rename, synced too.
+    directory.sync()
+}
+
+/// The link to the Android app's .NET in the prefix
+/// (`runtime::APP_DOTNET_LINK`), made when it is not there, and made again
+/// when it leads to another target (one an earlier release made, should
+/// `runtime::APP_DOTNET_LINK_TARGET` change). Only a link is replaced: a
+/// real file or folder at its place is kept.
+fn link_app_dotnet(root: &Path) -> io::Result<()> {
+    let link = root.join(crate::runtime::APP_DOTNET_LINK);
+    let target = Path::new(crate::runtime::APP_DOTNET_LINK_TARGET);
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(_) => {
+            if fs::read_link(&link)? == target {
+                return Ok(());
+            }
+            // The link goes, never what it leads to.
+            fs::remove_file(&link)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(folder) = link.parent() {
+                fs::create_dir_all(folder)?;
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    std::os::unix::fs::symlink(target, &link)
+}
+
 /// Puts the sealed XInput bridge (`tools/xinput-bridge.c`) in the prefix as
 /// the game's `xinput1_4.dll` unless it is there already, replacing Wine's
 /// own. The Android host only; it needs `xinput1_4=n`.
@@ -3489,6 +3710,39 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
     }
+}
+
+/// PD2's installer's file name on the Android host ([`android_client_installer`]).
+const ANDROID_CLIENT_INSTALLER_NAME: &str = "ProjectD2Installer.exe";
+
+/// Where the Android host runs PD2's installer from, as Windows names it: its
+/// checked copy in [`ANDROID_PROGRAM_COPIES`] (named
+/// [`ANDROID_CLIENT_INSTALLER_NAME`]).
+const ANDROID_CLIENT_INSTALLER: &str = r"C:\pd2launcher-programs\ProjectD2Installer.exe";
+
+/// PD2's installer, copied from its verified artifact to
+/// [`ANDROID_CLIENT_INSTALLER`] and checked again there; returns the copy's
+/// Windows path and the guard that removes it. Under Box64 its Inno Setup
+/// program and the `.tmp` copy that one runs fail with an access violation
+/// when the installer runs as a descriptor (`/proc/self/fd/N`), even with
+/// Box64's exact flags; under its own file name they install. The copy is
+/// kept out of [`WRAPPER_DOWNLOADS`], like every program copy, so a copy left
+/// by a stopped app never counts as parts of a download.
+fn android_client_installer(
+    paths: &ManagedPaths,
+    bootstrap: &VerifiedArtifact,
+) -> Result<(OsString, RemoveOnDrop), AdapterFailure> {
+    let mut source = open_verified_program(bootstrap)?;
+    let sha256 = bootstrap
+        .execution_sha256()
+        .map_err(|_| AdapterFailure::here())?;
+    android_program_copy(
+        paths.directory(),
+        paths.root(),
+        &mut source,
+        ANDROID_CLIENT_INSTALLER_NAME,
+        sha256,
+    )
 }
 
 /// On the Android host, the sealed UI helper is copied to
@@ -3781,6 +4035,12 @@ const WPF_GRAPHICS_KEY: &str = r"HKCU\Software\Microsoft\Avalon.Graphics";
 const WPF_SOFTWARE_RENDERING_VALUE: &str = "DisableHWAcceleration";
 /// `reg delete` exits 1 when the value is already absent.
 const REG_VALUE_ABSENT_STATUS: i32 = 1;
+/// The Android app's prefixes draw OpenGL through GLX: Wine's X11 driver
+/// with `UseEGL` "N" (Wine 11 takes EGL by default). With the app's Mesa
+/// (Zink on Xvfb, Vulkan's WSI copying each frame), EGL's way to the screen
+/// drew 43.6 frames a second on a Mali-G715 where GLX drew 55.2 to 55.4.
+const X11_DRIVER_KEY: &str = r"HKCU\Software\Wine\X11 Driver";
+const X11_USE_EGL_VALUE: &str = "UseEGL";
 
 /// `reg` arguments that turn WPF software rendering on (`reg add` of
 /// `DisableHWAcceleration=1`) or off (`reg delete` of the value).
@@ -3807,6 +4067,42 @@ fn wpf_software_rendering_arguments(enabled: bool) -> Vec<OsString> {
         ]
     };
     arguments.iter().map(OsString::from).collect()
+}
+
+/// `reg` setting the X11 driver's `UseEGL` to "N" ([`X11_DRIVER_KEY`]).
+fn x11_glx_arguments() -> Vec<OsString> {
+    [
+        "add",
+        X11_DRIVER_KEY,
+        "/v",
+        X11_USE_EGL_VALUE,
+        "/t",
+        "REG_SZ",
+        "/d",
+        "N",
+        "/f",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect()
+}
+
+/// Whether the text of a prefix's `user.reg` has the X11 driver's `UseEGL`
+/// set to "N": the line `"UseEGL"="N"` in its `[Software\\Wine\\X11 Driver]`
+/// section (Wine writes key names with doubled backslashes; their case does
+/// not count).
+fn x11_glx_set(user_reg: &str) -> bool {
+    let mut in_section = false;
+    for line in user_reg.lines() {
+        if let Some(name) = line.strip_prefix('[') {
+            in_section = name
+                .to_ascii_lowercase()
+                .starts_with(r"software\\wine\\x11 driver]");
+        } else if in_section && line.trim_end() == r#""UseEGL"="N""# {
+            return true;
+        }
+    }
+    false
 }
 
 /// `reg add` arguments for the location values Blizzard's 1.14 installer
@@ -3959,6 +4255,66 @@ fn wrapper_arguments() -> Vec<OsString> {
 }
 
 impl ProductionInstallDriver {
+    /// The Android app's prefix, while the audit rejects the runtime or the
+    /// prefix (only then does the setup come here): a new one is a copy of
+    /// the app's prefix template (made by the same Wine, so no `wineboot`
+    /// runs on the phone; it carries `"UseEGL"="N"`), with the XInput bridge
+    /// and the official launcher's WPF setting. The prefix gets GLX for
+    /// OpenGL ([`X11_DRIVER_KEY`]) when its `user.reg` lacks it, and the
+    /// link to the app's .NET. A prefix Wine never finished is made again;
+    /// any other one is kept as it is.
+    fn provision_app_prefix(
+        &self,
+        paths: &ManagedPaths,
+        runtime: InstalledRuntime,
+        new_prefix: bool,
+        parts: &mut EnvironmentParts<'_>,
+        mutation_lease: &File,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure> {
+        if new_prefix {
+            parts.start(EnvironmentPart::Windows);
+            let root = paths.root();
+            if paths
+                .directory()
+                .open_directory(Path::new("prefix"))
+                .is_ok()
+            {
+                paths
+                    .directory()
+                    .remove_owned_tree(OsStr::new("prefix"))
+                    .map_err(|_| AdapterFailure::here())?;
+            }
+            copy_app_prefix_template(root).map_err(|error| {
+                eprintln!("pd2-launcher: the prefix template was not copied: {error}");
+                AdapterFailure::here()
+            })?;
+            install_xinput_bridge(paths.directory()).map_err(|_| AdapterFailure::here())?;
+            if self.wpf_software_rendering {
+                let _ = self.sync_wpf_software_rendering(paths, runtime, mutation_lease, control);
+                if control.is_cancelled() {
+                    return Err(AdapterFailure::here());
+                }
+            }
+        }
+        // A copy of the template has it, so no Wine runs for it; a kept prefix
+        // gets it here only when the audit rejected the runtime or the
+        // prefix. Without it the game still draws, through EGL.
+        if self
+            .sync_x11_glx(paths, runtime, mutation_lease, control)
+            .is_err()
+        {
+            if control.is_cancelled() {
+                return Err(AdapterFailure::here());
+            }
+            eprintln!("pd2-launcher: UseEGL=N was not set; OpenGL goes through EGL");
+        }
+        link_app_dotnet(paths.root()).map_err(|error| {
+            eprintln!("pd2-launcher: the .NET link was not made: {error}");
+            AdapterFailure::here()
+        })
+    }
+
     /// Run a downloader wrapper to fetch its complete payload into
     /// [`WRAPPER_DOWNLOADS`], then verify the payload against its frozen
     /// identity exactly as a selected complete payload. Nothing the
@@ -4112,15 +4468,14 @@ impl ProductionInstallDriver {
         // still opens, though its window may stay black.
         let _ = self.sync_wpf_software_rendering(&paths, runtime, mutation_lease, control);
         // The game folder's drive (`in_place_drive`), as before the game.
-        if let Some(folder) =
-            crate::in_place_drive::folder(crate::android_host(), paths.game_folder())
+        if let Some(folder) = crate::in_place_drive::folder(self.android, paths.game_folder())
             && let Err(error) = crate::in_place_drive::link(paths.directory(), &folder)
         {
             eprintln!("pd2-launcher: the G: drive was not linked: {error}");
         }
         // It can start the game, whose D2GL loads the DLLs d2gl.json names:
         // as before a Play, they must be PD2's own.
-        if crate::android_host()
+        if self.android
             && let Err(error) = paths
                 .open_game()
                 .and_then(|game| crate::process::pin_d2gl_dlls(&game))
@@ -4235,6 +4590,16 @@ impl InstallDriver for ProductionInstallDriver {
             Some(wine) => ensure_runtime(paths, wine, control)?,
             None => self.installed_runtime(paths),
         };
+        if runtime == InstalledRuntime::App {
+            return self.provision_app_prefix(
+                paths,
+                runtime,
+                new_prefix,
+                &mut parts,
+                mutation_lease,
+                control,
+            );
+        }
         if gecko.is_none() && mono.is_none() && dotnet.is_none() {
             return Ok(());
         }
@@ -4289,7 +4654,7 @@ impl InstallDriver for ProductionInstallDriver {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return Err(AdapterFailure::here()),
         }
-        let android = crate::android_host();
+        let android = self.android;
         let Some((gecko, mono, dotnet)) = new_prefix_components(gecko, mono, dotnet, android)
         else {
             return Err(AdapterFailure::here());
@@ -4331,7 +4696,7 @@ impl InstallDriver for ProductionInstallDriver {
         }
         // The game's XInput bridge on Android; the game start puts it back
         // if it is missing.
-        if crate::android_host() {
+        if android {
             install_xinput_bridge(paths.directory()).map_err(|_| AdapterFailure::here())?;
         }
         // Best effort, like the sync before each official-launcher session,
@@ -4431,7 +4796,7 @@ impl InstallDriver for ProductionInstallDriver {
                 if !crate::game_folder::usable_in_place(existing) {
                     return Err(AdapterFailure::here());
                 }
-                in_place_install_path(paths, existing.path(), crate::android_host())?
+                in_place_install_path(paths, existing.path(), self.android)?
             }
         };
         reject_artifact_cancelled(control)?;
@@ -4543,13 +4908,24 @@ impl InstallDriver for ProductionInstallDriver {
         if bootstrap.kind() != ArtifactKind::ClientBootstrap {
             return Err(AdapterFailure::here());
         }
+        // On the Android host it runs from a checked copy under its own file
+        // name (`android_client_installer`).
+        let android_copy = if self.android {
+            Some(android_client_installer(paths, bootstrap)?)
+        } else {
+            None
+        };
+        let program = match &android_copy {
+            Some((copy, _)) => WineProgram::Builtin(copy.clone()),
+            None => WineProgram::Verified(bootstrap),
+        };
         // The accepted installer source uses Inno Setup 5.5.9, disables
         // restart-by-run, and marks the final PD2Launcher launch skipifsilent.
-        self.run_wine(WineInvocation {
+        let result = self.run_wine(WineInvocation {
             paths,
             runtime: self.installed_runtime(paths),
             working_directory: paths.root(),
-            program: WineProgram::Verified(bootstrap),
+            program,
             verified_argument: None,
             arguments: vec![
                 OsString::from("/SP-"),
@@ -4565,7 +4941,10 @@ impl InstallDriver for ProductionInstallDriver {
             ui_helper: None,
             stall: None,
             accepted_exit_codes: &[],
-        })?;
+        });
+        // The copy goes as soon as the installer ends.
+        drop(android_copy);
+        result?;
         // The pinned bootstrap installed the official launcher: its copy is
         // the one trusted until the official launcher updates itself.
         if bootstrap.custom_source().is_none() {
@@ -10880,6 +11259,26 @@ mod tests {
     }
 
     #[test]
+    fn box64_names_the_pd2_installer_by_the_name_it_runs_under() {
+        let programs = BOX64_INSTALLER_ENVIRONMENT
+            .iter()
+            .find(|(name, _)| *name == "BOX64_DYNAREC_PROGRAMS")
+            .map(|(_, value)| *value)
+            .unwrap();
+        let exe = ANDROID_CLIENT_INSTALLER.rsplit('\\').next().unwrap();
+        assert_eq!(exe, ANDROID_CLIENT_INSTALLER_NAME);
+        assert_eq!(
+            programs,
+            format!("{exe};{}.tmp", exe.trim_end_matches(".exe"))
+        );
+        // It runs from the program copies, which the download watch never counts.
+        assert_eq!(
+            ANDROID_CLIENT_INSTALLER,
+            format!("{WINDOWS_ANDROID_PROGRAM_COPIES}\\{ANDROID_CLIENT_INSTALLER_NAME}")
+        );
+    }
+
+    #[test]
     fn an_android_ui_helper_runs_as_a_checked_copy_that_is_removed_after() {
         let fixture = tempfile::tempdir().unwrap();
         let paths = ManagedPaths::prepare(fixture.path()).unwrap();
@@ -10905,6 +11304,516 @@ mod tests {
             drop(guard);
             assert!(!copy.exists());
             assert!(!folder.exists());
+        }
+    }
+
+    #[test]
+    fn the_app_prefix_is_a_copy_of_its_template_with_links_and_the_dotnet_link() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        // No template: no prefix, and nothing half made.
+        assert!(copy_app_prefix_template(root).is_err());
+        assert!(!root.join("prefix").exists());
+        let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+        let system32 = template.join("drive_c/windows/system32");
+        fs::create_dir_all(&system32).unwrap();
+        for hive in ["system.reg", "user.reg", "userdef.reg"] {
+            fs::write(template.join(hive), b"WINE REGISTRY").unwrap();
+        }
+        fs::write(template.join(".update-timestamp"), b"disable\n").unwrap();
+        fs::write(system32.join("tool.exe"), b"MZ").unwrap();
+        fs::set_permissions(system32.join("tool.exe"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(
+            "../../../../runner/wine-11.0-arm64/lib/wine/aarch64-windows/kernel32.dll",
+            system32.join("kernel32.dll"),
+        )
+        .unwrap();
+        // A copy cut short before is replaced.
+        fs::create_dir_all(root.join(".prefix.partial/stale")).unwrap();
+        copy_app_prefix_template(root).unwrap();
+        let prefix = root.join("prefix");
+        assert!(!root.join(".prefix.partial").exists());
+        assert_eq!(
+            fs::read(prefix.join("system.reg")).unwrap(),
+            b"WINE REGISTRY"
+        );
+        assert_eq!(
+            fs::read(prefix.join(".update-timestamp")).unwrap(),
+            b"disable\n"
+        );
+        let tool = prefix.join("drive_c/windows/system32/tool.exe");
+        assert_eq!(
+            fs::metadata(&tool).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("drive_c/windows/system32/kernel32.dll")).unwrap(),
+            Path::new("../../../../runner/wine-11.0-arm64/lib/wine/aarch64-windows/kernel32.dll")
+        );
+        // The template stays for the next prefix.
+        assert!(template.join("system.reg").is_file());
+        // The .NET link, made once; a real folder at its place is kept.
+        link_app_dotnet(root).unwrap();
+        let link = root.join(crate::runtime::APP_DOTNET_LINK);
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
+        );
+        let dotnet = root.join("runner/dotnet-6.0.36-x86/shared");
+        fs::create_dir_all(&dotnet).unwrap();
+        assert!(
+            link.join("shared").is_dir(),
+            "the link reaches the app's .NET"
+        );
+        link_app_dotnet(root).unwrap();
+        fs::remove_file(&link).unwrap();
+        fs::create_dir(&link).unwrap();
+        link_app_dotnet(root).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+    }
+
+    #[test]
+    fn a_dotnet_link_to_another_target_is_made_again_and_a_real_file_or_folder_is_kept() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let link = root.join(crate::runtime::APP_DOTNET_LINK);
+        let current = Path::new(crate::runtime::APP_DOTNET_LINK_TARGET);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        // An earlier release's link to its own .NET, which is still there,
+        // and one to a .NET that is gone.
+        let earlier = root.join("runner/dotnet-6.0.30-x86/shared");
+        fs::create_dir_all(&earlier).unwrap();
+        for target in [
+            "../../../runner/dotnet-6.0.30-x86",
+            "../../../runner/dotnet-6.0.20-x86",
+        ] {
+            symlink(target, &link).unwrap();
+            link_app_dotnet(root).unwrap();
+            assert_eq!(fs::read_link(&link).unwrap(), current);
+            fs::remove_file(&link).unwrap();
+        }
+        // Only the link went, never what it led to.
+        assert!(earlier.is_dir());
+        // The current link stays, also before the app's .NET is there.
+        symlink(current, &link).unwrap();
+        let made = fs::symlink_metadata(&link).unwrap().ino();
+        link_app_dotnet(root).unwrap();
+        assert_eq!(fs::symlink_metadata(&link).unwrap().ino(), made);
+        fs::remove_file(&link).unwrap();
+        // A real folder, with what it holds, and a real file are kept.
+        fs::create_dir_all(link.join("shared")).unwrap();
+        link_app_dotnet(root).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+        assert!(link.join("shared").is_dir());
+        fs::remove_dir_all(&link).unwrap();
+        fs::write(&link, b"a file").unwrap();
+        link_app_dotnet(root).unwrap();
+        assert_eq!(fs::read(&link).unwrap(), b"a file");
+    }
+
+    /// The Android app's prefix template in the managed root `root`, as the
+    /// app makes it with Wine: its hives (`user.reg` with `UseEGL` "N"), its
+    /// update switch, and Wine's folders.
+    fn app_prefix_template_fixture(root: &Path) -> PathBuf {
+        let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+        for folder in ["drive_c/windows/system32", "drive_c/windows/syswow64"] {
+            fs::create_dir_all(template.join(folder)).unwrap();
+        }
+        fs::write(template.join("system.reg"), b"WINE REGISTRY Version 2\n").unwrap();
+        fs::write(
+            template.join("user.reg"),
+            "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\X11 Driver] 1\n\"UseEGL\"=\"N\"\n",
+        )
+        .unwrap();
+        fs::write(template.join("userdef.reg"), b"WINE REGISTRY Version 2\n").unwrap();
+        fs::write(template.join(".update-timestamp"), b"disable\n").unwrap();
+        template
+    }
+
+    /// Gives `folders` the owner's write again, so the fixture can go.
+    fn writable_again(folders: &[PathBuf]) {
+        for folder in folders {
+            let _ = fs::set_permissions(folder, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn a_template_folder_without_the_owners_write_is_copied_with_its_mode() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let template = app_prefix_template_fixture(root);
+        // Wine gives a folder with the read-only attribute such a mode.
+        let windows = template.join("drive_c/windows");
+        fs::write(windows.join("win.ini"), b"[windows]\n").unwrap();
+        fs::set_permissions(&windows, fs::Permissions::from_mode(0o555)).unwrap();
+        let copied = copy_app_prefix_template(root);
+        let copy = root.join("prefix/drive_c/windows");
+        let mode = fs::metadata(&copy).map(|metadata| metadata.permissions().mode() & 0o777);
+        writable_again(&[
+            windows.clone(),
+            copy.clone(),
+            root.join(".prefix.partial/drive_c/windows"),
+        ]);
+        copied.unwrap();
+        // The folder has the template's mode, and every entry under it.
+        assert_eq!(mode.unwrap(), 0o555);
+        assert_eq!(fs::read(copy.join("win.ini")).unwrap(), b"[windows]\n");
+        assert!(copy.join("system32").is_dir() && copy.join("syswow64").is_dir());
+    }
+
+    #[test]
+    fn the_prefix_gets_its_name_only_after_the_whole_template_is_copied() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let template = app_prefix_template_fixture(root);
+        // A template file the copy cannot read stops it part way.
+        let unreadable = template.join("drive_c/windows/system32/unreadable.dll");
+        fs::write(&unreadable, b"MZ").unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&unreadable).is_ok() {
+            // Root reads every file: nothing to show.
+            return;
+        }
+        assert!(copy_app_prefix_template(root).is_err());
+        assert!(!root.join("prefix").exists(), "no prefix from a part");
+        // The next copy goes to the end, and only then has the name.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+        copy_app_prefix_template(root).unwrap();
+        assert!(!root.join(".prefix.partial").exists());
+        let prefix = root.join("prefix");
+        assert_eq!(
+            fs::read(prefix.join("user.reg")).unwrap(),
+            fs::read(template.join("user.reg")).unwrap()
+        );
+        assert_eq!(
+            fs::read(prefix.join("drive_c/windows/system32/unreadable.dll")).unwrap(),
+            b"MZ"
+        );
+    }
+
+    #[test]
+    fn a_stale_copy_whose_folder_the_owner_cannot_write_is_removed() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        app_prefix_template_fixture(root);
+        // A crash after a copied folder got the template's read-only mode.
+        let stale = root.join(".prefix.partial/drive_c/windows");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("leftover.dll"), b"MZ").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o555)).unwrap();
+        let copied = copy_app_prefix_template(root);
+        writable_again(&[stale]);
+        copied.unwrap();
+        assert!(!root.join(".prefix.partial").exists());
+        assert!(!root.join("prefix/drive_c/windows/leftover.dll").exists());
+        assert!(root.join("prefix/system.reg").is_file());
+    }
+
+    /// A managed root with the Android app's runtime and its prefix
+    /// template, and its mutation lease.
+    fn android_setup_fixture() -> (tempfile::TempDir, ManagedPaths, File) {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = ManagedPaths::prepare(fixture.path()).unwrap();
+        app_runtime_fixture(fixture.path());
+        app_prefix_template_fixture(fixture.path());
+        let lease = fixture_lease(fixture.path());
+        (fixture, paths, lease)
+    }
+
+    /// A prefix kept from an earlier release (FEX 0.2.x): Wine's hives
+    /// without `UseEGL`, and the game. Returns the game's `Game.exe`.
+    fn kept_app_prefix(root: &Path) -> PathBuf {
+        let prefix = initialized_prefix_fixture(root);
+        let game = prefix.join("drive_c/Program Files (x86)/Diablo II/Game.exe");
+        fs::create_dir_all(game.parent().unwrap()).unwrap();
+        fs::write(&game, b"game").unwrap();
+        game
+    }
+
+    #[test]
+    fn an_abandoned_app_prefix_is_made_again_from_the_template() {
+        let (fixture, paths, lease) = android_setup_fixture();
+        let root = fixture.path();
+        // Wine never finished it: no hive, no game and no saves.
+        let leftover = root.join("prefix/drive_c/windows/leftover.dll");
+        fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+        fs::write(&leftover, b"MZ").unwrap();
+        let host = Arc::new(RecordingHost::default());
+        let control = OperationControl::default();
+        let parts = reported_parts(&control);
+        ProductionInstallDriver::new(host.clone())
+            .on_android_host(true)
+            .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+            .unwrap();
+        // The template's copy, with the XInput bridge and the .NET link.
+        let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+        assert!(!leftover.exists());
+        for hive in ["system.reg", "user.reg", "userdef.reg"] {
+            assert_eq!(
+                fs::read(root.join("prefix").join(hive)).unwrap(),
+                fs::read(template.join(hive)).unwrap()
+            );
+        }
+        assert!(root.join(XINPUT_BRIDGE_PATH).is_file());
+        assert_eq!(
+            fs::read_link(root.join(crate::runtime::APP_DOTNET_LINK)).unwrap(),
+            Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
+        );
+        // Wine ran for the WPF value alone: the copy has `UseEGL` "N", and
+        // its "disable" keeps Wine's update away.
+        let requests = host.requests.lock().unwrap();
+        let wine = requests
+            .iter()
+            .filter(|request| request.executable == Path::new("/proc/self/fd/230"))
+            .collect::<Vec<_>>();
+        assert_eq!(wine.len(), 1);
+        assert!(
+            wine[0]
+                .arguments
+                .ends_with(&wpf_software_rendering_arguments(true))
+        );
+        let planned = [EnvironmentPart::Windows];
+        assert_eq!(
+            *parts.lock().unwrap(),
+            [EnvironmentProgress::new(EnvironmentPart::Windows, &planned)]
+        );
+    }
+
+    #[test]
+    fn a_kept_app_prefix_stays_and_gets_glx_and_the_dotnet_link() {
+        let (fixture, paths, lease) = android_setup_fixture();
+        let root = fixture.path();
+        let game = kept_app_prefix(root);
+        let host = Arc::new(RecordingHost::default());
+        let control = OperationControl::default();
+        let parts = reported_parts(&control);
+        ProductionInstallDriver::new(host.clone())
+            .on_android_host(true)
+            .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+            .unwrap();
+        // Kept as it is: its own hives and the game, no copy of the template.
+        assert_eq!(
+            fs::read(root.join("prefix/system.reg")).unwrap(),
+            b"WINE REGISTRY"
+        );
+        assert_eq!(fs::read(&game).unwrap(), b"game");
+        assert!(!root.join(XINPUT_BRIDGE_PATH).exists());
+        // Wine's update for the app's Wine (another Wine updated the prefix
+        // last), as before any Wine program there, and then `reg add` for
+        // `UseEGL` "N", which its user.reg lacks. No WPF value: only a new
+        // prefix gets it here.
+        let requests = host.requests.lock().unwrap();
+        let wine = requests
+            .iter()
+            .filter(|request| request.executable == Path::new("/proc/self/fd/230"))
+            .map(|request| request.arguments.clone())
+            .collect::<Vec<_>>();
+        let loader = loader_arguments(InstalledRuntime::App);
+        assert_eq!(
+            wine,
+            [
+                [loader.clone(), vec!["wineboot".into(), "-u".into()]].concat(),
+                [loader, vec!["reg".into()], x11_glx_arguments()].concat(),
+            ]
+        );
+        assert_eq!(
+            fs::read_link(root.join(crate::runtime::APP_DOTNET_LINK)).unwrap(),
+            Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
+        );
+        assert!(parts.lock().unwrap().is_empty());
+    }
+
+    /// Records the arguments of every request. The first `reg` runs until
+    /// the player's stop, which comes while it runs (`stop`), or exits with
+    /// 1 (no `stop`).
+    struct RegHost {
+        stop: Option<OperationControl>,
+        stopped: AtomicBool,
+        requests: Mutex<Vec<Vec<OsString>>>,
+    }
+
+    impl RegHost {
+        fn new(stop: Option<OperationControl>) -> Self {
+            Self {
+                stop,
+                stopped: AtomicBool::new(false),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HostExecution for RegHost {
+        fn spawn(&self, request: ProcessRequest) -> io::Result<Box<dyn SupervisedProcess>> {
+            let arguments = request.arguments().to_vec();
+            let reg = arguments.contains(&OsString::from("reg"));
+            self.requests.lock().unwrap().push(arguments);
+            if !reg || self.stopped.swap(true, Ordering::AcqRel) {
+                return Ok(Box::new(CompleteProcess));
+            }
+            match &self.stop {
+                Some(control) => {
+                    control.request_cancel();
+                    Ok(Box::new(CancelProcess {
+                        state: Arc::default(),
+                    }))
+                }
+                None => Ok(Box::new(FailedProcess)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_stop_during_reg_add_ends_the_setup_safely_and_the_next_one_finishes_the_prefix() {
+        let (fixture, paths, lease) = android_setup_fixture();
+        let root = fixture.path();
+        let game = kept_app_prefix(root);
+        let link = root.join(crate::runtime::APP_DOTNET_LINK);
+        // The player's stop during the `reg add` for `UseEGL`: the setup
+        // ends there, proven safe, and the prefix stays.
+        let control = OperationControl::default();
+        let host = Arc::new(RegHost::new(Some(control.clone())));
+        let driver = ProductionInstallDriver::new(host.clone()).on_android_host(true);
+        assert!(
+            driver
+                .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+                .is_err()
+        );
+        assert!(host.stopped.load(Ordering::Acquire));
+        assert_eq!(
+            control.cancellation_safety(),
+            crate::operation::CancellationSafety::ProvenSafe
+        );
+        assert_eq!(fs::read(&game).unwrap(), b"game");
+        assert!(fs::symlink_metadata(&link).is_err());
+        // The next setup sets it and makes the link: nothing was lost.
+        let host = Arc::new(RecordingHost::default());
+        ProductionInstallDriver::new(host.clone())
+            .on_android_host(true)
+            .provision_runtime(
+                &paths,
+                None,
+                PrefixArtifacts::default(),
+                &lease,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert!(
+            host.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.arguments.ends_with(&x11_glx_arguments()))
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
+        );
+        assert_eq!(fs::read(&game).unwrap(), b"game");
+    }
+
+    #[test]
+    fn a_failed_reg_add_without_a_stop_does_not_fail_the_setup() {
+        let (fixture, paths, lease) = android_setup_fixture();
+        let root = fixture.path();
+        let game = kept_app_prefix(root);
+        let host = Arc::new(RegHost::new(None));
+        // Without `UseEGL` "N" the game still draws, through EGL.
+        ProductionInstallDriver::new(host.clone())
+            .on_android_host(true)
+            .provision_runtime(
+                &paths,
+                None,
+                PrefixArtifacts::default(),
+                &lease,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert!(host.stopped.load(Ordering::Acquire));
+        assert_eq!(
+            fs::read_link(root.join(crate::runtime::APP_DOTNET_LINK)).unwrap(),
+            Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
+        );
+        assert_eq!(fs::read(&game).unwrap(), b"game");
+    }
+
+    #[test]
+    fn the_box64_settings_go_only_to_the_programs_they_name_and_never_on_the_desktop() {
+        // The Launcher's Box64 settings in a request, by name. A name this
+        // test's own environment sets is left out: on Android its value
+        // reaches every Wine process.
+        let own = env::vars_os()
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        let launcher = |name: &&(&str, &str)| !own.contains(OsStr::new(name.0));
+        let box64 = |request: &RequestSnapshot| {
+            BOX64_INSTALLER_ENVIRONMENT
+                .iter()
+                .chain(&BOX64_LAUNCHER_ENVIRONMENT)
+                .filter(launcher)
+                .filter_map(|(name, _)| {
+                    let value = environment_value(request, name)?.to_str()?.to_owned();
+                    Some((*name, value))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let expected = |environment: &[(&'static str, &str)]| {
+            environment
+                .iter()
+                .filter(launcher)
+                .map(|(name, value)| (*name, (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        for android in [true, false] {
+            let (fixture, paths) = managed_paths_with_runtime();
+            app_runtime_fixture(fixture.path());
+            initialized_prefix_fixture(fixture.path());
+            let project = paths.game().join("ProjectD2");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
+            let lease = fixture_lease(fixture.path());
+            let host = Arc::new(RecordingHost::default());
+            let driver = ProductionInstallDriver::new(host.clone()).on_android_host(android);
+            // PD2's installer, then the official launcher, each with the
+            // other Wine runs around it (`reg`, Wine's update, `wineserver`).
+            let bootstrap = verified_test_artifact(
+                ArtifactKind::ClientBootstrap,
+                fixture.path().join("ProjectD2Installer.exe"),
+            );
+            let _ = driver.install_client_bootstrap(
+                &paths,
+                &bootstrap,
+                &lease,
+                &OperationControl::default(),
+            );
+            driver
+                .run_official_launcher(fixture.path(), &lease, &OperationControl::default())
+                .unwrap();
+            let requests = host.requests.lock().unwrap();
+            let (mut installer, mut launcher) = (0, 0);
+            for request in requests.iter() {
+                let named = if request.arguments.contains(&OsString::from("/VERYSILENT")) {
+                    installer += 1;
+                    expected(&BOX64_INSTALLER_ENVIRONMENT)
+                } else if request
+                    .arguments
+                    .ends_with(&[OsString::from(OFFICIAL_LAUNCHER)])
+                {
+                    launcher += 1;
+                    expected(&BOX64_LAUNCHER_ENVIRONMENT)
+                } else {
+                    BTreeMap::new()
+                };
+                let want = if android { named } else { BTreeMap::new() };
+                assert_eq!(
+                    box64(request),
+                    want,
+                    "android {android}: {:?}",
+                    request.arguments
+                );
+            }
+            assert_eq!((installer, launcher), (1, 1), "android {android}");
+            assert!(requests.len() > 2, "the other runs were seen");
         }
     }
 
@@ -11062,6 +11971,40 @@ mod tests {
                 .iter()
                 .all(|request| !request.arguments.contains(&OsString::from("wineboot")))
         );
+    }
+
+    #[test]
+    fn a_disabled_prefix_update_holds_only_on_the_app_runtime() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let prefix = initialized_prefix_fixture(fixture.path());
+        app_runtime_fixture(fixture.path());
+        let share = paths.runtime().join("share/wine");
+        fs::create_dir_all(&share).unwrap();
+        fs::write(share.join("wine.inf"), b"[version]").unwrap();
+        let lease = fixture_lease(fixture.path());
+        // Whether `wineboot -u` ran before the next Wine program, with
+        // `timestamp` in the prefix's `.update-timestamp`.
+        let updated = |runtime: InstalledRuntime, timestamp: &str| {
+            fs::write(prefix.join(".update-timestamp"), timestamp).unwrap();
+            let host = Arc::new(RecordingHost::default());
+            ProductionInstallDriver::new(host.clone())
+                .update_prefix_for_runtime(&paths, runtime, &lease, &OperationControl::default())
+                .unwrap();
+            let wineboot = [OsString::from("wineboot"), OsString::from("-u")];
+            host.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.arguments.ends_with(&wineboot))
+        };
+        // The Android app's prefix template: its runtime never updates it,
+        // although it would update a prefix another Wine updated last.
+        assert!(!updated(InstalledRuntime::App, "disable\n"));
+        assert!(updated(InstalledRuntime::App, "1\n"));
+        // The desktop's runtime updates the prefix whatever the file says.
+        let desktop = InstalledRuntime::BuiltIn(managed_runtime());
+        assert!(updated(desktop, "disable\n"));
+        assert!(updated(desktop, "1\n"));
     }
 
     #[test]
@@ -11475,6 +12418,79 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_gets_glx_once_and_a_user_reg_that_has_it_is_left_alone() {
+        let (fixture, paths) = managed_paths_with_runtime();
+        let lease = fixture_lease(fixture.path());
+        let prefix = fixture.path().join("prefix");
+        fs::create_dir_all(&prefix).unwrap();
+        // A prefix kept from FEX 0.2.x: an X11 driver section without it.
+        fs::write(
+            prefix.join("user.reg"),
+            "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\X11 Driver] 1792400000\n\"Decorated\"=\"N\"\n",
+        )
+        .unwrap();
+        let host = Arc::new(RecordingHost::default());
+        let driver = ProductionInstallDriver::new(host.clone());
+        let runtime = driver.installed_runtime(&paths);
+        driver
+            .sync_x11_glx(&paths, runtime, &lease, &OperationControl::default())
+            .unwrap();
+        let ran = {
+            let requests = host.requests.lock().unwrap();
+            let reg = requests
+                .iter()
+                .filter(|request| request.arguments.ends_with(&x11_glx_arguments()))
+                .count();
+            assert_eq!(reg, 1);
+            requests.len()
+        };
+        // Once it is there (Wine wrote it, or the template had it): no Wine.
+        fs::write(
+            prefix.join("user.reg"),
+            "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\X11 Driver] 1792400000\n\"UseEGL\"=\"N\"\n",
+        )
+        .unwrap();
+        driver
+            .sync_x11_glx(&paths, runtime, &lease, &OperationControl::default())
+            .unwrap();
+        assert_eq!(host.requests.lock().unwrap().len(), ran);
+    }
+
+    #[test]
+    fn glx_is_seen_only_in_the_x11_driver_section() {
+        assert_eq!(
+            x11_glx_arguments(),
+            [
+                "add",
+                r"HKCU\Software\Wine\X11 Driver",
+                "/v",
+                "UseEGL",
+                "/t",
+                "REG_SZ",
+                "/d",
+                "N",
+                "/f"
+            ]
+            .map(OsString::from)
+        );
+        let section = "[Software\\\\Wine\\\\X11 Driver] 1792400000\n#time=1dc5f\n";
+        assert!(x11_glx_set(&format!("{section}\"UseEGL\"=\"N\"\n")));
+        // Key names in any case; a line end of Windows' kind.
+        assert!(x11_glx_set(
+            "[software\\\\wine\\\\x11 driver] 1\r\n\"UseEGL\"=\"N\"\r\n"
+        ));
+        assert!(!x11_glx_set(""));
+        assert!(!x11_glx_set(&format!("{section}\"UseEGL\"=\"Y\"\n")));
+        // The same value under another key is not it.
+        assert!(!x11_glx_set(
+            "[Software\\\\Wine\\\\AppDefaults\\\\x.exe\\\\X11 Driver] 1\n\"UseEGL\"=\"N\"\n"
+        ));
+        assert!(!x11_glx_set(&format!(
+            "{section}\n[Software\\\\Wine\\\\Direct3D] 1\n\"UseEGL\"=\"N\"\n"
+        )));
+    }
+
+    #[test]
     fn builtin_dependency_receipts_need_the_pinned_installer_and_its_tree() {
         let fixture = tempfile::tempdir().unwrap();
         let paths = ManagedPaths::prepare(fixture.path()).unwrap();
@@ -11727,6 +12743,22 @@ mod tests {
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         }
         (fixture, paths)
+    }
+
+    /// The Android app's runtime in the managed root `root`: its `wine`,
+    /// its `wineserver` and its `wine.inf`.
+    fn app_runtime_fixture(root: &Path) {
+        let runtime = root
+            .join("runner")
+            .join(crate::runtime::APP_RUNTIME_DIRECTORY);
+        fs::create_dir_all(runtime.join("bin")).unwrap();
+        for program in ["wine", "wineserver"] {
+            let path = runtime.join("bin").join(program);
+            fs::write(&path, b"fixture").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(runtime.join("share/wine")).unwrap();
+        fs::write(runtime.join("share/wine/wine.inf"), b"[version]").unwrap();
     }
 
     fn fixture_lease(root: &Path) -> File {

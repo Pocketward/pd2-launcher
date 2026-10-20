@@ -4918,7 +4918,7 @@ dependencies = [
 
 [[package]]
 name = "pd2-launcher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "backhand",
  "command-fds",

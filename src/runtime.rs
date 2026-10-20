@@ -182,6 +182,26 @@ fn builtin_receipt_present(root: &crate::safe_fs::Directory, runtime: &ManagedRu
 /// Wine reports Windows 10, whose layout the 1.14d Fog.dll rejects.
 const CUSTOM_WINDOWS_VERSION: &str = "win7";
 
+/// Runner directory of the Android app's runtime: an ARM64 Wine 11.0 in
+/// WoW64 mode, whose 32-bit x86 code Box64's `wowbox64.dll` runs. The app
+/// unpacks it there from its APK (made for its own data folder, so it has no
+/// pinned digest) and replaces it with each new app version; the Launcher
+/// never downloads it.
+pub(crate) const APP_RUNTIME_DIRECTORY: &str = "wine-11.0-arm64";
+/// Player-facing name of the Android app's runtime.
+pub(crate) const APP_RUNTIME_DISPLAY_NAME: &str = "Wine 11.0";
+/// Exact `wine --version` output of the Android app's runtime.
+pub(crate) const APP_RUNTIME_VERSION: &str = "wine-11.0";
+/// The prefix the Android app's runtime starts from, in the managed root: a
+/// copy of it becomes a new prefix (the app makes it with the same Wine, so
+/// no `wineboot` runs on the phone). Game.exe already runs as Windows 7 in it.
+pub(crate) const APP_PREFIX_TEMPLATE: &str = "runner/wine-11.0-arm64-prefix";
+/// The link a prefix of the Android app's runtime reaches the app's x86
+/// .NET runtime (the official PD2 launcher's) by, and its target, relative
+/// to the link's folder: `runner/dotnet-6.0.36-x86` in the managed root.
+pub(crate) const APP_DOTNET_LINK: &str = "prefix/drive_c/Program Files (x86)/dotnet";
+pub(crate) const APP_DOTNET_LINK_TARGET: &str = "../../../runner/dotnet-6.0.36-x86";
+
 /// The runtime an installation actually uses: the row's pinned runtime, or a
 /// runtime installed from a custom source. A custom runtime is
 /// used only while the Wine download source is custom; with the built-in
@@ -191,6 +211,9 @@ const CUSTOM_WINDOWS_VERSION: &str = "win7";
 pub(crate) enum InstalledRuntime {
     BuiltIn(&'static ManagedRuntime),
     Custom,
+    /// The Android app's runtime ([`APP_RUNTIME_DIRECTORY`]), the only one
+    /// an Android host runs.
+    App,
 }
 
 impl InstalledRuntime {
@@ -211,6 +234,9 @@ impl InstalledRuntime {
         builtin: &'static ManagedRuntime,
         retained: Option<&'static ManagedRuntime>,
     ) -> Self {
+        if crate::android_host() {
+            return Self::App;
+        }
         if custom_source && custom_receipt_present(root) {
             return Self::Custom;
         }
@@ -237,6 +263,7 @@ impl InstalledRuntime {
         match self {
             Self::BuiltIn(runtime) => runtime.identity,
             Self::Custom => CUSTOM_RUNTIME_DIRECTORY,
+            Self::App => APP_RUNTIME_DIRECTORY,
         }
     }
 
@@ -245,14 +272,14 @@ impl InstalledRuntime {
     pub(crate) fn loader_name(self) -> &'static str {
         match self {
             Self::BuiltIn(runtime) => runtime.loader_name,
-            Self::Custom => "wine",
+            Self::Custom | Self::App => "wine",
         }
     }
 
     pub(crate) fn loader_takes_wine_path(self) -> bool {
         match self {
             Self::BuiltIn(runtime) => runtime.loader_takes_wine_path,
-            Self::Custom => false,
+            Self::Custom | Self::App => false,
         }
     }
 
@@ -260,6 +287,17 @@ impl InstalledRuntime {
         match self {
             Self::BuiltIn(runtime) => runtime.windows_version,
             Self::Custom => Some(CUSTOM_WINDOWS_VERSION),
+            // Its prefix template sets Game.exe's own version.
+            Self::App => None,
+        }
+    }
+
+    /// Player-facing name of this runtime.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::BuiltIn(runtime) => runtime.display_name,
+            Self::Custom => current().display_name,
+            Self::App => APP_RUNTIME_DISPLAY_NAME,
         }
     }
 }

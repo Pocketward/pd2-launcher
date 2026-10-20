@@ -31,8 +31,8 @@ mod adapters;
 pub(crate) use adapters::{
     InstallerMedia, ProductionArtifactSource, ProductionInstallDriver, UpdaterClientSynchronizer,
     XINPUT_BRIDGE_PATH, XINPUT_BRIDGE_SHA256, XINPUT_BRIDGE_SIZE, android_gl_probe_copy,
-    fex_strict_settings, gl_probe_helper, install_xinput_bridge, remove_wine_gecko_and_mono,
-    seed_verified_cache,
+    fex_strict_settings, gl_probe_helper, install_xinput_bridge, recorded_cache_names,
+    remove_wine_gecko_and_mono, seed_verified_cache,
 };
 
 /// A temporary authorization that deliberately cannot be cloned or serialized.
@@ -3165,15 +3165,15 @@ mod tests {
     }
 
     /// The Android host's audit, as `ProductionAuditor` reports it there:
-    /// the prefix needs the .NET Desktop Runtime (for the official PD2
-    /// launcher), and never Wine Gecko or Wine Mono, whatever the audit of
-    /// the prefix says.
+    /// the app provides the prefix's .NET Desktop Runtime (for the official
+    /// PD2 launcher), and the prefix never gets Wine Gecko or Wine Mono,
+    /// whatever the audit of the prefix says.
     fn android_audit(status: InstallationStatus, runtime: CheckStatus) -> InstallAudit {
         audit(status, runtime)
             .with_prefix_needs(PrefixNeeds {
                 gecko: true,
                 mono: true,
-                dotnet: true,
+                dotnet: false,
             })
             .with_android_host()
     }
@@ -3207,16 +3207,23 @@ mod tests {
             )
             .expect("downloads verified");
         // Download keeps Blizzard's wrappers, verified, and runs nothing: no
-        // Wine (the app provides it, and the .NET installer in the download
-        // cache), no downloader, and no Wine Gecko or Wine Mono.
+        // Wine (the app provides it, its prefix and the prefix's .NET), no
+        // downloader, and no Wine Gecko or Wine Mono. The readiness check
+        // counts no record of what the app provides there.
         assert_eq!(
             *source.acquisitions.borrow(),
             [
-                ArtifactKind::DotnetDesktop,
                 ArtifactKind::BaseGameWrapper,
                 ArtifactKind::ExpansionWrapper,
                 ArtifactKind::ClientBootstrap,
             ]
+        );
+        assert!(
+            source
+                .acquisitions
+                .borrow()
+                .iter()
+                .all(|kind| !crate::downloads::PROVIDED_ON_ANDROID.contains(kind))
         );
         assert!(driver.operations.borrow().is_empty());
         assert!(matches!(
