@@ -15,7 +15,12 @@
 # because it finds no tag yet or the tag's release is published with its files.
 #
 # Before it builds, a release fills and checks the mirror release of the files
-# its built-in FEX downloads (mirror-fex.yml, from the same commit).
+# its built-in FEX downloads (mirror-fex.yml, from the same commit), and makes
+# the build images of the commit unless the build-images release holds them
+# already (build-image.yml). Each build loads the image of its architecture
+# from that release, so it installs no packages and no toolchain. One
+# architecture that fails does not stop the other; run the failed job again,
+# and the release is published when both executables are there.
 name: Release
 
 on:
@@ -137,10 +142,22 @@ jobs:
       contents: write
     uses: ./.github/workflows/mirror-fex.yml
 
+  # The build image of each architecture for the commit that is built, made
+  # only when the build-images release does not hold it yet.
+  image:
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-image.yml
+    with:
+      ref: ${{ needs.tag.outputs.candidate == 'true' && needs.tag.outputs.commit || needs.tag.outputs.tag }}
+
   executable:
-    needs: [tag, mirror]
+    needs: [tag, mirror, image]
     if: needs.tag.outputs.tag != ''
     strategy:
+      fail-fast: false
       matrix:
         include:
           - architecture: aarch64
@@ -154,9 +171,33 @@ jobs:
         with:
           ref: ${{ needs.tag.outputs.candidate == 'true' && needs.tag.outputs.commit || needs.tag.outputs.tag }}
 
+      # The image build-image.yml made for this commit's image key, checked
+      # against its SHA-256; the build then checks the key in its label.
+      - name: Load the build image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          key=$(scripts/build-appimage-container.sh --image-key "$ARCHITECTURE")
+          file=pd2-build-image-$ARCHITECTURE-$key.tar.zst
+          work=$(mktemp -d)
+          gh release download build-images --repo "$GITHUB_REPOSITORY" --dir "$work" \
+            --pattern "$file" --pattern "$file.sha256"
+          for name in "$file" "$file.sha256"; do
+            [[ -f $work/$name ]] ||
+              { echo "::error::the release build-images holds no $name: run build-image.yml for this commit"; exit 1; }
+          done
+          (cd "$work" && sha256sum --check --strict "$file.sha256")
+          command -v zstd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
+          zstd -dc "$work/$file" | docker load
+          rm -rf "$work"
+
+      # The image is loaded: the build must not make one from the snapshot.
       - name: Build the release executable
         env:
           PD2_RELEASE_BUILD: 1
+          PD2_REQUIRE_BUILD_IMAGE: 1
           CONTAINER_ENGINE: docker
         run: scripts/build-appimage-container.sh dist ${{ matrix.architecture }} binary
 
@@ -167,7 +208,8 @@ jobs:
         with:
           name: executable-${{ matrix.architecture }}
           path: dist/pd2-launcher-*
-          retention-days: 1
+          # Long enough to run a failed architecture again and still publish.
+          retention-days: 7
           if-no-files-found: error
 
   publish:
@@ -186,6 +228,13 @@ jobs:
           pattern: executable-*
           path: dist
           merge-multiple: true
+
+      - name: Check that both executables are there
+        working-directory: dist
+        run: |
+          for a in x86_64 aarch64; do
+            compgen -G "pd2-launcher-*-$a" >/dev/null || { echo "::error::no $a executable"; exit 1; }
+          done
 
       - name: Check the SHA-256 files
         working-directory: dist

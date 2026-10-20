@@ -1121,7 +1121,9 @@ impl Coordinator {
                         self.snapshot.installation() == InstallationStatus::RepairRequired,
                     );
                 }
-                operation_succeeded
+                // A stop of the official launcher can accept the update it
+                // made, so the update check runs again, as after it closes.
+                (operation_succeeded || (kind == MutationKind::OfficialLauncher && stopped))
                     && self.snapshot.installation() != InstallationStatus::RepairRequired
             }
         }
@@ -4500,6 +4502,42 @@ mod tests {
         });
         assert!(backend.calls().contains(&"safe-stop"));
         assert_eq!(stopped.installation(), InstallationStatus::Ready);
+    }
+
+    #[test]
+    fn a_stopped_official_launcher_checks_for_an_update_again() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::Available);
+        harness
+            .intents
+            .send(Intent::OpenOfficialLauncher)
+            .expect("official launcher intent");
+        harness.wait_for(official_launcher_open);
+        // It installed that update, and the stop accepted it.
+        backend.state.lock().expect("state").update_status = UpdateStatus::UpToDate;
+        harness
+            .intents
+            .send(Intent::RequestSafeStop)
+            .expect("close official launcher");
+        let checked = harness.wait_for(|snapshot| {
+            snapshot.operation().is_some_and(|operation| {
+                operation.phase() == OperationPhase::OfficialLauncher
+                    && operation.status() == OperationStatusView::Cancelled
+            }) && snapshot.update() == UpdateStatus::UpToDate
+        });
+        assert_eq!(checked.installation(), InstallationStatus::Ready);
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| **call == "check-update")
+                .count(),
+            2
+        );
     }
 
     #[test]

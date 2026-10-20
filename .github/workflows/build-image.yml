@@ -1,0 +1,134 @@
+# The build images of the release executables. Each architecture's executable
+# is built in an ubuntu:22.04 image that holds the build packages from a dated
+# Ubuntu snapshot and the pinned Rust toolchain
+# (scripts/build-appimage-container.sh). This workflow makes that image once
+# per image key, a hash of everything that goes into it, and keeps it on this
+# repository's release build-images as
+# pd2-build-image-<architecture>-<key>.tar.zst (docker save, compressed with
+# zstd), beside its .sha256 file. An image key whose two files the release
+# holds already is never made again. A release build loads that image, so it
+# installs no packages and no toolchain.
+#
+# The release workflow calls it before it builds. It can also run by itself
+# (gh workflow run build-image.yml), but only once it is on main: GitHub
+# starts a workflow by hand only from the copy on the default branch. The
+# release is published (not a draft and not the latest release), so anyone
+# can download an image from it.
+name: Build image
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The branch, tag or commit whose build images to make (default the branch of the run)
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: The tag or commit whose build images to make
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+          - architecture: x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    concurrency:
+      group: build-image-${{ matrix.architecture }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      ARCHITECTURE: ${{ matrix.architecture }}
+      RELEASE: build-images
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # A key counts as present only when both of its files are uploaded and
+      # the .sha256 file names the digest GitHub gives for the image file.
+      # Anything else of that key is deleted, and the image is made again.
+      - name: Look for the build image on the release
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          key=$(scripts/build-appimage-container.sh --image-key "$ARCHITECTURE")
+          file=pd2-build-image-$ARCHITECTURE-$key.tar.zst
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          # The release, made once; the other architecture's job can make it at the same time.
+          if ! gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+            gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" --latest=false \
+              --target "$default_branch" --title "Build images" \
+              --notes "The ubuntu:22.04 build images of the release executables, one file for each image key (scripts/build-appimage-container.sh --image-key): zstd -dc <file> | docker load." ||
+              gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE")
+          asset() { jq -c --arg name "$1" '[.assets[] | select(.name == $name)] | first // empty' <<<"$release_json"; }
+          image_asset=$(asset "$file")
+          sum_asset=$(asset "$file.sha256")
+          present=false
+          if [[ -n $image_asset && -n $sum_asset ]] &&
+            [[ $(jq -r .state <<<"$image_asset") == uploaded && $(jq -r .state <<<"$sum_asset") == uploaded ]]; then
+            listed=$(gh release download "$RELEASE" --repo "$GITHUB_REPOSITORY" --pattern "$file.sha256" --output - |
+              cut -d' ' -f1)
+            digest=$(jq -r '.digest // empty' <<<"$image_asset")
+            if [[ -n $listed && $digest == "sha256:$listed" ]]; then
+              present=true
+              echo "$file is on the release $RELEASE, SHA-256 $listed"
+            fi
+          fi
+          if [[ $present != true ]]; then
+            for name in "$file" "$file.sha256"; do
+              if [[ -n $(asset "$name") ]]; then
+                gh release delete-asset "$RELEASE" "$name" --repo "$GITHUB_REPOSITORY" --yes
+                echo "deleted $name, which had no complete, matching pair"
+              fi
+            done
+          fi
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+
+      # Without the token: this step installs the snapshot's packages.
+      - name: Make the build image
+        if: steps.find.outputs.present != 'true'
+        env:
+          CONTAINER_ENGINE: docker
+          FILE: ${{ steps.find.outputs.file }}
+        run: |
+          set -euo pipefail
+          command -v zstd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
+          image=$(scripts/build-appimage-container.sh --image "$ARCHITECTURE")
+          mkdir -p "$RUNNER_TEMP/build-image"
+          cd "$RUNNER_TEMP/build-image"
+          docker save "$image" | zstd -T0 -10 -q -o "$FILE"
+          sha256sum "$FILE" > "$FILE.sha256"
+          echo "$ARCHITECTURE: $FILE, $(stat -c %s "$FILE") bytes, image ID $(docker image inspect --format '{{.Id}}' "$image")" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the build image
+        if: steps.find.outputs.present != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILE: ${{ steps.find.outputs.file }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/build-image"
+          # A later run counts the pair only when both files are there and agree.
+          gh release upload "$RELEASE" "$FILE" "$FILE.sha256" --repo "$GITHUB_REPOSITORY"

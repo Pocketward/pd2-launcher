@@ -8,7 +8,7 @@ set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 output_directory=${1:-"$repository_root/dist"}
-package_version=0.1.5
+package_version=0.1.6
 architecture=${PD2_TARGET_ARCHITECTURE:-$(uname -m)}
 case "$architecture" in
   aarch64) cargo_features= ;;
@@ -114,6 +114,8 @@ release_build=$([[ -n "${PD2_RELEASE_BUILD:-}" ]] && echo 1 || echo 0)
 package_identity=$package_identity
 required_glibc=$required_glibc
 rustc=$(rustc --version)
+build_image=${PD2_BUILD_IMAGE:-none}
+build_image_id=${PD2_BUILD_IMAGE_ID:-none}
 EVIDENCE
 
 echo "standalone launcher audit passed (requires GLIBC_$required_glibc)"

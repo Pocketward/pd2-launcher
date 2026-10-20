@@ -57,9 +57,10 @@ fn same_file_identity(recorded: (u64, u64), now: (u64, u64), filesystem_unstable
 }
 
 /// The directories above the Launcher home that may be opened search-only
-/// (`O_PATH`) when a read-only open of them is refused: on the Android host
-/// an app may search `/`, `/data` and `/data/data` but not list them. Unset
-/// elsewhere, so every directory open stays as it is.
+/// (`O_PATH`): `/` at once, the others when a read-only open of them is
+/// refused. On the Android host an app may search `/`, `/data` and
+/// `/data/data` but not list them. Unset elsewhere, so every directory open
+/// stays as it is.
 static SEARCH_ONLY_ANCESTORS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 #[cfg(test)]
@@ -261,24 +262,23 @@ impl Directory {
     }
 
     fn root(search_only: &[PathBuf]) -> io::Result<Self> {
-        let open = |flags| {
+        // A search-only `/` (the Android host's) is opened `O_PATH` at once:
+        // SELinux refuses a read-only open of it there, and logs a denial
+        // for each.
+        let flags = if search_only
+            .iter()
+            .any(|ancestor| ancestor == Path::new("/"))
+        {
+            OFlags::PATH
+        } else {
+            OFlags::RDONLY
+        };
+        let directory = File::from(
             rustix::fs::open(
                 "/",
                 flags | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-        };
-        let directory = File::from(
-            match open(OFlags::RDONLY) {
-                Err(rustix::io::Errno::ACCESS)
-                    if search_only
-                        .iter()
-                        .any(|ancestor| ancestor == Path::new("/")) =>
-                {
-                    open(OFlags::PATH)
-                }
-                result => result,
-            }
             .map_err(io::Error::from)?,
         );
         validate_directory(&directory)?;
@@ -2838,6 +2838,25 @@ mod tests {
                 .unwrap();
             assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{path:?}");
         }
+    }
+
+    #[test]
+    fn a_search_only_root_is_opened_o_path_at_once() {
+        let search_only = |directory: &Directory| {
+            rustix::fs::fcntl_getfl(&directory.0)
+                .unwrap()
+                .contains(OFlags::PATH)
+        };
+        // The Android host: "/" is an ancestor of the home. This host could
+        // read it, so `O_PATH` shows that no read-only open came first.
+        let home = Path::new("/data/user/0/app/files/launcher");
+        let root = Directory::root(&home_ancestors(home)).unwrap();
+        assert!(search_only(&root));
+        let temporary = tempfile::tempdir().unwrap();
+        let below = absolute_relative(temporary.path()).unwrap();
+        assert!(root.open_directory(below).is_ok());
+        // Elsewhere "/" is opened read-only, as before.
+        assert!(!search_only(&Directory::root(&[]).unwrap()));
     }
 
     #[test]

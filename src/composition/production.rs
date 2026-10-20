@@ -67,7 +67,8 @@ use crate::{
         UpdateTransactionProbe,
     },
     update::{
-        GameActivity, PrefetchedPd2Source, ProtectedInventoryEvidence, UpdateError, VerifiedUpdater,
+        GameActivity, ManifestOnlyPd2Source, PrefetchedPd2Source, ProtectedInventoryEvidence,
+        UpdateError, VerifiedUpdater,
     },
 };
 
@@ -1516,19 +1517,9 @@ impl ReadyBackend {
             {
                 let _ = record_official_launcher(&root);
             }
-            if cancellation.is_requested() {
-                return Err(backend_failure(
-                    if cancellation.cancellation_safety()
-                        == crate::operation::CancellationSafety::ProvenSafe
-                    {
-                        "operation-cancelled"
-                    } else {
-                        "operation-indeterminate"
-                    },
-                ));
-            }
-            session.map_err(|_| backend_failure("official-launcher-failed"))?;
-            self.reconcile_official_client(&activity, &root, &lease, cancellation)?;
+            after_official_launcher(session, cancellation, |files, control| {
+                self.reconcile_official_client(&activity, &root, &lease, files, control)
+            })?;
             activity.progress(WorkPhase::Verification, None, None, None)
         })();
         activity.defer(&result)?;
@@ -1537,13 +1528,20 @@ impl ReadyBackend {
 
     /// The official launcher may have synchronized the client to a newer
     /// manifest. Under the same lease, the verified updater then accepts
-    /// that manifest (downloading only objects that still differ), so Ready
-    /// is re-established from evidence instead of lost to a stale manifest.
+    /// that manifest, so Ready is re-established from evidence instead of
+    /// lost to a stale manifest. With [`OfficialClientFiles::Download`] it
+    /// refreshes the client cache and downloads only objects that still
+    /// differ. With [`OfficialClientFiles::InstalledOnly`] it fetches only
+    /// the manifest, in one try, and leaves the cache as it is: a client the
+    /// launcher updated only in part is not accepted, and it and its record
+    /// stay as they are. Only an updater result reported as indeterminate
+    /// is `operation-indeterminate`, for Repair.
     fn reconcile_official_client(
         &self,
         activity: &ActiveDiagnostic<'_>,
         root: &Directory,
         lease: &InstallationMutationLease,
+        files: OfficialClientFiles,
         cancellation: &CancellationToken,
     ) -> Result<(), BackendFailure> {
         let audit = self.auditor.audit_report_with_lease(
@@ -1569,18 +1567,43 @@ impl ReadyBackend {
         let transaction_id = format!("official-{}-{sequence}", std::process::id());
         let mut source = self.updater_source()?;
         let layout = self.update_layout(root)?;
-        refresh_client_cache(root, &layout, &mut *source, cancellation)
-            .and_then(|cache| {
-                let mut cached = PrefetchedPd2Source::new(&mut *source, Some(cache));
-                VerifiedUpdater::with_layout(layout, &mut cached).apply_controlled(
-                    &transaction_id,
-                    GameActivity::Idle,
-                    ProtectedInventoryEvidence::Complete,
-                    cancellation,
-                )
+        let applied = match files {
+            OfficialClientFiles::Download => {
+                refresh_client_cache(root, &layout, &mut *source, cancellation).and_then(|cache| {
+                    let mut cached = PrefetchedPd2Source::new(&mut *source, Some(cache));
+                    VerifiedUpdater::with_layout(layout, &mut cached).apply_controlled(
+                        &transaction_id,
+                        GameActivity::Idle,
+                        ProtectedInventoryEvidence::Complete,
+                        cancellation,
+                    )
+                })
+            }
+            OfficialClientFiles::InstalledOnly => {
+                // A failure only keeps what is there, so one try is enough.
+                let mut installed = ManifestOnlyPd2Source::new(&mut *source);
+                let applied = VerifiedUpdater::with_layout(layout, &mut installed)
+                    .with_retry_policy(crate::network::RetryPolicy::once())
+                    .apply_controlled(
+                        &transaction_id,
+                        GameActivity::Idle,
+                        ProtectedInventoryEvidence::Complete,
+                        cancellation,
+                    );
+                eprintln!(
+                    "pd2-launcher: official launcher stopped: {}",
+                    stopped_client_outcome(&applied, installed.refused_a_file())
+                );
+                applied
+            }
+        };
+        applied.map(drop).map_err(|error| {
+            backend_failure(if update_indeterminate(&error) {
+                "operation-indeterminate"
+            } else {
+                "client-reconcile-failed"
             })
-            .map(drop)
-            .map_err(|_| backend_failure("client-reconcile-failed"))
+        })
     }
 
     /// Choose where the Managed installation lives. Holds the
@@ -3014,6 +3037,89 @@ pub(super) fn portable_identity(artifact: LauncherArtifactEvidence) -> Option<&'
     }
 }
 
+/// Which client files accepting the official launcher's update may use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OfficialClientFiles {
+    /// After its session ended by itself: the files that still differ are
+    /// downloaded.
+    Download,
+    /// After a stop: only the files already installed, with nothing
+    /// downloaded.
+    InstalledOnly,
+}
+
+/// What follows the official launcher's session, which ran under the job's
+/// control `cancellation`. After a session that ended by itself, `reconcile`
+/// accepts the client it updated with [`OfficialClientFiles::Download`],
+/// under that control. Only a stop proven safe (the launcher and everything
+/// it started have ended) lets `reconcile` accept the installed files
+/// ([`OfficialClientFiles::InstalledOnly`]), under a control of its own, as
+/// the job's is cancelled. The job then still ends as stopped, except when
+/// the protected-file inventory kept the client from being accepted or the
+/// outcome cannot be proven.
+fn after_official_launcher(
+    session: Result<(), AdapterFailure>,
+    cancellation: &CancellationToken,
+    reconcile: impl FnOnce(OfficialClientFiles, &CancellationToken) -> Result<(), BackendFailure>,
+) -> Result<(), BackendFailure> {
+    if !cancellation.is_requested() {
+        session.map_err(|_| backend_failure("official-launcher-failed"))?;
+        return reconcile(OfficialClientFiles::Download, cancellation);
+    }
+    if cancellation.cancellation_safety() != crate::operation::CancellationSafety::ProvenSafe {
+        return Err(backend_failure("operation-indeterminate"));
+    }
+    // The job's control still shows progress: the check of the client.
+    cancellation.report(crate::operation::WorkProgress::for_phase(
+        WorkPhase::Verification,
+    ));
+    Err(
+        match reconcile(
+            OfficialClientFiles::InstalledOnly,
+            &CancellationToken::default(),
+        ) {
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "official-client-not-reconciled" | "operation-indeterminate"
+                ) =>
+            {
+                error
+            }
+            _ => backend_failure("operation-cancelled"),
+        },
+    )
+}
+
+/// An update that stopped where its outcome cannot be proven: Repair
+/// resolves it.
+fn update_indeterminate(error: &UpdateError) -> bool {
+    matches!(
+        error,
+        UpdateError::Indeterminate
+            | UpdateError::Transaction(crate::transaction::TransactionError::Indeterminate)
+    )
+}
+
+/// The engine log's words on the client after the official launcher was
+/// stopped. `refused`: an installed file differed from the manifest.
+fn stopped_client_outcome(
+    applied: &Result<crate::update::ApplyOutcome, UpdateError>,
+    refused: bool,
+) -> String {
+    match applied {
+        Ok(_) => "client accepted, nothing downloaded".to_owned(),
+        Err(error) if update_indeterminate(error) => {
+            format!("client not accepted: indeterminate ({error})")
+        }
+        Err(_) if refused => {
+            "client not accepted: partial (a file differs from the current release)".to_owned()
+        }
+        Err(UpdateError::Network(error)) => format!("client not accepted: offline ({error})"),
+        Err(error) => format!("client not accepted: {error}"),
+    }
+}
+
 /// The official launcher runs the audited runtime in the audited prefix: the
 /// game must be installed (Ready, or only the client out of date) with the
 /// runtime and prefix accepted and no launch or transaction in the way.
@@ -4148,6 +4254,92 @@ mod tests {
 
         drop(first);
         assert!(InstallationMutationLease::acquire(&root).is_ok());
+    }
+
+    #[test]
+    fn the_official_launchers_session_end_picks_the_client_files_and_the_control() {
+        use crate::operation::{WorkProgress, progress_channel};
+        // It closed by itself: downloads, under the job's control.
+        let job = CancellationToken::default();
+        let mut used = None;
+        after_official_launcher(Ok(()), &job, |files, control| {
+            used = Some((files, std::ptr::eq(control, &job)));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(used, Some((OfficialClientFiles::Download, true)));
+        let failed = after_official_launcher(Err(AdapterFailure), &job, |_, _| {
+            unreachable!("a failed session takes no client")
+        });
+        assert_eq!(failed.unwrap_err().code(), "official-launcher-failed");
+
+        // A stop not proven safe: the launcher may still run.
+        for unproven in [false, true] {
+            let job = CancellationToken::default();
+            job.request_cancel();
+            if unproven {
+                job.mark_cancel_unproven();
+            }
+            let stopped = after_official_launcher(Ok(()), &job, |_, _| {
+                unreachable!("a stop not proven safe takes no client")
+            });
+            assert_eq!(stopped.unwrap_err().code(), "operation-indeterminate");
+        }
+
+        // A safe stop: the installed files only, under a control of its own
+        // that is not cancelled, while the job's control shows the check.
+        // The job ends as stopped, also when the client is not accepted.
+        for (reconciled, ends) in [
+            (Ok::<(), &'static str>(()), "operation-cancelled"),
+            (Err("client-reconcile-failed"), "operation-cancelled"),
+            (
+                Err("official-client-not-reconciled"),
+                "official-client-not-reconciled",
+            ),
+            (Err("operation-indeterminate"), "operation-indeterminate"),
+        ] {
+            let (publisher, progress) = progress_channel();
+            let job = CancellationToken::with_progress(publisher);
+            job.request_cancel();
+            job.mark_cancelled_safe();
+            let mut used = None;
+            let stopped = after_official_launcher(Err(AdapterFailure), &job, |files, control| {
+                used = Some((files, std::ptr::eq(control, &job), control.is_requested()));
+                reconciled.map_err(backend_failure)
+            });
+            assert_eq!(stopped.unwrap_err().code(), ends);
+            assert_eq!(
+                used,
+                Some((OfficialClientFiles::InstalledOnly, false, false))
+            );
+            assert_eq!(
+                progress.take_latest(),
+                Some(WorkProgress::for_phase(WorkPhase::Verification))
+            );
+        }
+    }
+
+    #[test]
+    fn the_engine_log_says_why_a_stopped_launchers_client_was_or_was_not_accepted() {
+        use crate::update::ApplyOutcome;
+        let accepted = Ok(ApplyOutcome::Applied {
+            downloaded: 0,
+            promoted: 0,
+            preserved: 1,
+        });
+        let offline = || {
+            Err(UpdateError::Network(
+                crate::network::NetworkError::transient("offline"),
+            ))
+        };
+        let indeterminate = Err(UpdateError::Transaction(
+            crate::transaction::TransactionError::Indeterminate,
+        ));
+        assert!(stopped_client_outcome(&accepted, false).starts_with("client accepted"));
+        assert!(stopped_client_outcome(&offline(), false).contains("offline"));
+        // A refused file is partial, though it fails as a network error.
+        assert!(stopped_client_outcome(&offline(), true).contains("partial"));
+        assert!(stopped_client_outcome(&indeterminate, true).contains("indeterminate"));
     }
 
     #[test]

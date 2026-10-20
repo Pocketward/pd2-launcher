@@ -105,6 +105,12 @@ impl<'a> VerifiedUpdater<'a> {
         self
     }
 
+    /// Fetches with `retry_policy` instead of the standard one.
+    pub(crate) fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
     /// Performs the read-only automatic check. It never stages or promotes.
     pub(crate) fn check(&mut self) -> Result<Pd2Manifest, UpdateError> {
         fetch_manifest(self.source, None, self.retry_policy)
@@ -893,6 +899,53 @@ impl Pd2Source for PrefetchedPd2Source<'_> {
     }
 }
 
+/// A PD2 source that serves the manifest and no client file. An update
+/// through it records the manifest only when every file the manifest names
+/// is already installed with its MD5 (a protected file, such as the official
+/// launcher's own, only present); with any other file it fails before the
+/// installed client or its record changes.
+pub(crate) struct ManifestOnlyPd2Source<'a> {
+    inner: &'a mut dyn Pd2Source,
+    refused: bool,
+}
+
+impl<'a> ManifestOnlyPd2Source<'a> {
+    pub(crate) fn new(inner: &'a mut dyn Pd2Source) -> Self {
+        Self {
+            inner,
+            refused: false,
+        }
+    }
+
+    /// Whether a client file was asked for: an installed one differs from
+    /// the manifest, or is missing.
+    pub(crate) const fn refused_a_file(&self) -> bool {
+        self.refused
+    }
+}
+
+impl Pd2Source for ManifestOnlyPd2Source<'_> {
+    fn client_base(&self) -> crate::manifest::Pd2ClientBase {
+        self.inner.client_base()
+    }
+
+    fn fetch_manifest(&mut self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        self.inner.fetch_manifest()
+    }
+
+    fn fetch_manifest_controlled(
+        &mut self,
+        control: &OperationControl,
+    ) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        self.inner.fetch_manifest_controlled(control)
+    }
+
+    fn open_object(&mut self, _request: &ObjectRequest) -> Result<ObjectResponse, NetworkError> {
+        self.refused = true;
+        Err(NetworkError::permanent("client files are not downloaded"))
+    }
+}
+
 fn append_response(
     output: &mut File,
     request: &ObjectRequest,
@@ -1637,6 +1690,156 @@ mod tests {
 
         assert_eq!(outcome, ApplyOutcome::NoOp);
         assert!(second.requests.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_only_source_accepts_a_complete_installed_client_and_nothing_less() {
+        // The record names the old client; the official launcher installed
+        // the new one, or only part of it before it was stopped.
+        let old: &[(&str, &[u8])] = &[("Game.exe", b"game"), ("ProjectDiablo.dll", b"dll")];
+        let new: &[(&str, &[u8])] = &[
+            ("Game.exe", b"new game"),
+            ("ProjectDiablo.dll", b"new dll"),
+            ("loot.filter", b"vendor default"),
+        ];
+        let installed = |files: &[(&str, &[u8])]| {
+            let project = TempDir::new().unwrap();
+            for (name, bytes) in files {
+                fs::write(project.path().join(name), bytes).unwrap();
+            }
+            fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+            fs::write(
+                project.path().join(".pd2launcher/accepted-manifest.json"),
+                manifest_body(old),
+            )
+            .unwrap();
+            project
+        };
+        let record = |project: &TempDir| {
+            fs::read(project.path().join(".pd2launcher/accepted-manifest.json")).unwrap()
+        };
+        // As after a stop: no client file is downloaded, and the manifest
+        // is fetched once.
+        fn stopped(
+            project: &TempDir,
+            source: &mut dyn Pd2Source,
+        ) -> (Result<ApplyOutcome, UpdateError>, bool) {
+            let mut installed = ManifestOnlyPd2Source::new(source);
+            let applied = VerifiedUpdater::new(project.path(), &mut installed)
+                .with_retry_policy(RetryPolicy::once())
+                .apply(
+                    "txn-stopped",
+                    GameActivity::Idle,
+                    ProtectedInventoryEvidence::Complete,
+                );
+            (applied, installed.refused_a_file())
+        }
+        let launcher_release: &[(&str, &[u8])] = &[
+            ("Game.exe", b"new game"),
+            ("ProjectDiablo.dll", b"new dll"),
+            ("loot.filter", b"my filter"),
+        ];
+
+        // Every file is the new one (the player's own filter stays): the
+        // new manifest is recorded, and nothing is downloaded or promoted.
+        let complete = installed(launcher_release);
+        let mut source = FakeSource::new(new);
+        let (applied, refused) = stopped(&complete, &mut source);
+        assert_eq!(
+            applied.unwrap(),
+            ApplyOutcome::Applied {
+                downloaded: 0,
+                promoted: 0,
+                preserved: 1,
+            }
+        );
+        assert!(!refused);
+        assert_eq!(record(&complete), source.manifest);
+        assert!(source.requests.is_empty());
+
+        // Not accepted, and nothing is downloaded, promoted or recorded: a
+        // file is still the old one, the player's filter (a protected file)
+        // is missing, or the server has a newer release than the one the
+        // launcher installed.
+        let one_old: &[(&str, &[u8])] = &[
+            ("Game.exe", b"new game"),
+            ("ProjectDiablo.dll", b"dll"),
+            ("loot.filter", b"my filter"),
+        ];
+        let no_filter: &[(&str, &[u8])] =
+            &[("Game.exe", b"new game"), ("ProjectDiablo.dll", b"new dll")];
+        let newer: &[(&str, &[u8])] = &[
+            ("Game.exe", b"newer game"),
+            ("ProjectDiablo.dll", b"new dll"),
+            ("loot.filter", b"vendor default"),
+        ];
+        for (case, files, server) in [
+            ("a file is old", one_old, new),
+            ("a protected file is missing", no_filter, new),
+            ("the server has a newer release", launcher_release, newer),
+        ] {
+            let project = installed(files);
+            let mut source = FakeSource::new(server);
+            let (applied, refused) = stopped(&project, &mut source);
+            assert!(applied.is_err() && refused, "{case}");
+            assert!(source.requests.is_empty(), "{case}");
+            assert_eq!(record(&project), manifest_body(old), "{case}");
+            for (name, bytes) in files {
+                assert_eq!(fs::read(project.path().join(name)).unwrap(), *bytes);
+            }
+        }
+
+        // Offline: one try, and nothing changes.
+        struct Offline(usize);
+        impl Pd2Source for Offline {
+            fn fetch_manifest(&mut self) -> Result<ManifestResponse, NetworkError> {
+                self.0 += 1;
+                Err(NetworkError::transient("offline"))
+            }
+            fn open_object(
+                &mut self,
+                _request: &ObjectRequest,
+            ) -> Result<ObjectResponse, NetworkError> {
+                unreachable!("no object is asked for without a manifest")
+            }
+        }
+        let project = installed(launcher_release);
+        let mut offline = Offline(0);
+        let (applied, refused) = stopped(&project, &mut offline);
+        assert!(matches!(applied, Err(UpdateError::Network(_))));
+        assert!(!refused);
+        assert_eq!(offline.0, 1, "the manifest is fetched once");
+        assert_eq!(record(&project), manifest_body(old));
+
+        // A file is still the old one: an update with downloads (Install
+        // Project Diablo 2) then gets only that file.
+        let partial = installed(one_old);
+        let mut source = FakeSource::new(new);
+        assert!(stopped(&partial, &mut source).0.is_err());
+        let outcome = VerifiedUpdater::new(partial.path(), &mut source)
+            .apply(
+                "txn-download",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Applied {
+                downloaded: 1,
+                promoted: 1,
+                preserved: 1,
+            }
+        );
+        assert_eq!(
+            source
+                .requests
+                .iter()
+                .map(|request| request.url.as_str())
+                .collect::<Vec<_>>(),
+            [object_url("ProjectDiablo.dll").as_str()]
+        );
+        assert_eq!(record(&partial), source.manifest);
     }
 
     #[test]

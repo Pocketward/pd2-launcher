@@ -47,6 +47,17 @@ impl RetryPolicy {
         }
     }
 
+    /// One attempt and no retry, for a fetch whose failure only keeps what
+    /// is there.
+    pub(crate) const fn once() -> Self {
+        Self {
+            max_attempts: 1,
+            max_elapsed: Duration::ZERO,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) const fn immediate_for_tests() -> Self {
         Self {
@@ -544,5 +555,9 @@ mod tests {
             Instant::now(),
             Some(&control)
         ));
+
+        let once = RetryPolicy::once();
+        assert_eq!(once.max_attempts(), 1);
+        assert!(!once.pause(0, None, Instant::now(), None));
     }
 }
