@@ -1,6 +1,6 @@
 [package]
 name = "pd2-launcher"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.98"
 repository = "https://github.com/Pocketward/pd2-launcher"
@@ -14,11 +14,13 @@ resolver = "3"
 backhand = { version = "=0.25.5", default-features = false, features = ["zstd"] }
 zstd = { version = "=0.13.3", default-features = false }
 command-fds = "=0.3.3"
-gpui-kit = "=0.6.6"
+gpui-kit = { version = "=0.6.6", optional = true }
 md-5 = "=0.10.6"
 rustix = { version = "=0.38.44", features = ["fs", "param", "process", "rand", "system"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+# preserve_order: a JSON object keeps the order of its keys (d2gl.json keeps
+# D2GL's own order), also in a build without the window, whose crates turn it on.
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 sha2 = "=0.10.9"
 tar = "=0.4.46"
 xz2 = { version = "=0.1.7", features = ["static"] }
@@ -26,13 +28,15 @@ zed-reqwest = { version = "=0.12.15-zed", features = ["blocking", "rustls-tls-na
 zeroize = "=1.9.0"
 
 [features]
-# Admit the native x86-64 host row. Without it, builds report the row's
-# diagnostics but keep the host Unsupported.
-x86_64-host-row = []
 # A release build: without the testing additions of a dev build (prefilled
 # CD keys, Wine's longer logs; src/dev_build.rs). The build scripts turn it on
 # for PD2_RELEASE_BUILD=1.
 release-build = []
+# The Launcher's window (GPUI), on by default. Without it the executable is
+# only the Android app's Launcher engine (--engine, --stop-wine,
+# --remove-downloads), and links no window library.
+gui = ["dep:gpui-kit"]
+default = ["gui"]
 
 [dev-dependencies]
 gpui-kit = { version = "=0.6.6", features = ["test-support"] }

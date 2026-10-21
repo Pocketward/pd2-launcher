@@ -128,35 +128,34 @@ pub(crate) fn first_d2gl_launch_pending(root: &Directory) -> bool {
         .is_ok_and(|folder| d2gl::configuration_absent(&folder))
 }
 
-pub(crate) use d2gl::{DisplaySeed, GraphicsProfile, pin_dlls as pin_d2gl_dlls};
+pub(crate) use d2gl::{D2glSetup, GraphicsProfile, pin_dlls as pin_d2gl_dlls};
 
 /// What a launch does to D2GL's configuration in the game `folder` before
-/// the game starts. A Glide launch on the `android` host starts only once
-/// `d2gl.json` names the DLLs PD2 ships ([`pin_d2gl_dlls`]). D2GL owns its
-/// configuration otherwise: the seed only replaces its untouched default
-/// size (on Android also the window size, the cursor and full-screen values
-/// and a changed graphics profile's values) and never blocks the launch. An
-/// absent configuration is still reported so the Launcher can explain
-/// D2GL's first launch.
+/// the game starts. On the desktop D2GL owns its configuration: the
+/// Launcher writes nothing and only reports an absent one, so it can explain
+/// D2GL's first launch. A Glide launch on the `android` host starts only
+/// once `d2gl.json` names the DLLs PD2 ships ([`pin_d2gl_dlls`]); then the
+/// Launcher writes the host's other values ([`d2gl::configure`]), which
+/// never blocks the launch. No host writes D2GL's window size.
 fn prepare_d2gl(
     folder: &Directory,
     options: GameLaunchOptions,
     android: bool,
-) -> Result<DisplaySeed, GameLaunchError> {
-    if android && options.renderer == GameRenderer::Glide {
+) -> Result<D2glSetup, GameLaunchError> {
+    if options.renderer != GameRenderer::Glide {
+        return Ok(D2glSetup::NotRequested);
+    }
+    if android {
         pin_d2gl_dlls(folder).map_err(|error| {
             eprintln!("pd2-launcher: game not started, d2gl.json may name other DLLs: {error}");
             GameLaunchError::LaunchPreflightFailed
         })?;
+        return Ok(d2gl::configure(folder, options.graphics_profile));
     }
-    Ok(match (options.renderer, options.display_size) {
-        (GameRenderer::Glide, Some((width, height))) => {
-            d2gl::seed(folder, width, height, options.graphics_profile)
-        }
-        (GameRenderer::Glide, None) if d2gl::configuration_absent(folder) => {
-            DisplaySeed::ConfigurationAbsent
-        }
-        _ => DisplaySeed::NotRequested,
+    Ok(if d2gl::configuration_absent(folder) {
+        D2glSetup::ConfigurationAbsent
+    } else {
+        D2glSetup::Unchanged
     })
 }
 
@@ -184,7 +183,6 @@ pub(crate) struct GameLaunchOptions {
     direct_draw_renderer: Option<&'static str>,
     skip_to_bnet: bool,
     sound_in_background: bool,
-    display_size: Option<(u32, u32)>,
     /// The Android app's D2GL graphics profile for this Play; none on the
     /// desktop.
     graphics_profile: Option<GraphicsProfile>,
@@ -197,7 +195,6 @@ impl Default for GameLaunchOptions {
             direct_draw_renderer: None,
             skip_to_bnet: true,
             sound_in_background: false,
-            display_size: None,
             graphics_profile: None,
         }
     }
@@ -210,7 +207,6 @@ impl GameLaunchOptions {
             direct_draw_renderer: None,
             skip_to_bnet,
             sound_in_background: false,
-            display_size: None,
             graphics_profile: None,
         }
     }
@@ -226,16 +222,8 @@ impl GameLaunchOptions {
         self
     }
 
-    /// Physical pixel size of the display the Launcher window is on. A Glide
-    /// launch uses it to seed D2GL's untouched default window size.
-    pub(crate) fn with_display_size(mut self, width: u32, height: u32) -> Self {
-        self.display_size = Some((width, height));
-        self
-    }
-
-    /// The D2GL graphics profile a Glide launch with a display size writes
-    /// into `d2gl.json` on the Android host when it is not the one last
-    /// applied.
+    /// The D2GL graphics profile a Glide launch writes into `d2gl.json` on
+    /// the Android host when it is not the one last applied.
     pub(crate) fn with_graphics_profile(mut self, profile: GraphicsProfile) -> Self {
         self.graphics_profile = Some(profile);
         self
@@ -375,7 +363,7 @@ impl GameSupervisor {
         &mut self,
         managed_root: &Path,
         options: GameLaunchOptions,
-    ) -> Result<DisplaySeed, GameLaunchError> {
+    ) -> Result<D2glSetup, GameLaunchError> {
         if self.active.is_some() {
             return Err(GameLaunchError::AlreadyRunning);
         }
@@ -416,7 +404,7 @@ impl GameSupervisor {
                 Err(error) => eprintln!("pd2-launcher: the G: drive was not linked: {error}"),
             }
         }
-        let display_seed = prepare_d2gl(&paths.folder, options, android_host())?;
+        let d2gl_setup = prepare_d2gl(&paths.folder, options, android_host())?;
         // How DirectDraw mode draws; a failure keeps PD2's own setting.
         if options.renderer == GameRenderer::DirectDraw
             && let Some(renderer) = options.direct_draw_renderer
@@ -452,7 +440,7 @@ impl GameSupervisor {
             _leases: leases,
         });
         self.state = GameState::Running;
-        Ok(display_seed)
+        Ok(d2gl_setup)
     }
 
     pub(crate) fn poll(&mut self) -> GameState {
@@ -1797,9 +1785,8 @@ mod tests {
         let config = game.path().join("ProjectD2/d2gl.json");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let folder = Directory::open(game.path()).unwrap();
-        let glide = GameLaunchOptions::default().with_display_size(1280, 960);
-        let direct_draw =
-            GameLaunchOptions::new(GameRenderer::DirectDraw, true).with_display_size(1280, 960);
+        let glide = GameLaunchOptions::default();
+        let direct_draw = GameLaunchOptions::new(GameRenderer::DirectDraw, true);
         let stored = || -> serde_json::Value {
             serde_json::from_slice(&fs::read(&config).unwrap()).unwrap()
         };
@@ -1807,18 +1794,23 @@ mod tests {
         fs::write(&config, PLANTED).unwrap();
         assert_eq!(
             prepare_d2gl(&folder, direct_draw, true),
-            Ok(DisplaySeed::NotRequested)
+            Ok(D2glSetup::NotRequested)
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), PLANTED);
-        assert_eq!(prepare_d2gl(&folder, glide, false), Ok(DisplaySeed::Seeded));
-        assert_eq!(stored()["other"]["load_dlls_late"], "Save/notes.txt");
+        assert_eq!(
+            prepare_d2gl(&folder, glide, false),
+            Ok(D2glSetup::Unchanged)
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), PLANTED);
 
-        // The seed follows the pin and keeps its values.
-        fs::write(&config, PLANTED).unwrap();
-        assert_eq!(prepare_d2gl(&folder, glide, true), Ok(DisplaySeed::Seeded));
+        // The Android values follow the pin and keep its values; the window
+        // size stays.
+        assert_eq!(prepare_d2gl(&folder, glide, true), Ok(D2glSetup::Written));
         assert_eq!(stored()["other"]["load_dlls_late"], "SGD2FreeRes.dll");
         assert_eq!(stored()["other"]["load_dlls_early"], "");
-        assert_eq!(stored()["screen"]["window_size_width"], 1280);
+        assert_eq!(stored()["screen"]["unlock_cursor"], true);
+        assert_eq!(stored()["screen"]["window_size_width"], 800);
+        assert_eq!(stored()["screen"]["window_size_height"], 600);
 
         // A configuration that cannot be checked keeps the game from starting.
         fs::remove_file(&config).unwrap();
@@ -1829,58 +1821,56 @@ mod tests {
         );
         assert_eq!(
             prepare_d2gl(&folder, glide, false),
-            Ok(DisplaySeed::Skipped)
+            Ok(D2glSetup::Unchanged)
         );
     }
 
     #[test]
-    fn glide_launch_seeds_the_default_d2gl_size_before_spawning() {
-        const DEFAULT: &str = "{\"screen\": {\"window_size_width\": 800, \"window_size_height\": 600, \"window_fullscreen\": true}}";
-        for (options, expected_seed, expected_width) in [
-            (
-                GameLaunchOptions::default().with_display_size(3840, 2560),
-                DisplaySeed::Seeded,
-                3840,
-            ),
-            (GameLaunchOptions::default(), DisplaySeed::NotRequested, 800),
-            (
-                GameLaunchOptions::new(GameRenderer::DirectDraw, true)
-                    .with_display_size(3840, 2560),
-                DisplaySeed::NotRequested,
-                800,
-            ),
+    fn the_desktop_never_changes_d2gl_json() {
+        // D2GL sizes a full-screen game from the monitor, so its stored
+        // window size, D2GL's default or the player's, stays as it is, as
+        // does every other value, with or without a graphics profile.
+        const IMPORTED: &str = r#"{"screen": {"window_size_width": 3840, "window_size_height": 2160, "unlock_cursor": false, "window_fullscreen": false}, "graphics": {"fxaa": true}}"#;
+        for config in [
+            "{\"screen\": {\"window_size_width\": 800, \"window_size_height\": 600, \"window_fullscreen\": true}}",
+            IMPORTED,
+            "{ not json",
         ] {
-            let fixture = Fixture::new();
-            let config = fixture
-                .root()
-                .join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2/d2gl.json");
-            fs::write(&config, DEFAULT).expect("d2gl fixture");
-            let host = Arc::new(FakeHost::new());
-            let mut supervisor = game_supervisor(Arc::new(FakeAuditor::ready()), host);
+            for options in [
+                GameLaunchOptions::default(),
+                GameLaunchOptions::default().with_graphics_profile(GraphicsProfile::Performance),
+            ] {
+                let fixture = Fixture::new();
+                let path = fixture
+                    .root()
+                    .join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2/d2gl.json");
+                fs::write(&path, config).expect("d2gl fixture");
+                let host = Arc::new(FakeHost::new());
+                let mut supervisor = game_supervisor(Arc::new(FakeAuditor::ready()), host);
 
-            assert_eq!(supervisor.start(fixture.root(), options), Ok(expected_seed));
-            let stored: serde_json::Value =
-                serde_json::from_slice(&fs::read(&config).expect("read d2gl")).unwrap();
-            assert_eq!(stored["screen"]["window_size_width"], expected_width);
-            assert_eq!(stored["screen"]["window_fullscreen"], true);
+                assert_eq!(
+                    supervisor.start(fixture.root(), options),
+                    Ok(D2glSetup::Unchanged)
+                );
+                assert_eq!(fs::read_to_string(&path).expect("read d2gl"), config);
+                assert!(
+                    !path
+                        .parent()
+                        .unwrap()
+                        .join(".pd2launcher/d2gl-profile")
+                        .exists()
+                );
+            }
         }
     }
 
     #[test]
     fn glide_launch_without_d2gl_configuration_reports_its_absence() {
-        for (options, expected_seed) in [
+        for (options, expected) in [
+            (GameLaunchOptions::default(), D2glSetup::ConfigurationAbsent),
             (
-                GameLaunchOptions::default().with_display_size(3840, 2560),
-                DisplaySeed::ConfigurationAbsent,
-            ),
-            (
-                GameLaunchOptions::default(),
-                DisplaySeed::ConfigurationAbsent,
-            ),
-            (
-                GameLaunchOptions::new(GameRenderer::DirectDraw, true)
-                    .with_display_size(3840, 2560),
-                DisplaySeed::NotRequested,
+                GameLaunchOptions::new(GameRenderer::DirectDraw, true),
+                D2glSetup::NotRequested,
             ),
         ] {
             let fixture = Fixture::new();
@@ -1890,7 +1880,7 @@ mod tests {
             let host = Arc::new(FakeHost::new());
             let mut supervisor = game_supervisor(Arc::new(FakeAuditor::ready()), host);
 
-            assert_eq!(supervisor.start(fixture.root(), options), Ok(expected_seed));
+            assert_eq!(supervisor.start(fixture.root(), options), Ok(expected));
             assert!(!config.exists(), "the Launcher never creates d2gl.json");
         }
     }

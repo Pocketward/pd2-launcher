@@ -52,9 +52,9 @@ use crate::{
         self, ActiveJobView, AuthorizationInput, AuthorizationInputError, AuthorizationView,
         DirectDrawRendererView, DownloadSourceView, ExistingProblemView, GameNoticeView, GameView,
         HostView, ImportModeView, InstallerMediaView, Intent, OperationPhase, OperationStatusView,
-        PhysicalDisplaySize, Prerequisite, ReduceOutcome, RendererPreferenceView, ReportView,
-        ResultNextStep, SequencedEvent, ServiceEndpoint, SettingsChange, SettingsPersistenceView,
-        SetupStep, SourceBadgeView, UiReducer, UiSnapshot,
+        Prerequisite, ReduceOutcome, RendererPreferenceView, ReportView, ResultNextStep,
+        SequencedEvent, ServiceEndpoint, SettingsChange, SettingsPersistenceView, SetupStep,
+        SourceBadgeView, UiReducer, UiSnapshot,
     },
     sources::DownloadArtifact,
 };
@@ -107,8 +107,8 @@ pub(crate) enum EngineMessage {
     /// The command `seq` was not taken (0: not known, or the engine itself
     /// failed). `reason` is a stable code: `malformed-message`,
     /// `unsupported-command`, `unexpected-hello`, `invalid-product-key`,
-    /// `invalid-display-size`, `relative-path`, `engine-busy`,
-    /// `service-unavailable` or `engine-failed`; or the Launcher refused it
+    /// `relative-path`, `engine-busy`, `service-unavailable` or
+    /// `engine-failed`; or the Launcher refused it
     /// (a guard failure such as `install-not-permitted`), named by the code
     /// the desktop window shows under "Request not started". A Launcher
     /// refusal carries the `seq` of the newest command handed to the
@@ -222,12 +222,12 @@ pub(crate) enum Command {
     /// Apply the Available update. The player pressed Update on Play, so
     /// the command is the confirmed intent.
     ApplyUpdate,
-    /// Play, with the X screen's size in pixels when known (the player's
-    /// game resolution), the app's graphics driver (`standard` when absent)
-    /// and its D2GL graphics profile (none when absent: `d2gl.json`'s
-    /// graphics stay as they are).
+    /// Play, with the app's graphics driver (`standard` when absent) and its
+    /// D2GL graphics profile (none when absent: `d2gl.json`'s graphics stay
+    /// as they are). The app may also send the X screen's size (`display`),
+    /// which the engine does not use: D2GL sizes the full-screen game from
+    /// the X screen itself.
     LaunchGame {
-        display: Option<DisplaySize>,
         #[serde(default)]
         graphics_driver: GraphicsDriver,
         #[serde(default)]
@@ -363,12 +363,6 @@ pub(crate) enum Artifact {
     FexRootFs,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct DisplaySize {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-}
-
 /// The app's graphics driver for a Play: the App userland's Turnip as it is,
 /// or with its Compatibility values.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -456,21 +450,9 @@ impl Command {
             Self::RequestSafeStop => Intent::RequestSafeStop,
             Self::ApplyUpdate => Intent::ApplyUpdate,
             Self::LaunchGame {
-                display,
                 graphics_driver,
                 graphics_profile,
             } => Intent::LaunchGame(
-                match display {
-                    Some(size) => Some(
-                        PhysicalDisplaySize::from_scaled(
-                            size.width as f32,
-                            size.height as f32,
-                            1.0,
-                        )
-                        .ok_or("invalid-display-size")?,
-                    ),
-                    None => None,
-                },
                 match graphics_driver {
                     GraphicsDriver::Standard => presentation::GraphicsDriver::Standard,
                     GraphicsDriver::Compatibility => presentation::GraphicsDriver::Compatibility,
@@ -1829,10 +1811,6 @@ mod tests {
             Command::RequestSafeStop,
             Command::ApplyUpdate,
             Command::LaunchGame {
-                display: Some(DisplaySize {
-                    width: 1280,
-                    height: 960,
-                }),
                 graphics_driver: GraphicsDriver::Compatibility,
                 graphics_profile: Some(GraphicsProfile::Performance),
             },
@@ -1969,18 +1947,6 @@ mod tests {
         );
         assert_eq!(
             refused(Command::LaunchGame {
-                display: Some(DisplaySize {
-                    width: 0,
-                    height: 0
-                }),
-                graphics_driver: GraphicsDriver::Standard,
-                graphics_profile: None,
-            }),
-            Some("invalid-display-size")
-        );
-        assert_eq!(
-            refused(Command::LaunchGame {
-                display: None,
                 graphics_driver: GraphicsDriver::Standard,
                 graphics_profile: None,
             }),
@@ -1997,17 +1963,33 @@ mod tests {
                 .expect("accepted")
         };
         assert!(matches!(
-            intent(r#"{"type":"launch_game","display":null}"#),
-            Intent::LaunchGame(None, presentation::GraphicsDriver::Standard, None)
+            intent(r#"{"type":"launch_game"}"#),
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None)
         ));
         assert!(matches!(
             intent(r#"{"type":"launch_game","display":null,"graphics_driver":"compatibility"}"#),
-            Intent::LaunchGame(None, presentation::GraphicsDriver::Compatibility, None)
+            Intent::LaunchGame(presentation::GraphicsDriver::Compatibility, None)
         ));
         assert!(matches!(
             intent(r#"{"type":"launch_game","display":null,"graphics_profile":null}"#),
-            Intent::LaunchGame(None, presentation::GraphicsDriver::Standard, None)
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None)
         ));
+        // The X screen's size, which the app sends, changes nothing, whatever
+        // it is.
+        for display in [
+            r#"{"width":1280,"height":960}"#,
+            r#"{"width":0,"height":0}"#,
+        ] {
+            assert!(matches!(
+                intent(&format!(
+                    r#"{{"type":"launch_game","display":{display},"graphics_driver":"standard","graphics_profile":"performance"}}"#
+                )),
+                Intent::LaunchGame(
+                    presentation::GraphicsDriver::Standard,
+                    Some(presentation::GraphicsProfile::Performance)
+                )
+            ));
+        }
         for (json, profile) in [
             ("default", presentation::GraphicsProfile::Default),
             ("performance", presentation::GraphicsProfile::Performance),
@@ -2016,7 +1998,7 @@ mod tests {
                 intent(&format!(
                     r#"{{"type":"launch_game","display":null,"graphics_profile":"{json}"}}"#
                 )),
-                Intent::LaunchGame(None, presentation::GraphicsDriver::Standard, Some(chosen))
+                Intent::LaunchGame(presentation::GraphicsDriver::Standard, Some(chosen))
                     if chosen == profile
             ));
         }

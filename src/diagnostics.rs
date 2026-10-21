@@ -45,18 +45,24 @@ pub(crate) enum DiagnosticCode {
     /// A Blizzard installer stayed at its main menu instead of installing.
     VendorInstallerMenu,
     DiagnosticsExported,
+    /// The Android host wrote D2GL's configuration, or its screen values or
+    /// graphics profile, before a launch.
     DisplayConfigSeeded,
+    /// The Android host could not read D2GL's configuration or set its
+    /// values in it, so it stayed as it was.
     DisplayConfigSkipped,
     /// The official launcher left the client out of date and its update
     /// could not be accepted (the protected-file inventory was incomplete).
     OfficialClientNotReconciled,
-    /// The XDG layout of an earlier release was moved into the home.
+    /// The XDG layout of an earlier release was moved into the home (kept so
+    /// older records still read; the Launcher no longer moves that layout).
     LegacyLayoutMigrated,
     /// As above, but the installation stays where it was and the pointer
     /// names it (another filesystem, or a location the user chose).
     LegacyInstallationKeptInPlace,
     /// Both the home and an earlier release's XDG layout exist; the home is
-    /// used and the legacy layout is left untouched.
+    /// used and the legacy layout is left untouched (kept so older records
+    /// still read).
     LegacyLayoutIgnored,
     /// Wine processes of an earlier session held the installation lease
     /// without their wineserver and were stopped.
@@ -78,9 +84,9 @@ impl DiagnosticCode {
                 "A Blizzard installer opened its menu instead of installing"
             }
             Self::DiagnosticsExported => "Redacted diagnostics exported",
-            Self::DisplayConfigSeeded => "D2GL default window size set to the display size",
+            Self::DisplayConfigSeeded => "D2GL settings written for the Android app",
             Self::DisplayConfigSkipped => {
-                "D2GL window size was left unchanged because its configuration was unreadable"
+                "D2GL settings were left unchanged because its configuration could not be read or edited"
             }
             Self::OfficialClientNotReconciled => {
                 "The official launcher's client update was not accepted: the protected-file inventory was incomplete"

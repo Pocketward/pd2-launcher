@@ -139,6 +139,13 @@ impl ArgumentError {
     }
 }
 
+/// A build without the window (no `gui` feature) refuses every mode that
+/// opens it.
+#[cfg(not(feature = "gui"))]
+pub(crate) const WINDOW_UNAVAILABLE: ArgumentError = ArgumentError::new(
+    "This PD2 Launcher has no window: it runs only as the Launcher engine of the Android app.",
+);
+
 impl fmt::Display for ArgumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.message)

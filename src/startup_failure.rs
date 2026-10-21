@@ -1,7 +1,7 @@
 //! Reporting a Launcher that could not open its window.
 //!
 //! Without a window the user would see nothing at all: a double-clicked
-//! AppImage that finds no graphics driver to draw with, or no font, simply
+//! executable that finds no graphics driver to draw with, or no font, simply
 //! vanishes. A failure to open the window, or a panic before it opened, is
 //! written to `~/.pd2launcher/logs/startup-error.txt` and announced with the
 //! first available desktop dialog or notification. The announcement names
@@ -103,17 +103,7 @@ fn report_directories(
     if let Ok(paths) = LauncherPaths::discover_from(environment)
         && let Some(home) = paths.home()
     {
-        let logs = home.join("logs");
-        // A `logs/` folder marks a home that already holds the new layout:
-        // creating one here would make the next start ignore an earlier
-        // release's installation instead of moving it.
-        let blocks_migration = !logs.exists()
-            && paths
-                .legacy()
-                .is_some_and(crate::persistence::LegacyRoots::present);
-        if !blocks_migration {
-            directories.push((logs, REPORT_NAME));
-        }
+        directories.push((home.join("logs"), REPORT_NAME));
     }
     if let Some(runtime) = environment("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -263,27 +253,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(path, runtime.join(FALLBACK_NAME));
-    }
-
-    #[test]
-    fn a_report_never_blocks_the_move_of_an_earlier_release() {
-        let fixture = tempfile::tempdir().unwrap();
-        let home = fixture.path().join("home");
-        let legacy = home.join(".local/share/pd2-launcher");
-        fs::create_dir_all(&legacy).unwrap();
-        let runtime = fixture.path().join("runtime");
-        fs::create_dir(&runtime).unwrap();
-        let path = report(
-            "injected",
-            environment(vec![
-                ("HOME", home.clone()),
-                ("XDG_RUNTIME_DIR", runtime.clone()),
-            ]),
-            |_| true,
-        )
-        .unwrap();
-        assert_eq!(path, runtime.join(FALLBACK_NAME));
-        assert!(!home.join(".pd2launcher/logs").exists());
     }
 
     #[test]

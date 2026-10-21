@@ -8,16 +8,20 @@ use std::sync::Arc;
 use crate::{
     InstallationStatus,
     audit::GraphicsExecutionEvidence,
-    automation::AutomationRequest,
     control_channel::HostFacts,
     coordinator::ServiceRuntime,
     host_execution::{GuestExecutor, SystemHostExecution, SystemHostProbe},
     persistence::LauncherPaths,
     presentation::{
-        self, DomainEvent, GraphicsSnapshot, HostView, OperationPhase, OperationStatusView,
-        OperationView, SequencedEvent, ServiceEndpoint, UiSnapshot,
+        DomainEvent, HostView, OperationPhase, OperationStatusView, OperationView, SequencedEvent,
+        ServiceEndpoint, UiSnapshot,
     },
     startup_credentials::LaunchMode,
+};
+#[cfg(feature = "gui")]
+use crate::{
+    automation::AutomationRequest,
+    presentation::{self, GraphicsSnapshot},
 };
 
 mod production;
@@ -25,14 +29,17 @@ mod production;
 use production::ProductionBackend;
 
 /// Start the native launcher interface.
+#[cfg(feature = "gui")]
 pub fn run() {
     run_with_automation_inner(None);
 }
 
+#[cfg(feature = "gui")]
 pub(crate) fn run_with_automation(request: AutomationRequest) {
     run_with_automation_inner(Some(request));
 }
 
+#[cfg(feature = "gui")]
 fn run_with_automation_inner(request: Option<AutomationRequest>) {
     // Only the unattended CLI reads `.env.local`; the interactive Launcher
     // uses the process environment alone.
@@ -61,7 +68,12 @@ fn run_with_automation_inner(request: Option<AutomationRequest>) {
         presentation::UiSnapshot::initial().with_setup_record(setup_record),
     );
     presentation::run(presentation, request, mode, move |graphics| {
-        start_service(service, graphics, mode, None)
+        start_service(
+            service,
+            graphics.map(graphics_execution_evidence),
+            mode,
+            None,
+        )
     });
 }
 
@@ -179,12 +191,11 @@ fn remove_downloads_at(managed_root: &std::path::Path) -> u8 {
 /// Android host's facts, given only to the Launcher engine.
 fn start_service(
     service: ServiceEndpoint,
-    graphics: Option<GraphicsSnapshot>,
+    graphics: Option<GraphicsExecutionEvidence>,
     mode: LaunchMode,
     android: Option<HostFacts>,
 ) -> Box<dyn Send> {
     let failure_events = service.event_sender.clone();
-    let graphics = graphics.map(graphics_execution_evidence);
     let paths = LauncherPaths::discover().ok();
     if android.is_some() {
         // Before the backend's first lookup.
@@ -244,14 +255,15 @@ fn guest_executor(android_host: bool, paths: Option<&LauncherPaths>) -> GuestExe
     }
 }
 
-/// Evaluate the same paired build/runtime identity used by the host audit,
-/// without constructing GPUI or any production service. This is intentionally
-/// narrow and exists only for post-package verification.
+/// Evaluate the same build identity used by the host audit, without
+/// constructing GPUI or any production service. This is intentionally narrow
+/// and exists only for post-build verification.
 #[doc(hidden)]
 pub fn package_identity_probe() -> Option<&'static str> {
     production::portable_identity(production::launcher_artifact())
 }
 
+#[cfg(feature = "gui")]
 fn graphics_execution_evidence(graphics: GraphicsSnapshot) -> GraphicsExecutionEvidence {
     GraphicsExecutionEvidence::new(
         graphics.is_software_emulated,

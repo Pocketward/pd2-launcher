@@ -5,17 +5,23 @@
 
 use std::{
     fmt,
-    ops::Range,
     path::PathBuf,
-    sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+    sync::mpsc::{Receiver, SyncSender, sync_channel},
     time::Duration,
 };
+#[cfg(feature = "gui")]
+use std::{
+    ops::Range,
+    sync::mpsc::{TryRecvError, TrySendError},
+};
 
+#[cfg(feature = "gui")]
 use gpui_kit::component::{
     Sizable,
     button::{Button, ButtonVariants},
     input::InputState,
 };
+#[cfg(feature = "gui")]
 use gpui_kit::{
     App, Bounds, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, GpuSpecs, KeyBinding, LayoutId,
@@ -26,18 +32,25 @@ use gpui_kit::{
 };
 use zeroize::Zeroize;
 
+#[cfg(feature = "gui")]
 mod page;
-#[cfg(debug_assertions)]
+#[cfg(all(feature = "gui", debug_assertions))]
 pub(crate) mod preview;
+#[cfg(feature = "gui")]
 mod theme;
 
 use crate::{
-    InstallationStatus, InterruptedStage, UpdateStatus,
+    InstallationStatus, UpdateStatus,
     audit::WineLibrary,
-    automation::{AfterReady, AutomationRequest},
+    automation::AfterReady,
     operation::{EnvironmentPart, EnvironmentProgress},
     persistence::SetupRecord,
     sources::DownloadArtifact,
+};
+#[cfg(feature = "gui")]
+use crate::{
+    InterruptedStage,
+    automation::AutomationRequest,
     startup_credentials::{
         InvalidInstallerSource, LaunchMode, StartupInputs, StartupInstallerSource,
     },
@@ -250,7 +263,8 @@ pub(crate) enum GameView {
 /// while that game runs, and after it exits, and never gates Play.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GameNoticeView {
-    /// D2GL had not written its configuration yet, so it opens at 800x600.
+    /// D2GL has not written its configuration yet: the game's first launch
+    /// with it.
     FirstD2glLaunch,
 }
 
@@ -384,67 +398,6 @@ impl LaunchSettingsView {
 
     pub(crate) const fn persistence(self) -> SettingsPersistenceView {
         self.persistence
-    }
-}
-
-/// Physical pixel size of the display the Launcher window is on. It travels
-/// with the Play intent as typed evidence so the Game supervisor can size a
-/// renderer that has no size of its own yet; presentation performs no I/O.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PhysicalDisplaySize {
-    width: u32,
-    height: u32,
-}
-
-impl PhysicalDisplaySize {
-    const MIN_WIDTH: u32 = 640;
-    const MIN_HEIGHT: u32 = 480;
-    const MAX_EDGE: u32 = 16_384;
-
-    /// Scales a logical display size to physical pixels, rounding each edge.
-    /// Implausible or non-finite results are unavailable evidence.
-    pub(crate) fn from_scaled(width: f32, height: f32, scale: f32) -> Option<Self> {
-        let edge = |logical: f32, minimum: u32| {
-            let physical = (logical * scale).round();
-            (physical.is_finite()
-                && physical >= minimum as f32
-                && physical <= Self::MAX_EDGE as f32)
-                .then_some(physical as u32)
-        };
-        if !scale.is_finite() || scale <= 0.0 {
-            return None;
-        }
-        Some(Self {
-            width: edge(width, Self::MIN_WIDTH)?,
-            height: edge(height, Self::MIN_HEIGHT)?,
-        })
-    }
-
-    /// Converts the bounds GPUI reports for the window's display.
-    ///
-    /// On Wayland, GPUI derives display bounds from the output's physical
-    /// mode divided by the integer `wl_output` scale, which compositors
-    /// advertise as the ceiling of a fractional scale (Hyprland reports 2 for
-    /// 1.6). On X11 the bounds describe the whole X screen rather than the
-    /// monitor the window is on, so no size is claimed there.
-    pub(crate) fn detect(
-        compositor: &str,
-        bounds_width: f32,
-        bounds_height: f32,
-        window_scale: f32,
-    ) -> Option<Self> {
-        match compositor {
-            "Wayland" => Self::from_scaled(bounds_width, bounds_height, window_scale.ceil()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn width(self) -> u32 {
-        self.width
-    }
-
-    pub(crate) fn height(self) -> u32 {
-        self.height
     }
 }
 
@@ -4552,11 +4505,7 @@ pub(crate) enum Intent {
     UseDefaultInstallerSource,
     RequestSafeStop,
     ApplyUpdate,
-    LaunchGame(
-        Option<PhysicalDisplaySize>,
-        GraphicsDriver,
-        Option<GraphicsProfile>,
-    ),
+    LaunchGame(GraphicsDriver, Option<GraphicsProfile>),
     /// Open the official PD2 launcher as a fallback.
     OpenOfficialLauncher,
     /// Open it after the user confirmed an unverified binary.
@@ -4746,16 +4695,20 @@ pub(crate) fn service_bridge(
     )
 }
 
+#[cfg(feature = "gui")]
 actions!(operations_deck, [FocusNext, FocusPrevious]);
 
 /// The most characters a CD key field keeps, so a too-long paste is still
 /// reported with its length instead of silently cut to a valid one.
+#[cfg(feature = "gui")]
 const MAX_KEY_INPUT: usize = 64;
+#[cfg(feature = "gui")]
 actions!(
     secret_product_key,
     [Backspace, Delete, Left, Right, SelectAll, Home, End, Paste,]
 );
 
+#[cfg(feature = "gui")]
 struct SecretInput {
     focus_handle: FocusHandle,
     content: Vec<u8>,
@@ -4846,6 +4799,7 @@ pub(crate) fn key_length_problem(game: &str, len: usize) -> Option<String> {
         .then(|| format!("{game} CD keys are 26 letters and numbers. This one has {len}."))
 }
 
+#[cfg(feature = "gui")]
 impl SecretInput {
     fn new(
         name: &'static str,
@@ -5025,6 +4979,7 @@ impl SecretInput {
     }
 }
 
+#[cfg(feature = "gui")]
 impl Drop for SecretInput {
     fn drop(&mut self) {
         // `Vec::zeroize` clears the initialized bytes and the spare capacity,
@@ -5033,6 +4988,7 @@ impl Drop for SecretInput {
     }
 }
 
+#[cfg(feature = "gui")]
 impl EntityInputHandler for SecretInput {
     fn text_for_range(
         &mut self,
@@ -5131,16 +5087,19 @@ impl EntityInputHandler for SecretInput {
     }
 }
 
+#[cfg(feature = "gui")]
 struct SecretTextElement {
     input: Entity<SecretInput>,
 }
 
+#[cfg(feature = "gui")]
 struct SecretPrepaint {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
 }
 
+#[cfg(feature = "gui")]
 impl IntoElement for SecretTextElement {
     type Element = Self;
 
@@ -5149,6 +5108,7 @@ impl IntoElement for SecretTextElement {
     }
 }
 
+#[cfg(feature = "gui")]
 impl Element for SecretTextElement {
     type RequestLayoutState = ();
     type PrepaintState = SecretPrepaint;
@@ -5305,6 +5265,7 @@ impl Element for SecretTextElement {
     }
 }
 
+#[cfg(feature = "gui")]
 impl Render for SecretInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = theme::field_colors();
@@ -5371,12 +5332,14 @@ impl Render for SecretInput {
     }
 }
 
+#[cfg(feature = "gui")]
 impl Focusable for SecretInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
+#[cfg(feature = "gui")]
 struct LauncherView {
     state: LauncherViewState,
     intent_sender: SyncSender<Intent>,
@@ -5471,12 +5434,11 @@ struct LauncherView {
     /// `--save-report`: where saving the report and closing stands.
     report_cli: ReportCli,
     snapshot_requested: bool,
-    /// Refreshed on every render from the window's current display.
-    display_size: Option<PhysicalDisplaySize>,
     _service_runtime: Box<dyn Send>,
 }
 
 /// Where `--save-report` stands.
+#[cfg(feature = "gui")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReportCli {
     Off,
@@ -5486,6 +5448,7 @@ enum ReportCli {
     Finished,
 }
 
+#[cfg(feature = "gui")]
 impl LauncherView {
     fn new(
         endpoint: PresentationEndpoint,
@@ -5633,7 +5596,6 @@ impl LauncherView {
                 ReportCli::Off
             },
             snapshot_requested: false,
-            display_size: None,
             _service_runtime: service_runtime,
         };
         #[cfg(debug_assertions)]
@@ -6093,11 +6055,7 @@ impl LauncherView {
         }
 
         let intent = match after_ready_step(self.unattended_after_ready, self.state.snapshot()) {
-            AfterReadyStep::LaunchGame => Some(Intent::LaunchGame(
-                self.display_size,
-                GraphicsDriver::Standard,
-                None,
-            )),
+            AfterReadyStep::LaunchGame => Some(Intent::LaunchGame(GraphicsDriver::Standard, None)),
             AfterReadyStep::OpenOfficialLauncher => Some(Intent::OpenOfficialLauncher),
             AfterReadyStep::Wait | AfterReadyStep::RefuseUnverifiedOfficialLauncher => None,
         };
@@ -6432,11 +6390,7 @@ impl LauncherView {
                 None
             }
             ActionId::ContinueInstallation => Some(Intent::ContinueInstallation),
-            ActionId::Play => Some(Intent::LaunchGame(
-                self.display_size,
-                GraphicsDriver::Standard,
-                None,
-            )),
+            ActionId::Play => Some(Intent::LaunchGame(GraphicsDriver::Standard, None)),
             ActionId::Update => Some(Intent::ApplyUpdate),
             ActionId::SafeStop => Some(Intent::RequestSafeStop),
             ActionId::OpenDiagnostics => {
@@ -6589,6 +6543,7 @@ impl LauncherView {
     }
 }
 
+#[cfg(feature = "gui")]
 impl Focusable for LauncherView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -6596,6 +6551,7 @@ impl Focusable for LauncherView {
 }
 
 /// GPUI-neutral renderer evidence emitted once the native window exists.
+#[cfg(feature = "gui")]
 pub(crate) struct GraphicsSnapshot {
     pub(crate) is_software_emulated: bool,
     pub(crate) device_name: String,
@@ -6603,6 +6559,7 @@ pub(crate) struct GraphicsSnapshot {
     pub(crate) driver_info: String,
 }
 
+#[cfg(feature = "gui")]
 pub(crate) fn run(
     endpoint: PresentationEndpoint,
     automation: Option<AutomationRequest>,
@@ -6732,6 +6689,7 @@ pub(crate) fn run(
 
 /// Quit from inside the launch callback. A quit requested before the event
 /// loop runs is lost on some platforms, so it waits for the loop.
+#[cfg(feature = "gui")]
 fn quit_once_running(cx: &mut App) {
     cx.spawn(async move |cx| {
         cx.background_executor()
@@ -6742,6 +6700,7 @@ fn quit_once_running(cx: &mut App) {
     .detach();
 }
 
+#[cfg(feature = "gui")]
 impl From<GpuSpecs> for GraphicsSnapshot {
     fn from(graphics: GpuSpecs) -> Self {
         Self {
@@ -6756,7 +6715,7 @@ impl From<GpuSpecs> for GraphicsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InstallationStatus, UpdateStatus};
+    use crate::{InstallationStatus, InterruptedStage, UpdateStatus};
 
     fn ready(update: UpdateStatus) -> UiSnapshot {
         UiSnapshot::initial()
@@ -7494,38 +7453,9 @@ mod tests {
     }
 
     #[test]
-    fn physical_display_size_scales_logical_bounds_and_rounds() {
-        let size = PhysicalDisplaySize::from_scaled(2400.0, 1600.0, 1.6).expect("scaled");
-        assert_eq!((size.width(), size.height()), (3840, 2560));
-        let size = PhysicalDisplaySize::from_scaled(1706.6666, 1066.6666, 1.5).expect("scaled");
-        assert_eq!((size.width(), size.height()), (2560, 1600));
-        assert_eq!(PhysicalDisplaySize::from_scaled(2560.0, 1440.0, 0.0), None);
+    fn play_is_labelled_in_the_history() {
         assert_eq!(
-            PhysicalDisplaySize::from_scaled(2560.0, 1440.0, f32::NAN),
-            None
-        );
-        assert_eq!(PhysicalDisplaySize::from_scaled(320.0, 240.0, 1.0), None);
-        assert_eq!(
-            PhysicalDisplaySize::from_scaled(20_000.0, 1440.0, 1.0),
-            None
-        );
-    }
-
-    #[test]
-    fn wayland_display_bounds_use_the_integer_output_scale() {
-        // Hyprland at 1.6 advertises wl_output scale 2, so GPUI reports the
-        // 3840x2560 mode as 1920x1280 while the window scale is 1.6.
-        let fractional = PhysicalDisplaySize::detect("Wayland", 1920.0, 1280.0, 1.6).unwrap();
-        assert_eq!((fractional.width(), fractional.height()), (3840, 2560));
-        let unscaled = PhysicalDisplaySize::detect("Wayland", 2560.0, 1440.0, 1.0).unwrap();
-        assert_eq!((unscaled.width(), unscaled.height()), (2560, 1440));
-        assert_eq!(
-            PhysicalDisplaySize::detect("X11", 2400.0, 1600.0, 1.6),
-            None
-        );
-        assert_eq!(PhysicalDisplaySize::detect("", 2400.0, 1600.0, 1.6), None);
-        assert_eq!(
-            Intent::LaunchGame(Some(fractional), GraphicsDriver::Standard, None).history_label(),
+            Intent::LaunchGame(GraphicsDriver::Standard, None).history_label(),
             "Launch Game client"
         );
     }

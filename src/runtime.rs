@@ -3,8 +3,7 @@
 //! The AArch64 row uses the FEX-translated Wine-GE 8-26 runtime. The x86-64
 //! row uses an upstream Wine 11.11 build in WoW64 mode: 32-bit Windows code
 //! runs inside 64-bit Unix processes, so the host needs no i386 loader,
-//! 32-bit multilib, or `libunwind`. An installation an older release made
-//! with Wine 11.18 keeps that runtime until Start over.
+//! 32-bit multilib, or `libunwind`.
 
 /// Exact size and SHA-256 of one executable inside the extracted runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,14 +40,10 @@ pub(crate) struct ManagedRuntime {
     pub(crate) windows_version: Option<&'static str>,
 }
 
-/// The artifact-cache name older releases used for every row. An x86-64
-/// cache may hold the WoW64 archive under it.
-pub(crate) const LEGACY_CACHE_NAME: &str = "wine-ge-8-26.verified";
-
 pub(crate) const WINE_GE_8_26: ManagedRuntime = ManagedRuntime {
     identity: "lutris-GE-Proton8-26-x86_64",
     display_name: "Wine-GE 8-26",
-    cache_name: LEGACY_CACHE_NAME,
+    cache_name: "wine-ge-8-26.verified",
     archive_url: "https://github.com/GloriousEggroll/wine-ge-custom/releases/download/GE-Proton8-26/wine-lutris-GE-Proton8-26-x86_64.tar.xz",
     archive_size: 233_577_252,
     archive_sha512: "3abd578ed45a16096843936e0258799450e6a5751bc67afaf8c58cd245c40e62794a89af25ae482d74d5ca2b7527d17ff77232781c6d9cf97bc02976c2f960bd",
@@ -92,55 +87,12 @@ pub(crate) const WINE_WOW64_11_11: ManagedRuntime = ManagedRuntime {
     windows_version: Some("win7"),
 };
 
-/// Kron4ek Wine-Builds 11.18 `amd64-wow64` (upstream release SHA-256
-/// `f899879b8c37e0b20adca19d147cf77436f3f1a37bf16d08d27fa7137a52b9ba`), the
-/// x86-64 row's previous runtime. It is never downloaded; an installation
-/// whose prefix it made keeps running it (see [`retained`]).
-pub(crate) const WINE_WOW64_11_18: ManagedRuntime = ManagedRuntime {
-    identity: "wine-11.18-amd64-wow64",
-    display_name: "Wine 11.18",
-    cache_name: "wine-11.18-amd64-wow64.verified",
-    archive_url: "https://github.com/Kron4ek/Wine-Builds/releases/download/11.18/wine-11.18-amd64-wow64.tar.xz",
-    archive_size: 99_305_644,
-    archive_sha512: "81673789c42860626396f77506ab31eb6a74fa5527d3de26fd7da198f014817c494bcafca968de953fee724a17f5012825408ef238b52df2b64017f541406899",
-    wine: RuntimeFile {
-        size: 13_424,
-        sha256: "40d5d0f45702a66d1837f3cf44673bfd970901ea52d06aaa1ba39a3a478d6a79",
-    },
-    loader_name: "wine",
-    loader: RuntimeFile {
-        size: 13_424,
-        sha256: "40d5d0f45702a66d1837f3cf44673bfd970901ea52d06aaa1ba39a3a478d6a79",
-    },
-    loader_takes_wine_path: false,
-    version: "wine-11.18",
-    windows_version: Some("win7"),
-};
-
 /// Runtime of the row for `architecture` (a `std::env::consts::ARCH` value).
 pub(crate) fn for_architecture(architecture: &str) -> &'static ManagedRuntime {
     match architecture {
         "x86_64" => &WINE_WOW64_11_11,
         _ => &WINE_GE_8_26,
     }
-}
-
-/// The runtime the row for `architecture` pinned before its current one,
-/// kept for installations made with it.
-pub(crate) fn retained_for_architecture(architecture: &str) -> Option<&'static ManagedRuntime> {
-    match architecture {
-        "x86_64" => Some(&WINE_WOW64_11_18),
-        _ => None,
-    }
-}
-
-/// Earlier pinned runtime of the running Launcher binary's row. A prefix
-/// that runtime created stays on it: running an older Wine on a newer
-/// Wine's prefix is a downgrade Wine does not support. It is selected only
-/// while the current runtime is not installed beside it, and Start over
-/// removes it with the prefix.
-pub(crate) fn retained() -> Option<&'static ManagedRuntime> {
-    retained_for_architecture(std::env::consts::ARCH)
 }
 
 /// Runtime of the running Launcher binary's compile target.
@@ -162,17 +114,6 @@ pub(crate) fn custom_receipt_present(root: &crate::safe_fs::Directory) -> bool {
         &std::path::Path::new("runner")
             .join(CUSTOM_RUNTIME_DIRECTORY)
             .join(CUSTOM_RUNTIME_RECEIPT),
-        rustix::fs::OFlags::PATH,
-    )
-    .is_ok()
-}
-
-/// Whether `runner/<identity>` of the pinned `runtime` carries its receipt.
-fn builtin_receipt_present(root: &crate::safe_fs::Directory, runtime: &ManagedRuntime) -> bool {
-    root.open_beneath(
-        &std::path::Path::new("runner")
-            .join(runtime.identity)
-            .join(BUILTIN_RUNTIME_RECEIPT),
         rustix::fs::OFlags::PATH,
     )
     .is_ok()
@@ -218,40 +159,18 @@ pub(crate) enum InstalledRuntime {
 
 impl InstalledRuntime {
     /// Select the runtime for an installation whose Wine source is currently
-    /// custom (`custom_source`) or built-in.
+    /// custom (`custom_source`) or built-in. With a custom Wine source, a
+    /// runtime carrying a custom-source receipt is used; otherwise (no custom
+    /// runtime yet, or the built-in source) the row's pinned runtime is used
+    /// and audited against its pins.
     pub(crate) fn select(root: &crate::safe_fs::Directory, custom_source: bool) -> Self {
-        Self::select_with(root, custom_source, current(), retained())
-    }
-
-    /// With a custom Wine source, a runtime carrying a custom-source receipt
-    /// is used; otherwise (no custom runtime yet, or the built-in source) a
-    /// pinned runtime is used and audited against its pins: the `retained`
-    /// earlier one while it carries its receipt beside a prefix and
-    /// `builtin` carries none, else `builtin`.
-    pub(crate) fn select_with(
-        root: &crate::safe_fs::Directory,
-        custom_source: bool,
-        builtin: &'static ManagedRuntime,
-        retained: Option<&'static ManagedRuntime>,
-    ) -> Self {
         if crate::android_host() {
             return Self::App;
         }
         if custom_source && custom_receipt_present(root) {
             return Self::Custom;
         }
-        match retained {
-            Some(retained)
-                if !builtin_receipt_present(root, builtin)
-                    && builtin_receipt_present(root, retained)
-                    && root
-                        .open_beneath(std::path::Path::new("prefix"), rustix::fs::OFlags::PATH)
-                        .is_ok() =>
-            {
-                Self::BuiltIn(retained)
-            }
-            _ => Self::BuiltIn(builtin),
-        }
+        Self::BuiltIn(current())
     }
 
     pub(crate) fn is_custom(self) -> bool {
@@ -310,17 +229,16 @@ mod tests {
     fn each_row_selects_its_frozen_runtime() {
         assert_eq!(for_architecture("x86_64"), &WINE_WOW64_11_11);
         assert_eq!(for_architecture("aarch64"), &WINE_GE_8_26);
-        for runtime in [&WINE_WOW64_11_11, &WINE_WOW64_11_18] {
-            assert!(
-                runtime
-                    .archive_url
-                    .ends_with(&format!("/{}.tar.xz", runtime.identity))
-            );
-            assert_eq!(runtime.cache_name, format!("{}.verified", runtime.identity));
-        }
-        assert_eq!(retained_for_architecture("x86_64"), Some(&WINE_WOW64_11_18));
-        assert_eq!(retained_for_architecture("aarch64"), None);
-        for runtime in [&WINE_GE_8_26, &WINE_WOW64_11_11, &WINE_WOW64_11_18] {
+        assert!(
+            WINE_WOW64_11_11
+                .archive_url
+                .ends_with(&format!("/{}.tar.xz", WINE_WOW64_11_11.identity))
+        );
+        assert_eq!(
+            WINE_WOW64_11_11.cache_name,
+            format!("{}.verified", WINE_WOW64_11_11.identity)
+        );
+        for runtime in [&WINE_GE_8_26, &WINE_WOW64_11_11] {
             assert_eq!(runtime.archive_sha512.len(), 128);
             assert_eq!(runtime.wine.sha256.len(), 64);
             assert_eq!(runtime.loader.sha256.len(), 64);
@@ -336,9 +254,10 @@ mod tests {
             for_architecture("x86_64").cache_name,
             "wine-11.11-amd64-wow64.verified"
         );
-        // The AArch64 row keeps the shared cache name.
-        assert_eq!(for_architecture("aarch64").cache_name, LEGACY_CACHE_NAME);
-        assert_eq!(LEGACY_CACHE_NAME, "wine-ge-8-26.verified");
+        assert_eq!(
+            for_architecture("aarch64").cache_name,
+            "wine-ge-8-26.verified"
+        );
     }
 
     #[test]
@@ -384,62 +303,10 @@ mod tests {
 
     #[test]
     fn a_runtime_without_a_preloader_executes_wine_directly() {
-        for runtime in [&WINE_WOW64_11_11, &WINE_WOW64_11_18] {
-            assert_eq!(runtime.loader_name, "wine");
-            assert_eq!(runtime.loader, runtime.wine);
-            assert!(!runtime.loader_takes_wine_path);
-            assert_eq!(runtime.windows_version, Some("win7"));
-        }
+        assert_eq!(WINE_WOW64_11_11.loader_name, "wine");
+        assert_eq!(WINE_WOW64_11_11.loader, WINE_WOW64_11_11.wine);
+        const { assert!(!WINE_WOW64_11_11.loader_takes_wine_path) };
+        assert_eq!(WINE_WOW64_11_11.windows_version, Some("win7"));
         const { assert!(WINE_GE_8_26.loader_takes_wine_path) };
-    }
-
-    #[test]
-    fn a_prefix_made_by_the_retained_runtime_stays_on_it_until_the_current_one_is_installed() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = crate::safe_fs::Directory::open(fixture.path()).unwrap();
-        let select = |custom_source| {
-            InstalledRuntime::select_with(
-                &root,
-                custom_source,
-                &WINE_WOW64_11_11,
-                Some(&WINE_WOW64_11_18),
-            )
-        };
-        let receipt = |runtime: &ManagedRuntime| {
-            let directory = fixture.path().join("runner").join(runtime.identity);
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(
-                directory.join(BUILTIN_RUNTIME_RECEIPT),
-                runtime.archive_sha512,
-            )
-            .unwrap();
-        };
-        let current = InstalledRuntime::BuiltIn(&WINE_WOW64_11_11);
-        let earlier = InstalledRuntime::BuiltIn(&WINE_WOW64_11_18);
-
-        // An earlier runtime without a prefix (never installed, or after
-        // Start over) is not used: installing materializes the current one.
-        receipt(&WINE_WOW64_11_18);
-        assert_eq!(select(false), current);
-        std::fs::create_dir(fixture.path().join("prefix")).unwrap();
-        assert_eq!(select(false), earlier);
-        assert_eq!(select(true), earlier);
-        assert_eq!(earlier.directory(), "wine-11.18-amd64-wow64");
-        assert_eq!(earlier.loader_name(), "wine");
-        assert_eq!(earlier.windows_version(), Some("win7"));
-        // A custom runtime still wins while the Wine source is custom.
-        let custom = fixture.path().join("runner").join(CUSTOM_RUNTIME_DIRECTORY);
-        std::fs::create_dir_all(&custom).unwrap();
-        std::fs::write(custom.join(CUSTOM_RUNTIME_RECEIPT), b"{}").unwrap();
-        assert_eq!(select(true), InstalledRuntime::Custom);
-        assert_eq!(select(false), earlier);
-        // Once the current runtime is installed it is always the one used.
-        receipt(&WINE_WOW64_11_11);
-        assert_eq!(select(false), current);
-        // A row without an earlier runtime never selects one.
-        assert_eq!(
-            InstalledRuntime::select_with(&root, false, &WINE_GE_8_26, None),
-            InstalledRuntime::BuiltIn(&WINE_GE_8_26)
-        );
     }
 }

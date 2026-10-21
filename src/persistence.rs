@@ -31,58 +31,25 @@ const SETTINGS_SCHEMA: u32 = 1;
 
 /// The Launcher's home below `$HOME`.
 pub(crate) const HOME_DIRECTORY: &str = ".pd2launcher";
-/// Overrides the whole home with an absolute path (no legacy migration).
+/// Overrides the whole home with an absolute path.
 pub(crate) const HOME_OVERRIDE: &str = "PD2_LAUNCHER_HOME";
 /// The default managed root, inside the home.
 pub(crate) const GAME_DIRECTORY: &str = "game";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LauncherPaths {
-    /// `~/.pd2launcher`; `None` for a view of the legacy XDG layout.
+    /// `~/.pd2launcher`, or the path [`HOME_OVERRIDE`] names.
     home: Option<PathBuf>,
     config_root: PathBuf,
     /// Location records: the root-selection lock, the relocation intent,
-    /// the previous-root record, and the home migration journal.
+    /// and the previous-root record.
     state_root: PathBuf,
     diagnostics_root: PathBuf,
     exports_root: PathBuf,
     default_managed_root: PathBuf,
-    /// Where earlier releases kept everything, migrated on first open.
-    legacy: Option<LegacyRoots>,
     /// The resolved managed root when it is not the default. Shared by
     /// every clone so a chosen or moved location reaches every component.
     managed: Arc<RwLock<Option<PathBuf>>>,
-    /// What the last open did with a legacy layout, for diagnostics.
-    migration: Arc<RwLock<Option<HomeMigration>>>,
-}
-
-/// The XDG application roots earlier releases used.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct LegacyRoots {
-    pub(crate) data: PathBuf,
-    pub(crate) state: PathBuf,
-    pub(crate) config: PathBuf,
-}
-
-impl LegacyRoots {
-    pub(crate) fn managed_root(&self) -> PathBuf {
-        self.data.join("managed")
-    }
-
-    /// Whether any legacy application root exists (a symbolic link counts,
-    /// so it is never mistaken for an absent layout).
-    pub(crate) fn present(&self) -> bool {
-        [&self.data, &self.state, &self.config]
-            .into_iter()
-            .any(|root| fs::symlink_metadata(root).is_ok())
-    }
-
-    fn valid(&self) -> bool {
-        [&self.data, &self.state, &self.config]
-            .into_iter()
-            .all(|root| valid_root_path(root))
-    }
 }
 
 /// Why the managed layout could not be opened.
@@ -113,18 +80,6 @@ impl From<io::Error> for LayoutError {
     }
 }
 
-/// What opening the home did with a legacy XDG layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HomeMigration {
-    /// Moved into the home (the installation by one rename).
-    Migrated,
-    /// Moved into the home, but the installation stays where it is (another
-    /// filesystem, or a location the user chose) and the pointer names it.
-    InstallationKeptInPlace,
-    /// A home already existed: the legacy layout was left untouched.
-    LegacyIgnored,
-}
-
 impl LauncherPaths {
     pub(crate) fn discover() -> io::Result<Self> {
         Self::discover_from(|name| env::var_os(name))
@@ -146,25 +101,10 @@ impl LauncherPaths {
                     "PD2_LAUNCHER_HOME was not a normalized absolute path",
                 ));
             }
-            // An explicit home is used exactly as given: nothing is
-            // migrated into it.
+            // An explicit home is used exactly as given.
             return Ok(Self::from_home(root));
         }
-        // An XDG base as earlier releases resolved it; a relative value is
-        // ignored, as the XDG specification requires.
-        let base = |variable: &str, fallback: &str| {
-            environment(variable)
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .unwrap_or_else(|| home.join(fallback))
-                .join("pd2-launcher")
-        };
-        let legacy = LegacyRoots {
-            data: base("XDG_DATA_HOME", ".local/share"),
-            state: base("XDG_STATE_HOME", ".local/state"),
-            config: base("XDG_CONFIG_HOME", ".config"),
-        };
-        Ok(Self::from_home(home.join(HOME_DIRECTORY)).with_legacy(legacy))
+        Ok(Self::from_home(home.join(HOME_DIRECTORY)))
     }
 
     /// Everything below one home: `game/`, `config/`, and `logs/`.
@@ -177,48 +117,12 @@ impl LauncherPaths {
             exports_root: home.join("logs/exports"),
             default_managed_root: home.join(GAME_DIRECTORY),
             home: Some(home),
-            legacy: None,
             managed: Arc::default(),
-            migration: Arc::default(),
-        }
-    }
-
-    /// Migrate `legacy` into the home when it is opened the first time.
-    pub(crate) fn with_legacy(mut self, legacy: LegacyRoots) -> Self {
-        self.legacy = legacy.valid().then_some(legacy);
-        self
-    }
-
-    /// The legacy layout as earlier releases resolved it, for completing
-    /// their interrupted moves before migrating.
-    pub(crate) fn legacy_view(legacy: &LegacyRoots) -> Self {
-        Self {
-            home: None,
-            config_root: legacy.config.clone(),
-            state_root: legacy.state.clone(),
-            diagnostics_root: legacy.state.join("diagnostics"),
-            exports_root: legacy.state.join("exports"),
-            default_managed_root: legacy.managed_root(),
-            legacy: None,
-            managed: Arc::default(),
-            migration: Arc::default(),
         }
     }
 
     pub(crate) fn home(&self) -> Option<&Path> {
         self.home.as_deref()
-    }
-
-    pub(crate) fn legacy(&self) -> Option<&LegacyRoots> {
-        self.legacy.as_ref()
-    }
-
-    /// What the last open did with a legacy layout, reported once.
-    pub(crate) fn take_migration(&self) -> Option<HomeMigration> {
-        self.migration
-            .write()
-            .ok()
-            .and_then(|mut value| value.take())
     }
 
     /// Creates only Launcher-owned user directories and the shared installation
@@ -228,15 +132,6 @@ impl LauncherPaths {
     /// unavailable. The returned root-selection lock is held shared for as
     /// long as this Launcher keeps the root open.
     pub(crate) fn open_managed_layout(&self) -> Result<SelectionLock, LayoutError> {
-        self.open_managed_layout_with(&crate::migration::NoMigrationFaults)
-    }
-
-    /// [`Self::open_managed_layout`] with a crash-injection seam for the
-    /// legacy migration.
-    pub(crate) fn open_managed_layout_with(
-        &self,
-        faults: &dyn crate::migration::MigrationFaults,
-    ) -> Result<SelectionLock, LayoutError> {
         if let Some(home) = &self.home {
             ensure_app_directory(home)?;
         }
@@ -245,14 +140,6 @@ impl LauncherPaths {
         }
         let selection = SelectionLock::acquire_shared(&self.state_root)
             .map_err(|_| LayoutError::SelectionBusy)?;
-        // Before anything else is created in the home, so a legacy layout
-        // moves into it whole.
-        if self.home.is_some() {
-            let outcome = crate::migration::prepare_home(self, &selection, faults)?;
-            if let Ok(mut migration) = self.migration.write() {
-                *migration = outcome;
-            }
-        }
         for directory in [self.diagnostics_root(), self.exports_root()] {
             ensure_owned_directory(&directory)?;
         }
@@ -341,8 +228,7 @@ impl LauncherPaths {
         self.config_root.join("settings.json")
     }
 
-    /// Where the player's characters are kept, outside every installation;
-    /// `None` for a view of the legacy XDG layout.
+    /// Where the player's characters are kept, outside every installation.
     pub(crate) fn kept_saves(&self) -> Option<crate::save_keeper::KeptSaves> {
         self.home
             .as_deref()
@@ -914,8 +800,33 @@ mod tests {
         assert_eq!(paths.settings_file(), home.join("config/settings.json"));
         assert!(home.join("logs/diagnostics").is_dir());
         assert!(home.join("logs/exports").is_dir());
-        assert!(home.join(crate::migration::HOME_MARKER).is_file());
-        assert_eq!(paths.take_migration(), None);
+    }
+
+    #[test]
+    fn the_home_is_below_home_or_where_the_override_names_it() {
+        let environment = |override_value: Option<&'static str>| {
+            move |name: &str| -> Option<OsString> {
+                match name {
+                    "HOME" => Some("/home/player".into()),
+                    HOME_OVERRIDE => override_value.map(Into::into),
+                    _ => None,
+                }
+            }
+        };
+        let default = LauncherPaths::discover_from(environment(None)).unwrap();
+        assert_eq!(default.home(), Some(Path::new("/home/player/.pd2launcher")));
+        let custom = LauncherPaths::discover_from(environment(Some("/srv/pd2"))).unwrap();
+        assert_eq!(custom.managed_root(), Path::new("/srv/pd2/game"));
+        assert_eq!(
+            custom.settings_file(),
+            Path::new("/srv/pd2/config/settings.json")
+        );
+        for invalid in ["relative/pd2", "/tmp/../pd2", "/tmp/./pd2"] {
+            assert!(
+                LauncherPaths::discover_from(environment(Some(invalid))).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     fn fixture_paths(fixture: &TempDir) -> LauncherPaths {

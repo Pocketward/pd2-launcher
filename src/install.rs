@@ -2400,17 +2400,6 @@ pub(crate) fn reset_managed_prefix(root: &Directory, lease: &File) -> std::io::R
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    // The row's earlier runtime serves only a prefix it made; with that
-    // prefix gone the next install uses the current runtime.
-    if let Some(retained) = crate::runtime::retained() {
-        match root.open_directory(&Path::new("runner").join(retained.identity)) {
-            Ok(_) => root
-                .open_directory(Path::new("runner"))?
-                .remove_owned_tree(OsStr::new(retained.identity))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
     crate::stage_marker::clear(root)?;
     root.sync()
 }
@@ -2434,11 +2423,12 @@ fn validate_artifact_cache(paths: &ManagedPaths) -> Result<(), ArtifactRejection
 
 fn validate_artifact_inventory(cache: &Directory) -> Result<(), ArtifactRejection> {
     const ALLOWED: &[&str] = &[
-        crate::runtime::LEGACY_CACHE_NAME,
+        crate::runtime::WINE_GE_8_26.cache_name,
         crate::runtime::WINE_WOW64_11_11.cache_name,
-        // Downloaded for the row's earlier runtime: never used again,
-        // tolerated so the caches it filled keep working.
-        crate::runtime::WINE_WOW64_11_18.cache_name,
+        // Downloaded by the x86-64 row's Wine 11.18 in caches that builds
+        // before the first release filled: never used, tolerated so that
+        // every download and install of those installations still works.
+        "wine-11.18-amd64-wow64.verified",
         "wine-gecko-2.47.4-x86.verified",
         "wine-mono-11.3.0-x86.verified",
         "windowsdesktop-runtime-6.0.36-win-x86.verified",
@@ -2630,18 +2620,19 @@ mod tests {
 
     /// A launcher folder copied from the other host row (an x86-64 PC's onto
     /// an ARM64 device, or back) keeps that row's runtime download: it is
-    /// tolerated and never used, so the cache still serves this row.
+    /// tolerated and never used, so the cache still serves this row. So is
+    /// the Wine 11.18 download of builds before the first release.
     #[test]
     fn the_cache_inventory_accepts_either_host_rows_runtime_download() {
         let fixture = tempfile::tempdir().unwrap();
         let cache = fixture.path().join("cache/artifacts");
         std::fs::create_dir_all(&cache).unwrap();
-        for runtime in [
-            &crate::runtime::WINE_GE_8_26,
-            &crate::runtime::WINE_WOW64_11_11,
-            &crate::runtime::WINE_WOW64_11_18,
+        for name in [
+            crate::runtime::WINE_GE_8_26.cache_name,
+            crate::runtime::WINE_WOW64_11_11.cache_name,
+            "wine-11.18-amd64-wow64.verified",
         ] {
-            std::fs::write(cache.join(runtime.cache_name), b"runtime").unwrap();
+            std::fs::write(cache.join(name), b"runtime").unwrap();
         }
         assert_eq!(
             validate_artifact_inventory(&Directory::open(&cache).unwrap()),
@@ -3020,8 +3011,7 @@ mod tests {
     }
 
     #[test]
-    fn start_over_removes_only_the_prefix_the_earlier_runtime_and_the_stage_marker_under_the_lease()
-    {
+    fn start_over_removes_only_the_prefix_and_the_stage_marker_under_the_lease() {
         let fixture = TempDir::new().unwrap();
         let root_path = fixture.path();
         let outside = TempDir::new().unwrap();
@@ -3029,7 +3019,6 @@ mod tests {
         let current = format!("runner/{}/bin", crate::runtime::current().identity);
         for directory in [
             current.as_str(),
-            "runner/wine-11.18-amd64-wow64/bin",
             "cache/artifacts",
             "cache/xdg",
             "prefix/drive_c/Program Files (x86)/Diablo II/Save",
@@ -3038,16 +3027,6 @@ mod tests {
             fs::create_dir_all(root_path.join(directory)).unwrap();
         }
         fs::write(root_path.join(&current).join("wine"), b"wine").unwrap();
-        fs::write(
-            root_path.join("runner/wine-11.18-amd64-wow64/bin/wine"),
-            b"earlier wine",
-        )
-        .unwrap();
-        fs::write(
-            root_path.join("cache/artifacts/wine-11.18-amd64-wow64.verified"),
-            b"earlier archive",
-        )
-        .unwrap();
         fs::write(
             root_path.join("cache/artifacts/artifact-01.partial"),
             b"half",
@@ -3089,17 +3068,7 @@ mod tests {
             fs::read(root_path.join(&current).join("wine")).unwrap(),
             b"wine"
         );
-        // The x86-64 row's earlier runtime served only the removed prefix.
-        assert_eq!(
-            root_path.join("runner/wine-11.18-amd64-wow64").exists(),
-            crate::runtime::retained().is_none()
-        );
         // Downloads are kept.
-        assert!(
-            root_path
-                .join("cache/artifacts/wine-11.18-amd64-wow64.verified")
-                .is_file()
-        );
         assert_eq!(
             fs::read(root_path.join("cache/artifacts/artifact-01.partial")).unwrap(),
             b"half"

@@ -269,14 +269,6 @@ fn readiness_on(root: &Directory, android: bool) -> DownloadReadiness {
     if record.schema != SCHEMA || record.items.is_empty() || record.items.len() > MAX_ITEMS {
         return DownloadReadiness::Incomplete;
     }
-    // Downloads made for the row's earlier runtime lack the current one,
-    // which an install needs unless a prefix keeps the earlier runtime.
-    if let Some(retained) = crate::runtime::retained() {
-        let archive = format!("cache/artifacts/{}", retained.cache_name);
-        if record.items.iter().any(|item| item.path == archive) {
-            return DownloadReadiness::Incomplete;
-        }
-    }
     let mut uncounted = 0_u64;
     for item in &record.items {
         if !counted(&item.path, android) {
@@ -395,28 +387,6 @@ mod tests {
     use std::fs;
 
     use super::*;
-
-    #[test]
-    fn downloads_holding_the_earlier_runtime_archive_are_downloaded_again() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root_path = fixture.path();
-        fs::create_dir_all(root_path.join("cache/artifacts")).unwrap();
-        let root = Directory::open(root_path).unwrap();
-        let need = DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, true);
-        let mut paths = vec!["cache/artifacts/gecko.verified".to_owned()];
-        fs::write(root_path.join(&paths[0]), b"gecko").unwrap();
-        record(&root, DownloadPlan::Installers, need, &paths).unwrap();
-        assert!(readiness(&root).serves(DownloadPlan::Installers, need));
-
-        let Some(retained) = crate::runtime::retained() else {
-            return;
-        };
-        let archive = format!("cache/artifacts/{}", retained.cache_name);
-        fs::write(root_path.join(&archive), b"earlier runtime").unwrap();
-        paths.push(archive);
-        record(&root, DownloadPlan::Installers, need, &paths).unwrap();
-        assert_eq!(readiness(&root), DownloadReadiness::Incomplete);
-    }
 
     #[test]
     fn the_result_holds_only_while_every_recorded_file_is_unchanged() {

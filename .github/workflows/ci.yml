@@ -1,6 +1,6 @@
 # Checks of every push to main and every pull request: formatting, Clippy
 # without warnings and the unit tests, for the default (dev) build and with all
-# features (the release build and the x86-64 host row).
+# features (the release build).
 name: Checks
 
 on:
@@ -63,3 +63,15 @@ jobs:
 
       - name: Tests, default features
         run: cargo test --locked --all-targets
+
+      # The Launcher engine of the Android app: the build without the window.
+      - name: Clippy, without the window
+        run: cargo clippy --locked --all-targets --no-default-features --features release-build -- -D warnings
+
+      - name: Tests, without the window
+        run: cargo test --locked --all-targets --no-default-features --features release-build
+
+      # As the Android app builds it: without the tests, whose dev-dependencies turn on more
+      # features of shared crates.
+      - name: Clippy, without the window or the tests
+        run: cargo clippy --locked --no-default-features --features release-build -- -D warnings

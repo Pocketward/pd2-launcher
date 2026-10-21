@@ -40,16 +40,15 @@ use super::{
     ActionId, ActionView, ActiveJobView, AuthorizationView, DeckPresentation, Destination,
     DownloadItemState, DownloadRowView, EvidenceTone, FIELD_HEIGHT, FlowStep, FolderOpenView,
     GameView, HostView, ImportModeView, InstallPlan, InstallerMediaView, LauncherView,
-    OperationPhase, OperationStatusView, OperationView, PhysicalDisplaySize,
-    RendererPreferenceView, ReportView, ResultCardView, ResultNextStep, SAFE_STOP_NOTE,
-    SavesPutAsideView, SettingsChange, SettingsPersistenceView, SetupStep, SourceBadgeView,
-    StepAffordance, StepMark, StopResultView, TaskState, UiSnapshot, about_built_with,
-    about_version, blizzard_windows_notice, check_again_available, close_warning,
-    copied_folder_note, download_rows, existing_found_line, flow_failed, flow_progress,
-    game_files_folder, guide_applies, guided_actions, human_bytes, install_command,
-    install_percent, install_tasks, install_title, key_length_problem, official_launcher_available,
-    official_launcher_offered, opening_step, repair_rows, result_card, running_step,
-    service_failure, standing_step, start_over_available, step_affordance, step_mark,
+    OperationPhase, OperationStatusView, OperationView, RendererPreferenceView, ReportView,
+    ResultCardView, ResultNextStep, SAFE_STOP_NOTE, SavesPutAsideView, SettingsChange,
+    SettingsPersistenceView, SetupStep, SourceBadgeView, StepAffordance, StepMark, StopResultView,
+    TaskState, UiSnapshot, about_built_with, about_version, blizzard_windows_notice,
+    check_again_available, close_warning, copied_folder_note, download_rows, existing_found_line,
+    flow_failed, flow_progress, game_files_folder, guide_applies, guided_actions, human_bytes,
+    install_command, install_percent, install_tasks, install_title, key_length_problem,
+    official_launcher_available, official_launcher_offered, opening_step, repair_rows, result_card,
+    running_step, service_failure, standing_step, start_over_available, step_affordance, step_mark,
     theme::palette,
 };
 use super::{PlayUpdate, about_terms, play_facts, play_main, play_update, plays_without_updating};
@@ -4458,15 +4457,6 @@ fn source_index(artifact: DownloadArtifact) -> usize {
 impl Render for LauncherView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_source_inputs(window, cx);
-        self.display_size = window.display(cx).and_then(|display| {
-            let size = display.bounds().size;
-            PhysicalDisplaySize::detect(
-                cx.compositor_name(),
-                f32::from(size.width),
-                f32::from(size.height),
-                window.scale_factor(),
-            )
-        });
         let snapshot = self.state.snapshot().clone();
         let deck = DeckPresentation::project(&snapshot, self.authorization_complete(cx));
         let destination = self.state.destination();

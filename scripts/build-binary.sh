@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# Build the standalone launcher executable for this host's architecture:
-# the same binary as the AppImage and the Debian package, compiled with the
-# standalone identity, which it attests by itself when run as is. Run it
-# from a clean, committed checkout, normally inside the pinned ubuntu:22.04
-# container (scripts/build-appimage-container.sh <dir> <arch> binary).
+# Build the standalone launcher executable for this host's architecture,
+# compiled with the standalone identity, which it attests by itself when run
+# as is. Run it from a clean, committed checkout, normally inside the pinned
+# ubuntu:22.04 container (scripts/build-appimage-container.sh <dir> <arch>).
 set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 output_directory=${1:-"$repository_root/dist"}
-package_version=0.1.6
+package_version=0.1.7
 architecture=${PD2_TARGET_ARCHITECTURE:-$(uname -m)}
 case "$architecture" in
-  aarch64) cargo_features= ;;
-  # The packaged x86-64 artifact admits its own host row.
-  x86_64) cargo_features=x86_64-host-row ;;
+  aarch64 | x86_64) ;;
   *)
     echo "Packaging supports only aarch64 or x86_64 targets, not $architecture" >&2
     exit 1
@@ -21,8 +18,9 @@ case "$architecture" in
 esac
 # PD2_RELEASE_BUILD=1 builds without a dev build's testing additions
 # (src/dev_build.rs).
+cargo_features=
 if [[ -n "${PD2_RELEASE_BUILD:-}" ]]; then
-  cargo_features=${cargo_features:+$cargo_features,}release-build
+  cargo_features=release-build
 fi
 package_identity="native-${architecture}-binary"
 artifact_name="pd2-launcher-${package_version}-${architecture}"
@@ -85,8 +83,8 @@ touch -d "@$SOURCE_DATE_EPOCH" "$staged"
 
 required_glibc=$("$repository_root/scripts/audit-launcher-elf.sh" "$staged" "$architecture")
 "$repository_root/scripts/audit-package-contents.sh" "$stage_root"
-# Run as is, with no marker in the environment, it attests itself.
-identity_output=$(env -u PD2_LAUNCHER_APPIMAGE_IDENTITY "$staged" --verify-package-identity) || {
+# Run as is, it attests itself.
+identity_output=$("$staged" --verify-package-identity) || {
   echo "the standalone launcher rejected its compiled identity" >&2
   exit 1
 }

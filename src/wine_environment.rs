@@ -148,10 +148,6 @@ pub(crate) fn use_compatibility_driver(compatibility: bool) {
     );
 }
 
-/// Set by the AppImage's entry point when it, not the host, set
-/// `DISABLE_GAMESCOPE_WSI` (for the Launcher's own window).
-const LAUNCHER_SET_GAMESCOPE_WSI: &str = "PD2_LAUNCHER_SET_DISABLE_GAMESCOPE_WSI";
-
 /// Whether the host's `name` reaches Wine.
 fn passes_through(name: &OsStr, value: &OsStr, android: bool) -> bool {
     let name = name.as_bytes();
@@ -188,7 +184,6 @@ pub(crate) fn compose_on(
     android: bool,
 ) -> Vec<(OsString, OsString)> {
     let host = host.into_iter().collect::<BTreeMap<_, _>>();
-    let launcher_set_wsi = host.contains_key(OsStr::new(LAUNCHER_SET_GAMESCOPE_WSI));
     let compatibility =
         if android && COMPATIBILITY_DRIVER.load(std::sync::atomic::Ordering::Relaxed) {
             host.iter()
@@ -207,11 +202,6 @@ pub(crate) fn compose_on(
         .chain(compatibility)
         .filter(|(name, value)| passes_through(name, value, android))
         .collect::<BTreeMap<_, _>>();
-    // The AppImage turns gamescope's Vulkan layer off for the Launcher's own
-    // window; the game keeps whatever the host itself chose.
-    if launcher_set_wsi {
-        environment.remove(OsStr::new("DISABLE_GAMESCOPE_WSI"));
-    }
     for setting in settings {
         if setting.kind == Kind::Default && environment.contains_key(&setting.name) {
             continue;
@@ -427,15 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn gamescopes_vulkan_layer_stays_off_only_where_the_host_turned_it_off() {
-        let set_by_launcher = compose(
-            host(&[
-                ("DISABLE_GAMESCOPE_WSI", "1"),
-                ("PD2_LAUNCHER_SET_DISABLE_GAMESCOPE_WSI", "1"),
-            ]),
-            &[],
-        );
-        assert_eq!(get(&set_by_launcher, "DISABLE_GAMESCOPE_WSI"), None);
+    fn gamescopes_vulkan_layer_stays_off_where_the_host_turned_it_off() {
         let set_by_host = compose(host(&[("DISABLE_GAMESCOPE_WSI", "1")]), &[]);
         assert_eq!(get(&set_by_host, "DISABLE_GAMESCOPE_WSI"), Some("1"));
     }

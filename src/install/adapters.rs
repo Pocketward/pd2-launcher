@@ -839,9 +839,6 @@ impl ArtifactSource for ProductionArtifactSource {
             }
         }
 
-        if let Some(legacy) = legacy_runtime_cache(spec, cache, cache_directory)? {
-            return Ok(legacy);
-        }
         if self.cache_only && !wrapper_fetch {
             return Err(AdapterFailure::here());
         }
@@ -1850,36 +1847,6 @@ fn volatile_wrapper(kind: ArtifactKind) -> bool {
         kind,
         ArtifactKind::BaseGameWrapper | ArtifactKind::ExpansionWrapper
     )
-}
-
-/// Reuses a runtime archive cached under the shared name older releases used
-/// for every row, so an existing x86-64 cache is not downloaded again.
-/// The legacy entry must verify against this row's exact archive; any other
-/// content is left in place and the canonical name is acquired normally.
-fn legacy_runtime_cache(
-    spec: &ArtifactSpec,
-    cache: &Path,
-    cache_directory: &Directory,
-) -> Result<Option<AcquiredArtifact>, AdapterFailure> {
-    let legacy_name = crate::runtime::LEGACY_CACHE_NAME;
-    if spec.kind != ArtifactKind::ManagedRuntime
-        || spec.is_custom()
-        || cache_name(spec) == legacy_name
-    {
-        return Ok(None);
-    }
-    let legacy_file = match cache_directory.open_file(Path::new(legacy_name)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(AdapterFailure::here()),
-    };
-    let legacy = AcquiredArtifact::new(
-        cache.join(legacy_name),
-        spec.request_url(),
-        spec.request_url(),
-        spec.expected_filename.map(str::to_owned),
-    );
-    Ok(verify_cached_artifact(spec, legacy, &legacy_file, None).ok())
 }
 
 fn cache_receipt_name(spec: &ArtifactSpec) -> String {
@@ -6970,55 +6937,6 @@ mod tests {
             source
                 .acquire(&spec, cache.path(), &OperationControl::default())
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn runtime_cached_under_the_legacy_name_is_reused_and_a_stale_one_is_ignored() {
-        let bytes = b"verified runtime fixture";
-        let spec = ArtifactSpec {
-            kind: ArtifactKind::ManagedRuntime,
-            request_url: Cow::Borrowed("https://fixtures.invalid/runtime"),
-            ..fixed_fixture_spec(bytes)
-        };
-        let legacy = crate::runtime::LEGACY_CACHE_NAME;
-
-        let cache = tempfile::tempdir().unwrap();
-        fs::write(cache.path().join(legacy), bytes).unwrap();
-        let offline = ProductionArtifactSource::with_http(FakeHttp {
-            response: Mutex::new(None),
-        });
-        let reused = offline
-            .acquire(&spec, cache.path(), &OperationControl::default())
-            .expect("verified legacy runtime cache is reused without a download");
-        assert_eq!(reused.path, cache.path().join(legacy));
-
-        if cache_name(&spec) == legacy {
-            return;
-        }
-        // A legacy entry holding another runtime's archive is not an error for
-        // this row: the canonical name is downloaded and the entry left alone.
-        let cache = tempfile::tempdir().unwrap();
-        fs::write(cache.path().join(legacy), b"Wine-GE archive").unwrap();
-        let source = ProductionArtifactSource::with_http(FakeHttp {
-            response: Mutex::new(Some(ArtifactHttpResponse {
-                final_url: spec.request_url().to_owned(),
-                status: 200,
-                declared_length: Some(bytes.len() as u64),
-                content_range: None,
-                suggested_filename: None,
-                retry_after: None,
-                body: Box::new(Cursor::new(bytes.to_vec())),
-            })),
-        });
-        let acquired = source
-            .acquire(&spec, cache.path(), &OperationControl::default())
-            .unwrap();
-        assert_eq!(acquired.path, cache.path().join(cache_name(&spec)));
-        assert_eq!(fs::read(&acquired.path).unwrap(), bytes);
-        assert_eq!(
-            fs::read(cache.path().join(legacy)).unwrap(),
-            b"Wine-GE archive"
         );
     }
 

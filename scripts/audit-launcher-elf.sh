@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# audit-launcher-elf.sh <binary> <aarch64|x86_64>: the packaged launcher binary
-# is a native PIE for the architecture, with the expected program interpreter,
-# no RPATH/RUNPATH, exactly the host libraries the packages declare, and no
-# GLIBC symbol version above the architecture's ceiling. Prints the highest
-# GLIBC version it requires. Shared by every package build's audit.
+# audit-launcher-elf.sh <binary> <aarch64|x86_64>: the launcher executable is a
+# native PIE for the architecture, with the expected program interpreter, no
+# RPATH/RUNPATH, exactly the expected host libraries, and no GLIBC symbol
+# version above the architecture's ceiling. Prints the highest GLIBC version it
+# requires.
 set -euo pipefail
 
 if [[ $# -ne 2 || ! -f "$1" ]]; then
@@ -85,7 +85,7 @@ if [[ -z "$required_glibc" ]]; then
 fi
 if [[ $(printf '%s\n' "$glibc_ceiling" "$required_glibc" | sort -V | tail -n 1) != "$glibc_ceiling" ]]; then
   echo "launcher requires GLIBC_$required_glibc, above the $architecture_label ceiling GLIBC_$glibc_ceiling" >&2
-  echo "build packages with scripts/build-appimage-container.sh" >&2
+  echo "build the executable with scripts/build-appimage-container.sh" >&2
   exit 1
 fi
 

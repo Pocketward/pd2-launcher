@@ -3,11 +3,10 @@
 //!
 //! On start the interactive Launcher writes `io.github.kapdon.pd2-launcher.desktop`
 //! into `$XDG_DATA_HOME/applications` (`~/.local/share/applications`), with
-//! `Exec=` naming where it really is: the AppImage file (`$APPIMAGE`), or
-//! the executable itself. Every desktop that follows the XDG specifications
-//! reads that folder (GNOME, KDE, XFCE, Sway's fuzzel, wofi, rofi), so the
-//! location is the same on every distribution. It is skipped where it would
-//! be wrong: a package already installed a system entry (the .deb), the
+//! `Exec=` naming the executable itself. Every desktop that follows the XDG
+//! specifications reads that folder (GNOME, KDE, XFCE, Sway's fuzzel, wofi,
+//! rofi), so the location is the same on every distribution. It is skipped
+//! where it would be wrong: a package already installed a system entry, the
 //! Launcher runs from a temporary location, or the player turned it off.
 //! Only files the Launcher wrote (marked [`MANAGED_KEY`]) are ever replaced
 //! or removed; a same-named entry of the player's own is left alone.
@@ -35,7 +34,7 @@ pub(crate) struct Environment {
     pub(crate) data_home: Option<PathBuf>,
     /// `$XDG_DATA_DIRS`, or `/usr/local/share:/usr/share`.
     pub(crate) data_dirs: Vec<PathBuf>,
-    /// The program the entry starts: `$APPIMAGE`, or this executable.
+    /// The program the entry starts: this executable.
     pub(crate) executable: Option<PathBuf>,
     /// Folders a program only runs from for a while (`/tmp`, `$TMPDIR`, …).
     pub(crate) temporary: Vec<PathBuf>,
@@ -56,10 +55,9 @@ impl Environment {
             })
             .filter(|dirs| !dirs.is_empty())
             .unwrap_or_else(|| vec!["/usr/local/share".into(), "/usr/share".into()]);
-        let executable = var("APPIMAGE")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| fs::canonicalize("/proc/self/exe").ok());
+        // Not `$APPIMAGE`: no release is an AppImage, so that variable can
+        // only come from another program's AppImage that started this one.
+        let executable = fs::canonicalize("/proc/self/exe").ok();
         let mut temporary = vec![
             PathBuf::from("/tmp"),
             PathBuf::from("/var/tmp"),
@@ -231,7 +229,7 @@ fn is_managed(content: &str) -> bool {
 }
 
 /// Whether `executable` lies in a temporary location, including an
-/// AppImage's own mount (`…/.mount_*`) when `$APPIMAGE` was not set.
+/// AppImage's mount (`…/.mount_*`).
 fn is_temporary(executable: &Path, temporary: &[PathBuf]) -> bool {
     temporary.iter().any(|dir| executable.starts_with(dir))
         || executable

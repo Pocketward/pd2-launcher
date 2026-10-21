@@ -1,8 +1,13 @@
 //! PD2 Launcher modular-monolith interface.
 
 #![forbid(unsafe_code)]
+// Without the window (the `gui` feature), what only the window uses (most
+// of the view model, unattended mode) is unused; the default build, with
+// the window, still checks the whole crate for dead code.
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod activity;
+#[cfg(feature = "gui")]
 mod app_menu;
 pub mod audit;
 mod automation;
@@ -19,7 +24,6 @@ mod in_place_drive;
 mod install;
 mod location;
 mod manifest;
-mod migration;
 mod network;
 mod operation;
 mod orphaned_wine;
@@ -37,6 +41,7 @@ mod save_keeper;
 mod sources;
 mod stage_marker;
 mod startup_credentials;
+#[cfg(feature = "gui")]
 mod startup_failure;
 mod transaction;
 mod update;
@@ -70,7 +75,9 @@ pub use domain::{
 };
 
 pub use automation::ArgumentError;
-pub use composition::{package_identity_probe, run};
+pub use composition::package_identity_probe;
+#[cfg(feature = "gui")]
+pub use composition::run;
 
 /// Process exit status for the finished run: nonzero when the window could
 /// not open, when unattended mode stopped without finishing, or when the
@@ -85,20 +92,29 @@ pub fn run_with_arguments(
     arguments: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Result<(), ArgumentError> {
     match automation::parse_arguments(arguments)? {
+        #[cfg(feature = "gui")]
         automation::ArgumentMode::Interactive => {
             startup_failure::install_panic_hook();
             composition::run();
         }
+        #[cfg(feature = "gui")]
         automation::ArgumentMode::SaveReport => {
             automation::request_report();
             startup_failure::install_panic_hook();
             composition::run();
         }
         automation::ArgumentMode::Help => println!("{}", automation::USAGE),
+        #[cfg(feature = "gui")]
         automation::ArgumentMode::Unattended(request) => {
             startup_failure::install_panic_hook();
             composition::run_with_automation(request);
         }
+        // A build without the window (no `gui` feature) is only the
+        // Android app's Launcher engine.
+        #[cfg(not(feature = "gui"))]
+        automation::ArgumentMode::Interactive
+        | automation::ArgumentMode::SaveReport
+        | automation::ArgumentMode::Unattended(_) => return Err(automation::WINDOW_UNAVAILABLE),
         // No desktop: a failure goes to standard error and the Control
         // channel, never to a dialog.
         automation::ArgumentMode::Engine => {

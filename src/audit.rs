@@ -627,12 +627,7 @@ pub enum GuestExecutionBlocker {
 /// Identity of the currently running Launcher artifact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LauncherArtifactEvidence {
-    NativeAarch64PortableBundle,
-    NativeX86_64PortableBundle,
-    /// The Debian package: the same launcher, installed by dpkg.
-    NativeAarch64DebPackage,
-    NativeX86_64DebPackage,
-    /// The standalone executable: the same launcher as one file, run as is.
+    /// The standalone executable: the launcher as one file, run as is.
     NativeAarch64StandaloneBinary,
     NativeX86_64StandaloneBinary,
     #[default]
@@ -1162,16 +1157,6 @@ impl AuditPolicy {
         .expect("static runtime identity")
     }
 
-    /// This policy for an installation on the pinned `runtime` instead of
-    /// its own (the row's earlier runtime, kept for a prefix it made).
-    fn for_pinned_runtime(&self, runtime: &crate::runtime::ManagedRuntime) -> Self {
-        Self {
-            runtime_identity: runtime.identity.to_owned(),
-            runtime_files: Self::runtime_file_expectations(runtime),
-            base_games: self.base_games.clone(),
-        }
-    }
-
     fn runtime_file_expectations(
         runtime: &crate::runtime::ManagedRuntime,
     ) -> RuntimeFileExpectations {
@@ -1336,11 +1321,9 @@ impl Auditor {
         // A custom runtime is audited only while the Wine source is custom;
         // with the built-in source only a pinned runtime is.
         let selected_runtime = managed_root.as_ref().map(|root| {
-            crate::runtime::InstalledRuntime::select_with(
+            crate::runtime::InstalledRuntime::select(
                 root,
                 request.custom_source(CustomComponent::WineRuntime),
-                crate::runtime::current(),
-                crate::runtime::retained(),
             )
         });
         let custom_runtime =
@@ -1348,19 +1331,7 @@ impl Auditor {
         // The Android app's runtime: provided by the app, audited by its
         // structure and its exact `wine --version`.
         let app_runtime = selected_runtime == Some(crate::runtime::InstalledRuntime::App);
-        // A prefix the row's earlier pinned runtime made stays on it, and the
-        // installation is audited against that runtime's own pins.
-        let retained_runtime = match selected_runtime {
-            Some(crate::runtime::InstalledRuntime::BuiltIn(runtime))
-                if Some(runtime) == crate::runtime::retained() =>
-            {
-                Some(runtime)
-            }
-            _ => None,
-        };
-        let retained_policy =
-            retained_runtime.map(|runtime| self.policy.for_pinned_runtime(runtime));
-        let policy = retained_policy.as_ref().unwrap_or(&self.policy);
+        let policy = &self.policy;
         let (runtime_base, loader_name, loader_takes_wine_path) = if custom_runtime {
             (CUSTOM_RUNTIME_BASE.to_owned(), "wine", false)
         } else if app_runtime {
@@ -1384,8 +1355,6 @@ impl Auditor {
         } else if app_runtime {
             runtime_preflight =
                 runtime_preflight.with_wine_version(crate::runtime::APP_RUNTIME_VERSION);
-        } else if let Some(runtime) = retained_runtime {
-            runtime_preflight = runtime_preflight.with_wine_version(runtime.version);
         }
 
         // The game folder: `Some(None)` for the Managed one, `Some(Some(_))`
@@ -1627,7 +1596,6 @@ impl Auditor {
             custom_sources,
             custom_runtime,
             app_runtime,
-            retained_runtime,
             prefix_components,
             official_launcher,
         }
@@ -1694,7 +1662,6 @@ pub struct InstallationReport {
     custom_runtime: bool,
     /// The audited runtime is the Android app's.
     app_runtime: bool,
-    retained_runtime: Option<&'static crate::runtime::ManagedRuntime>,
     prefix_components: PrefixComponents,
     official_launcher: OfficialLauncherTrust,
 }
@@ -1761,18 +1728,15 @@ impl InstallationReport {
     }
 
     /// The runtime the audit accepted and preflighted, which a launch
-    /// executes: the custom-source runtime, the row's earlier pinned runtime
-    /// for a prefix it made, or the row's pinned runtime.
+    /// executes: the custom-source runtime, the Android app's runtime, or the
+    /// row's pinned runtime.
     pub(crate) fn installed_runtime(&self) -> crate::runtime::InstalledRuntime {
         if self.custom_runtime {
             crate::runtime::InstalledRuntime::Custom
         } else if self.app_runtime {
             crate::runtime::InstalledRuntime::App
         } else {
-            crate::runtime::InstalledRuntime::BuiltIn(
-                self.retained_runtime
-                    .unwrap_or_else(crate::runtime::current),
-            )
+            crate::runtime::InstalledRuntime::BuiltIn(crate::runtime::current())
         }
     }
 
@@ -1938,8 +1902,7 @@ enum RowArchitecture {
 }
 
 /// One artifact/host row: the platform it serves, the Launcher artifacts it
-/// admits (the AppImage, the Debian package, and the standalone executable),
-/// whether it is certified in
+/// admits (the standalone executable), whether it is certified in
 /// this build, and the capabilities it requires. Admission is a lookup over this table rather than CPU checks
 /// spread through policy.
 struct HostRow {
@@ -1959,11 +1922,7 @@ const HOST_ROWS: [HostRow; 3] = [
     HostRow {
         architecture: RowArchitecture::Aarch64,
         android: false,
-        artifacts: &[
-            LauncherArtifactEvidence::NativeAarch64PortableBundle,
-            LauncherArtifactEvidence::NativeAarch64DebPackage,
-            LauncherArtifactEvidence::NativeAarch64StandaloneBinary,
-        ],
+        artifacts: &[LauncherArtifactEvidence::NativeAarch64StandaloneBinary],
         certified: true,
         capabilities: &[
             HostCapability::DisplaySession,
@@ -1979,15 +1938,11 @@ const HOST_ROWS: [HostRow; 3] = [
     HostRow {
         architecture: RowArchitecture::X86_64,
         android: false,
-        artifacts: &[
-            LauncherArtifactEvidence::NativeX86_64PortableBundle,
-            LauncherArtifactEvidence::NativeX86_64DebPackage,
-            LauncherArtifactEvidence::NativeX86_64StandaloneBinary,
-        ],
-        // The native x86-64 row is uncertified. It reports precise
-        // diagnostics everywhere but may be Supported only in builds that
-        // explicitly opt into the uncertified row.
-        certified: cfg!(feature = "x86_64-host-row"),
+        artifacts: &[LauncherArtifactEvidence::NativeX86_64StandaloneBinary],
+        // Certified in x86-64 builds, the only builds that run on these
+        // hosts; a build for another architecture reports the row's
+        // diagnostics but keeps the host Unsupported.
+        certified: cfg!(target_arch = "x86_64"),
         capabilities: &[
             HostCapability::DisplaySession,
             HostCapability::DirectGuest,
@@ -2037,13 +1992,22 @@ fn host_prerequisite_findings(
     host: &HostEvidence,
     launcher_artifact: LauncherArtifactEvidence,
 ) -> Vec<AuditFinding> {
+    row_findings(&HOST_ROWS, host, launcher_artifact)
+}
+
+/// [`host_prerequisite_findings`] with the host `rows`.
+fn row_findings(
+    rows: &[HostRow],
+    host: &HostEvidence,
+    launcher_artifact: LauncherArtifactEvidence,
+) -> Vec<AuditFinding> {
     let row_architecture = match HostPlatform::from_architecture(&host.architecture) {
         HostPlatform::Aarch64 => Some(RowArchitecture::Aarch64),
         HostPlatform::X86_64 => Some(RowArchitecture::X86_64),
         HostPlatform::Other(_) => None,
     };
     let android = host.os_id == ANDROID_OS_ID;
-    let Some(row) = HOST_ROWS
+    let Some(row) = rows
         .iter()
         .find(|row| Some(row.architecture) == row_architecture && row.android == android)
     else {
@@ -3705,10 +3669,13 @@ mod tests {
         assert_eq!(reasons(&ready), []);
         // Only the standalone ARM64 Launcher runs inside the app.
         assert_eq!(
-            host_prerequisite_findings(&ready, LauncherArtifactEvidence::NativeAarch64DebPackage)
-                .into_iter()
-                .map(|finding| finding.reason)
-                .collect::<Vec<_>>(),
+            host_prerequisite_findings(
+                &ready,
+                LauncherArtifactEvidence::NativeX86_64StandaloneBinary
+            )
+            .into_iter()
+            .map(|finding| finding.reason)
+            .collect::<Vec<_>>(),
             [FindingReason::LauncherArtifactUnverified]
         );
     }
@@ -3739,6 +3706,35 @@ mod tests {
             [FindingReason::PageSizeUnsupported]
         );
         assert_eq!(reasons(&desktop(true)), []);
+    }
+
+    #[test]
+    fn an_uncertified_row_reports_only_its_certification_gap() {
+        // The x86-64 row is uncertified in builds for another architecture,
+        // which the checks do not run; the same row table shows the gap.
+        let host = HostEvidence {
+            os_id: "rocknix".to_owned(),
+            display_session: DisplaySession::Wayland,
+            ..android_host(GuestExecutionEvidence::Translated {
+                interpreter_present: true,
+                page_size_4k: true,
+                rootfs_ready: true,
+                pending: false,
+            })
+        };
+        let artifact = LauncherArtifactEvidence::NativeAarch64StandaloneBinary;
+        let reasons = |rows: &[HostRow]| {
+            row_findings(rows, &host, artifact)
+                .into_iter()
+                .map(|finding| finding.reason)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reasons(&HOST_ROWS), []);
+        let uncertified = HostRow {
+            certified: false,
+            ..HOST_ROWS[0]
+        };
+        assert_eq!(reasons(&[uncertified]), [FindingReason::HostRowUncertified]);
     }
 
     #[test]

@@ -24,10 +24,9 @@ use crate::{
         DownloadsView, EvidenceTone, EvidenceView, FexSettingView, FolderOpenView, GameFolderView,
         GameNoticeView, GameView, GraphicsDriver, GraphicsProfile, HostView, ImportModeView,
         InstallerMediaView, Intent, LaunchSettingsView, LocationView, OperationPhase,
-        OperationStatusView, OperationView, PhysicalDisplaySize, REQUEST_NOT_STARTED, ReportView,
-        SavesPutAsideView, SequencedEvent, ServiceEndpoint, SettingsChange, SetupStep,
-        StepAffordance, StopResultView, SystemContractView, UiSnapshot, human_bytes,
-        human_duration, step_affordance,
+        OperationStatusView, OperationView, REQUEST_NOT_STARTED, ReportView, SavesPutAsideView,
+        SequencedEvent, ServiceEndpoint, SettingsChange, SetupStep, StepAffordance, StopResultView,
+        SystemContractView, UiSnapshot, human_bytes, human_duration, step_affordance,
     },
     sources::DownloadArtifact,
 };
@@ -249,14 +248,11 @@ pub(crate) trait CoordinatorBackend: Send + Sync + 'static {
     ) -> Result<(), BackendFailure> {
         Err(BackendFailure::new("location-previous-unavailable"))
     }
-    /// `display` is the physical size of the display the Launcher window is
-    /// on, when presentation could determine it; `driver` and `profile` the
-    /// Android app's graphics driver and D2GL graphics profile for this
-    /// launch (no profile from the desktop). A returned notice is shown for
-    /// this launch only.
+    /// `driver` and `profile` are the Android app's graphics driver and D2GL
+    /// graphics profile for this launch (no profile from the desktop). A
+    /// returned notice is shown for this launch only.
     fn launch_game(
         &self,
-        display: Option<PhysicalDisplaySize>,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
     ) -> Result<Option<GameNoticeView>, BackendFailure>;
@@ -785,8 +781,8 @@ impl Coordinator {
                     "Applying the Available update",
                 );
             }
-            Intent::LaunchGame(display, driver, profile) => {
-                self.launch_game(backend.as_ref(), display, driver, profile);
+            Intent::LaunchGame(driver, profile) => {
+                self.launch_game(backend.as_ref(), driver, profile);
             }
             Intent::OpenOfficialLauncher | Intent::OpenOfficialLauncherConfirmed => {
                 if !self.official_launcher_guard() {
@@ -1251,7 +1247,6 @@ impl Coordinator {
     fn launch_game(
         &mut self,
         backend: &dyn CoordinatorBackend,
-        display: Option<PhysicalDisplaySize>,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
     ) {
@@ -1272,7 +1267,7 @@ impl Coordinator {
             self.play_failed("play-preflight-rejected");
             return;
         }
-        let launched = backend.launch_game(display, driver, profile);
+        let launched = backend.launch_game(driver, profile);
         // The keep before it may have put characters aside, even when the
         // game then did not start.
         self.note_saves_put_aside(backend.take_saves_put_aside());
@@ -2259,7 +2254,6 @@ mod tests {
         authorized_installs: usize,
         update_calls: usize,
         launch_calls: usize,
-        launch_display: Option<PhysicalDisplaySize>,
         launch_driver: GraphicsDriver,
         launch_profile: Option<GraphicsProfile>,
         launch_notice: Option<GameNoticeView>,
@@ -2318,7 +2312,6 @@ mod tests {
                     authorized_installs: 0,
                     update_calls: 0,
                     launch_calls: 0,
-                    launch_display: None,
                     launch_driver: GraphicsDriver::Standard,
                     launch_profile: None,
                     launch_notice: None,
@@ -2637,7 +2630,6 @@ mod tests {
 
         fn launch_game(
             &self,
-            display: Option<PhysicalDisplaySize>,
             driver: GraphicsDriver,
             profile: Option<GraphicsProfile>,
         ) -> Result<Option<GameNoticeView>, BackendFailure> {
@@ -2648,7 +2640,6 @@ mod tests {
                 self.notify(state);
                 return Err(failure);
             }
-            state.launch_display = display;
             state.launch_driver = driver;
             state.launch_profile = profile;
             state.game = BackendGameState::Running;
@@ -3463,7 +3454,7 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::UpToDate);
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .unwrap();
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness.intents.send(Intent::StartOver).unwrap();
@@ -3526,7 +3517,7 @@ mod tests {
             "nothing is audited there"
         );
         for intent in [
-            Intent::LaunchGame(None, GraphicsDriver::Standard, None),
+            Intent::LaunchGame(GraphicsDriver::Standard, None),
             Intent::ContinueInstallation,
             Intent::StartOver,
         ] {
@@ -3606,7 +3597,7 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::UpToDate);
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .unwrap();
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -4071,7 +4062,7 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.installation(), InstallationStatus::Ready);
@@ -4123,12 +4114,9 @@ mod tests {
         assert_eq!(snapshot.installation(), InstallationStatus::Ready);
         assert!(snapshot.launch_preflight_passed());
 
-        let display = PhysicalDisplaySize::detect("Wayland", 1920.0, 1280.0, 1.6);
-        assert!(display.is_some());
         harness
             .intents
             .send(Intent::LaunchGame(
-                display,
                 GraphicsDriver::Compatibility,
                 Some(GraphicsProfile::Performance),
             ))
@@ -4138,7 +4126,6 @@ mod tests {
         assert_eq!(running.update(), UpdateStatus::CheckFailed);
         backend.wait_for(|state| {
             state.launch_calls == 1
-                && state.launch_display == display
                 && state.launch_driver == GraphicsDriver::Compatibility
                 && state.launch_profile == Some(GraphicsProfile::Performance)
         });
@@ -4156,7 +4143,7 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.game_notice(), Some(GameNoticeView::FirstD2glLaunch));
@@ -4173,7 +4160,7 @@ mod tests {
         backend.state.lock().expect("state").launch_notice = None;
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("second play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.game_notice(), None);
@@ -4409,7 +4396,7 @@ mod tests {
 
         // Nothing else may run while it is open.
         for intent in [
-            Intent::LaunchGame(None, GraphicsDriver::Standard, None),
+            Intent::LaunchGame(GraphicsDriver::Standard, None),
             Intent::ApplyUpdate,
             Intent::ContinueInstallation,
             Intent::OpenOfficialLauncher,
@@ -4451,7 +4438,7 @@ mod tests {
         });
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         backend.wait_for(|state| state.launch_calls == 1);
     }
@@ -4467,7 +4454,7 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -4555,7 +4542,7 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -4577,7 +4564,7 @@ mod tests {
         backend.wait_for(|state| state.update_calls == 1);
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .expect("play intent");
         thread::sleep(Duration::from_millis(80));
         assert_eq!(backend.state.lock().expect("state").launch_calls, 1);
@@ -4742,7 +4729,7 @@ mod tests {
         backend.state.lock().unwrap().saves_put_aside = Some(put_aside(1, 0, 0, "/b/backup-1"));
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .unwrap();
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(
@@ -5095,7 +5082,7 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.launch_preflight_passed());
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .unwrap();
         let failed = harness.wait_for(|snapshot| {
             snapshot
@@ -5129,7 +5116,7 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.launch_preflight_passed());
         harness
             .intents
-            .send(Intent::LaunchGame(None, GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
             .unwrap();
         let failed = harness.wait_for(|snapshot| {
             snapshot

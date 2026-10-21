@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
-# Build the AppImage, the Debian package, or the standalone executable inside
-# a pinned ubuntu:22.04 container so the launcher's glibc floor is GLIBC_2.35
-# instead of the build host's glibc.
+# Build the standalone executable inside a pinned ubuntu:22.04 container so
+# the launcher's glibc floor is GLIBC_2.35 instead of the build host's glibc.
 # The container runs in a build image that holds the build packages from a
 # dated Ubuntu snapshot and the Rust toolchain of rust-toolchain.toml, which
 # the pinned rustup-init installs. A build clones the committed HEAD into a
-# fixed path and runs the format's build script (scripts/build-binary.sh for
-# the executable) and its audits unchanged; it installs no packages and no
-# toolchain.
+# fixed path and runs scripts/build-binary.sh and its audits unchanged; it
+# installs no packages and no toolchain.
 #
-# usage: build-appimage-container.sh [OUTPUT_DIRECTORY] [x86_64|aarch64] [binary|appimage|deb]
+# usage: build-appimage-container.sh [OUTPUT_DIRECTORY] [x86_64|aarch64] [binary]
 #        build-appimage-container.sh --image-key [x86_64|aarch64]
 #        build-appimage-container.sh --image [x86_64|aarch64]
-# The format defaults to the standalone executable; the AppImage and the
-# Debian package wrap the same binary. The architecture defaults to the
-# host's. The container always runs the host's architecture; a foreign target
-# is cross-compiled against that architecture's libraries from the same
-# snapshot. Only the audits' short runs of the built launcher use a qemu-user
-# binfmt_misc handler with the F flag.
+# The standalone executable (binary) is the only format. The architecture
+# defaults to the host's. The container always runs the host's architecture;
+# a foreign target is cross-compiled against that architecture's libraries
+# from the same snapshot. Only the audit's short run of the built launcher
+# uses a qemu-user binfmt_misc handler with the F flag.
 #
 # The build image is made once per image key, a hash of everything that goes
 # into it (base image, snapshot, packages, rustup-init, toolchain file,
@@ -50,21 +47,14 @@ repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 if [[ $mode == build ]]; then
   output_directory=${1:-"$repository_root/dist"}
   architecture=${2:-$(uname -m)}
-  package_format=${3:-binary}
+  if [[ ${3:-binary} != binary ]]; then
+    echo "the container build makes only the standalone executable (binary), not $3" >&2
+    exit 1
+  fi
 else
   architecture=${1:-$(uname -m)}
-  package_format=binary
 fi
 host_architecture=$(uname -m)
-case "$package_format" in
-  appimage) build_script=scripts/build-appimage.sh ;;
-  deb) build_script=scripts/build-deb.sh ;;
-  binary) build_script=scripts/build-binary.sh ;;
-  *)
-    echo "the package format must be appimage, deb, or binary, not $package_format" >&2
-    exit 1
-    ;;
-esac
 apt_snapshot=20260920T000000Z
 rustup_version=1.29.1
 case "$architecture" in
@@ -131,8 +121,7 @@ retry() {
   done
   "$@"
 }
-target_libraries=(libasound2-dev libfontconfig-dev libvulkan1 libwayland-dev libx11-xcb-dev
-  libxkbcommon-x11-dev libzstd-dev)
+target_libraries=(libfontconfig-dev libx11-xcb-dev libxkbcommon-x11-dev)
 cross_packages=()
 if [[ -n "$CROSS_GNU_TRIPLE" ]]; then
   # The target libraries come from the same snapshot, for the target architecture.
@@ -148,8 +137,8 @@ fi
 install_packages() {
   apt-get "${apt_options[@]}" update -qq --error-on=any &&
     apt-get "${apt_options[@]}" install -y -qq --no-install-recommends \
-      binutils build-essential ca-certificates clang curl desktop-file-utils file git \
-      libxml2-utils pkg-config python3 util-linux "${cross_packages[@]}" "${target_libraries[@]}" >/dev/null
+      binutils build-essential ca-certificates curl file git pkg-config util-linux \
+      "${cross_packages[@]}" "${target_libraries[@]}" >/dev/null
 }
 retry install_packages
 rm -rf /var/lib/apt/lists/*
@@ -218,10 +207,9 @@ if [[ -n "$CROSS_GNU_TRIPLE" ]]; then
   export "AR_$target_variable=$CROSS_GNU_TRIPLE-ar"
   export "PKG_CONFIG_ALLOW_CROSS_$target_variable=1"
   export "PKG_CONFIG_LIBDIR_$target_variable=/usr/lib/$CROSS_GNU_TRIPLE/pkgconfig:/usr/share/pkgconfig"
-  export "BINDGEN_EXTRA_CLANG_ARGS_$target_variable=--target=$CROSS_GNU_TRIPLE"
 fi
 echo "container glibc: $(ldd --version | head -n 1)"
-XDG_CACHE_HOME=/xdg APPIMAGE_EXTRACT_AND_RUN=1 "$BUILD_SCRIPT" /out
+XDG_CACHE_HOME=/xdg scripts/build-binary.sh /out
 '
 
 image_key=$(printf '%s\n' "$base_image" "$apt_snapshot" "$architecture" "$cross_gnu_triple" \
@@ -316,11 +304,8 @@ if [[ $mode == image ]]; then
   exit 0
 fi
 
-# The audits run the cross-compiled launcher under the host's qemu-user
-# binfmt_misc handler. AppImages carry their own ELF magic that the handler
-# does not match, so the AppImage audit runs the built AppImage through the
-# host's static qemu-user binary, mounted into the container.
-emulator_arguments=()
+# The audit runs the cross-compiled launcher under the host's qemu-user
+# binfmt_misc handler, which the F flag makes usable inside the container.
 if [[ "$host_architecture" != "$architecture" ]]; then
   binfmt_handler=/proc/sys/fs/binfmt_misc/qemu-$architecture
   # Debian and Ubuntu register a symlink to qemu-*-static as the interpreter.
@@ -336,10 +321,6 @@ if [[ "$host_architecture" != "$architecture" ]]; then
     echo "auditing a $architecture build on $host_architecture needs a static qemu-$architecture binfmt_misc handler with the F flag (qemu-user-static)" >&2
     exit 1
   fi
-  emulator_arguments=(
-    --volume "$emulator:/run/qemu-user:ro"
-    --env PD2_APPIMAGE_EMULATOR=/run/qemu-user
-  )
 fi
 
 if [[ -n $(git -C "$repository_root" status --porcelain --untracked-files=normal) ]]; then
@@ -358,7 +339,6 @@ output_directory=$(cd "$output_directory" && pwd -P)
 run_arguments=(
   run --rm "${platform_arguments[@]}" --security-opt label=disable
   --env SOURCE_COMMIT="$commit"
-  --env BUILD_SCRIPT="$build_script"
   --env PD2_TARGET_ARCHITECTURE="$architecture"
   --env CROSS_GNU_TRIPLE="$cross_gnu_triple"
   --env PD2_BUILD_IMAGE="$build_image"
@@ -367,7 +347,6 @@ run_arguments=(
   --volume "$container_cache/cargo/registry:/cargo/registry"
   --volume "$container_cache/xdg:/xdg"
   --volume "$output_directory:/out"
-  "${emulator_arguments[@]}"
 )
 if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
   run_arguments+=(--env SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH")
@@ -398,8 +377,8 @@ else
 fi
 if [[ -n "${PD2_FAST_BUILD:-}" ]]; then
   # The default, reusing build: a checkout and the faster device Cargo profile
-  # that persist between runs. The build scripts, their audits, and the
-  # artifact are otherwise the same.
+  # that persist between runs. The build script, its audits, and the artifact
+  # are otherwise the same.
   mkdir -p "$container_cache/build"
   run_arguments+=(--env PD2_FAST_BUILD=1 --volume "$container_cache/build:/build")
 fi

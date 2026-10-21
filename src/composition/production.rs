@@ -40,19 +40,17 @@ use crate::{
     manifest::{ManifestResponse, PD2_MANIFEST_URL, Pd2ClientBase, Pd2Manifest},
     network::SystemPd2Source,
     operation::WorkPhase,
-    persistence::{
-        HomeMigration, LauncherPaths, LayoutError, RendererSetting, SettingsStore, SetupRecord,
-    },
+    persistence::{LauncherPaths, LayoutError, RendererSetting, SettingsStore, SetupRecord},
     presentation::{
         DirectDrawRendererView, DistroFamily, DownloadSourceView, DownloadsView, EvidenceTone,
         EvidenceView, ExistingInstallView, ExistingProblemView, FexSettingView, FexSourceView,
         GameFolderView, GameNoticeView, GraphicsDriver, GraphicsProfile, HostView, ImportModeView,
-        InstallerMediaView, LaunchSettingsView, LocationView, PREFIX_EVIDENCE_LABEL,
-        PhysicalDisplaySize, Prerequisite, RendererPreferenceView, SavesPutAsideView,
-        SettingsChange, SourceBadgeView, SystemContractView,
+        InstallerMediaView, LaunchSettingsView, LocationView, PREFIX_EVIDENCE_LABEL, Prerequisite,
+        RendererPreferenceView, SavesPutAsideView, SettingsChange, SourceBadgeView,
+        SystemContractView,
     },
     process::{
-        DisplaySeed, GameAudit, GameAuditFailure, GameAuditor, GameLaunchOptions, GameRenderer,
+        D2glSetup, GameAudit, GameAuditFailure, GameAuditor, GameLaunchOptions, GameRenderer,
         GameState, GameSupervisor,
     },
     relocation::RelocationError,
@@ -95,13 +93,8 @@ const ACCEPTED_MANIFEST_LIMIT: u64 = 1024 * 1024;
 /// Saved reports kept in `logs/reports`.
 const REPORTS_KEPT: usize = 10;
 const PROJECT_D2_RELATIVE: &str = "prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2";
-pub(super) const AARCH64_PORTABLE_IDENTITY: &str = "native-aarch64-appimage";
-pub(super) const X86_64_PORTABLE_IDENTITY: &str = "native-x86_64-appimage";
-pub(super) const AARCH64_DEB_IDENTITY: &str = "native-aarch64-deb";
-pub(super) const X86_64_DEB_IDENTITY: &str = "native-x86_64-deb";
 pub(super) const AARCH64_BINARY_IDENTITY: &str = "native-aarch64-binary";
 pub(super) const X86_64_BINARY_IDENTITY: &str = "native-x86_64-binary";
-const APPIMAGE_IDENTITY_ENV: &str = "PD2_LAUNCHER_APPIMAGE_IDENTITY";
 const COMPILED_ARTIFACT_IDENTITY: Option<&str> = option_env!("PD2_LAUNCHER_ARTIFACT_IDENTITY");
 
 /// Fail-closed production backend. Construction never panics: if local paths
@@ -257,11 +250,10 @@ impl CoordinatorBackend for ProductionBackend {
 
     fn launch_game(
         &self,
-        display: Option<PhysicalDisplaySize>,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
     ) -> Result<Option<GameNoticeView>, BackendFailure> {
-        self.ready()?.launch_game(display, driver, profile)
+        self.ready()?.launch_game(driver, profile)
     }
 
     fn poll_game(&self) -> BackendGameState {
@@ -383,6 +375,7 @@ struct ReadyBackend {
 
 /// Add the Launcher to the desktop's app menu, or take it out (`app_menu`);
 /// a failure is only reported.
+#[cfg(feature = "gui")]
 fn sync_app_menu(enabled: bool) {
     match crate::app_menu::sync(&crate::app_menu::Environment::current(), enabled) {
         Ok(crate::app_menu::Outcome::Written) => {
@@ -526,6 +519,7 @@ impl ReadyBackend {
         if host_probe.android_host().is_some() && compatibility_driver_saved(paths.config_root()) {
             crate::wine_environment::use_compatibility_driver(true);
         }
+        #[cfg(feature = "gui")]
         if mode == LaunchMode::Interactive {
             sync_app_menu(
                 settings
@@ -671,19 +665,6 @@ impl ReadyBackend {
                     .recover_interrupted()
                     .map_err(|_| backend_failure("diagnostics-unavailable"))?;
                 *diagnostics = Some(store);
-            }
-            if let Some(migration) = self.paths.take_migration() {
-                diagnostics
-                    .as_mut()
-                    .expect("diagnostics were just opened")
-                    .record_event(match migration {
-                        HomeMigration::Migrated => DiagnosticCode::LegacyLayoutMigrated,
-                        HomeMigration::InstallationKeptInPlace => {
-                            DiagnosticCode::LegacyInstallationKeptInPlace
-                        }
-                        HomeMigration::LegacyIgnored => DiagnosticCode::LegacyLayoutIgnored,
-                    })
-                    .map_err(|_| backend_failure("diagnostics-unavailable"))?;
             }
             if result.is_ok() {
                 diagnostics
@@ -1890,7 +1871,6 @@ impl ReadyBackend {
 
     fn launch_game(
         &self,
-        display: Option<PhysicalDisplaySize>,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
     ) -> Result<Option<GameNoticeView>, BackendFailure> {
@@ -1912,9 +1892,6 @@ impl ReadyBackend {
             crate::wine_environment::use_compatibility_driver(compatibility);
         }
         let mut options = game_launch_options(&settings);
-        if let Some(display) = display {
-            options = options.with_display_size(display.width(), display.height());
-        }
         if let Some(profile) = profile {
             options = options.with_graphics_profile(match profile {
                 GraphicsProfile::Default => crate::process::GraphicsProfile::Default,
@@ -1931,20 +1908,20 @@ impl ReadyBackend {
             .map_err(|_| backend_failure("game-supervision-unavailable"))?;
         let started = game.start(&self.paths.managed_root(), options);
         drop(game);
-        let Ok(display_seed) = started else {
+        let Ok(d2gl_setup) = started else {
             self.record(DiagnosticCode::GameLaunchFailed)?;
             return Err(backend_failure("game-launch-failed"));
         };
         // The game is already running; a diagnostics failure must not report
         // the launch as failed.
-        let _ = match display_seed {
-            DisplaySeed::Seeded => self.record(DiagnosticCode::DisplayConfigSeeded),
-            DisplaySeed::Skipped => self.record(DiagnosticCode::DisplayConfigSkipped),
-            DisplaySeed::NotRequested
-            | DisplaySeed::Unchanged
-            | DisplaySeed::ConfigurationAbsent => Ok(()),
+        let _ = match d2gl_setup {
+            D2glSetup::Written => self.record(DiagnosticCode::DisplayConfigSeeded),
+            D2glSetup::Skipped => self.record(DiagnosticCode::DisplayConfigSkipped),
+            D2glSetup::NotRequested | D2glSetup::Unchanged | D2glSetup::ConfigurationAbsent => {
+                Ok(())
+            }
         };
-        Ok(game_launch_notice(display_seed))
+        Ok(game_launch_notice(d2gl_setup))
     }
 
     fn poll_game(&self) -> BackendGameState {
@@ -2151,9 +2128,8 @@ impl ReadyBackend {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: option_env!("PD2_LAUNCHER_COMMIT"),
                 artifact_identity: portable_identity(launcher_artifact()),
-                appimage: env::var_os("APPIMAGE").is_some(),
                 debug: cfg!(debug_assertions),
-                x86_64_host_row: cfg!(feature = "x86_64-host-row"),
+                x86_64_host_row: cfg!(target_arch = "x86_64"),
             },
             paths: crate::report::ReportPaths {
                 managed_root,
@@ -2955,26 +2931,18 @@ fn read_optional_bounded_at(
 }
 
 pub(super) fn launcher_artifact() -> LauncherArtifactEvidence {
-    let runtime_identity = env::var_os(APPIMAGE_IDENTITY_ENV);
-    launcher_artifact_from_identity(
-        env::consts::ARCH,
-        COMPILED_ARTIFACT_IDENTITY,
-        runtime_identity.as_deref().and_then(|value| value.to_str()),
-    )
+    launcher_artifact_from_identity(env::consts::ARCH, COMPILED_ARTIFACT_IDENTITY)
 }
 
-/// The package build embeds the accepted identity, and the package's own
-/// start script (AppRun in the AppImage, /usr/bin/pd2-launcher in the Debian
-/// package) overwrites the matching runtime marker before it starts the
-/// binary. Development builds have no compiled identity and therefore cannot
-/// attest a package. Each compile-target architecture accepts only its own
-/// row's identities, and both values must name the same package.
+/// The standalone executable's build embeds its identity, which attests the
+/// binary by itself. Development builds have no compiled identity and
+/// therefore cannot attest it. Each compile-target architecture accepts only
+/// its own row's identity.
 fn launcher_artifact_from_identity(
     architecture: &str,
     compiled_identity: Option<&str>,
-    runtime_identity: Option<&str>,
 ) -> LauncherArtifactEvidence {
-    let (standalone_identity, standalone) = match HostPlatform::from_architecture(architecture) {
+    let (identity, artifact) = match HostPlatform::from_architecture(architecture) {
         HostPlatform::Aarch64 => (
             AARCH64_BINARY_IDENTITY,
             LauncherArtifactEvidence::NativeAarch64StandaloneBinary,
@@ -2985,52 +2953,16 @@ fn launcher_artifact_from_identity(
         ),
         HostPlatform::Other(_) => return LauncherArtifactEvidence::Unverified,
     };
-    // The standalone executable is its own artifact: no package wraps it, so
-    // only the identity compiled into a binary built for it attests it.
-    if compiled_identity == Some(standalone_identity) {
-        return standalone;
+    if compiled_identity == Some(identity) {
+        artifact
+    } else {
+        LauncherArtifactEvidence::Unverified
     }
-    let accepted: [(&str, LauncherArtifactEvidence); 2] =
-        match HostPlatform::from_architecture(architecture) {
-            HostPlatform::Aarch64 => [
-                (
-                    AARCH64_PORTABLE_IDENTITY,
-                    LauncherArtifactEvidence::NativeAarch64PortableBundle,
-                ),
-                (
-                    AARCH64_DEB_IDENTITY,
-                    LauncherArtifactEvidence::NativeAarch64DebPackage,
-                ),
-            ],
-            HostPlatform::X86_64 => [
-                (
-                    X86_64_PORTABLE_IDENTITY,
-                    LauncherArtifactEvidence::NativeX86_64PortableBundle,
-                ),
-                (
-                    X86_64_DEB_IDENTITY,
-                    LauncherArtifactEvidence::NativeX86_64DebPackage,
-                ),
-            ],
-            HostPlatform::Other(_) => return LauncherArtifactEvidence::Unverified,
-        };
-    accepted
-        .into_iter()
-        .find(|(identity, _)| {
-            compiled_identity == Some(*identity) && runtime_identity == Some(*identity)
-        })
-        .map_or(LauncherArtifactEvidence::Unverified, |(_, artifact)| {
-            artifact
-        })
 }
 
-/// Paired package identity string for an attested artifact.
+/// The identity string of an attested artifact.
 pub(super) fn portable_identity(artifact: LauncherArtifactEvidence) -> Option<&'static str> {
     match artifact {
-        LauncherArtifactEvidence::NativeAarch64PortableBundle => Some(AARCH64_PORTABLE_IDENTITY),
-        LauncherArtifactEvidence::NativeX86_64PortableBundle => Some(X86_64_PORTABLE_IDENTITY),
-        LauncherArtifactEvidence::NativeAarch64DebPackage => Some(AARCH64_DEB_IDENTITY),
-        LauncherArtifactEvidence::NativeX86_64DebPackage => Some(X86_64_DEB_IDENTITY),
         LauncherArtifactEvidence::NativeAarch64StandaloneBinary => Some(AARCH64_BINARY_IDENTITY),
         LauncherArtifactEvidence::NativeX86_64StandaloneBinary => Some(X86_64_BINARY_IDENTITY),
         LauncherArtifactEvidence::Unverified => None,
@@ -3530,7 +3462,6 @@ fn managed_runtime_detail(
     status: CheckStatus,
     installed: crate::runtime::InstalledRuntime,
 ) -> String {
-    // A prefix the row's earlier runtime made is named with that runtime.
     let runtime = installed.display_name();
     if installed == crate::runtime::InstalledRuntime::App {
         // The app provides it; the Launcher never downloads it.
@@ -3643,9 +3574,9 @@ fn game_launch_options(settings: &crate::persistence::LauncherSettings) -> GameL
 }
 
 /// Only D2GL's first launch, before it has written its configuration, needs
-/// the player to resize it once; every other seed outcome is silent.
-fn game_launch_notice(display_seed: DisplaySeed) -> Option<GameNoticeView> {
-    (display_seed == DisplaySeed::ConfigurationAbsent).then_some(GameNoticeView::FirstD2glLaunch)
+/// the player to resize it once; every other outcome is silent.
+fn game_launch_notice(d2gl_setup: D2glSetup) -> Option<GameNoticeView> {
+    (d2gl_setup == D2glSetup::ConfigurationAbsent).then_some(GameNoticeView::FirstD2glLaunch)
 }
 
 fn update_launch_settings(
@@ -3675,6 +3606,7 @@ fn update_launch_settings(
     store
         .save(&settings)
         .map_err(|_| backend_failure("settings-save-failed"))?;
+    #[cfg(feature = "gui")]
     if let SettingsChange::AppMenuEntry(enabled) = change {
         sync_app_menu(enabled);
     }
@@ -4075,7 +4007,7 @@ mod tests {
         // A new process starts with the standard driver in use.
         let restart = || crate::wine_environment::use_compatibility_driver(false);
         // A Play with the Compatibility driver (no game starts here).
-        let _ = engine(true).launch_game(None, GraphicsDriver::Compatibility, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None);
         assert!(in_use());
         // The next engine uses it from its start: the official launcher's
         // game gets it before any Play.
@@ -4083,17 +4015,17 @@ mod tests {
         let _next = engine(true);
         assert!(in_use());
         // A Play with the standard driver, and the engine after it.
-        let _ = engine(true).launch_game(None, GraphicsDriver::Standard, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Standard, None);
         assert!(!in_use());
         restart();
         let _next = engine(true);
         assert!(!in_use());
         // The desktop keeps no driver and uses none.
-        let _ = engine(true).launch_game(None, GraphicsDriver::Compatibility, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None);
         restart();
         let desktop = engine(false);
         assert!(!in_use());
-        let _ = desktop.launch_game(None, GraphicsDriver::Standard, None);
+        let _ = desktop.launch_game(GraphicsDriver::Standard, None);
         assert!(compatibility_driver_saved(paths.config_root()));
     }
 
@@ -4345,14 +4277,14 @@ mod tests {
     #[test]
     fn only_an_absent_d2gl_configuration_produces_the_first_launch_notice() {
         assert_eq!(
-            game_launch_notice(DisplaySeed::ConfigurationAbsent),
+            game_launch_notice(D2glSetup::ConfigurationAbsent),
             Some(GameNoticeView::FirstD2glLaunch)
         );
         for silent in [
-            DisplaySeed::NotRequested,
-            DisplaySeed::Unchanged,
-            DisplaySeed::Seeded,
-            DisplaySeed::Skipped,
+            D2glSetup::NotRequested,
+            D2glSetup::Unchanged,
+            D2glSetup::Written,
+            D2glSetup::Skipped,
         ] {
             assert_eq!(game_launch_notice(silent), None, "{silent:?}");
         }
@@ -4729,26 +4661,6 @@ mod tests {
     }
 
     #[test]
-    fn packaged_aarch64_identity_requires_both_build_and_apprun_markers() {
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "aarch64",
-                Some(AARCH64_PORTABLE_IDENTITY),
-                Some(AARCH64_PORTABLE_IDENTITY),
-            ),
-            LauncherArtifactEvidence::NativeAarch64PortableBundle
-        );
-        assert_eq!(
-            launcher_artifact_from_identity("aarch64", None, Some(AARCH64_PORTABLE_IDENTITY)),
-            LauncherArtifactEvidence::Unverified
-        );
-        assert_eq!(
-            launcher_artifact_from_identity("aarch64", Some(AARCH64_PORTABLE_IDENTITY), None),
-            LauncherArtifactEvidence::Unverified
-        );
-    }
-
-    #[test]
     fn standalone_binary_identity_is_attested_by_its_build_alone() {
         for (architecture, identity, artifact) in [
             (
@@ -4762,147 +4674,45 @@ mod tests {
                 LauncherArtifactEvidence::NativeX86_64StandaloneBinary,
             ),
         ] {
-            // Run as is: no start script sets a marker.
             assert_eq!(
-                launcher_artifact_from_identity(architecture, Some(identity), None),
+                launcher_artifact_from_identity(architecture, Some(identity)),
                 artifact
             );
             assert_eq!(portable_identity(artifact), Some(identity));
-            // A marker never turns another build into the standalone one.
+            // A development build has no compiled identity.
             assert_eq!(
-                launcher_artifact_from_identity(architecture, None, Some(identity)),
+                launcher_artifact_from_identity(architecture, None),
                 LauncherArtifactEvidence::Unverified
             );
         }
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "aarch64",
-                Some(AARCH64_PORTABLE_IDENTITY),
-                Some(AARCH64_BINARY_IDENTITY),
-            ),
-            LauncherArtifactEvidence::Unverified
-        );
         // Nor does a binary built for one architecture pass on the other.
         assert_eq!(
-            launcher_artifact_from_identity("x86_64", Some(AARCH64_BINARY_IDENTITY), None),
-            LauncherArtifactEvidence::Unverified
-        );
-    }
-
-    #[test]
-    fn debian_package_identity_is_its_own_paired_artifact() {
-        for (architecture, identity, artifact) in [
-            (
-                "aarch64",
-                AARCH64_DEB_IDENTITY,
-                LauncherArtifactEvidence::NativeAarch64DebPackage,
-            ),
-            (
-                "x86_64",
-                X86_64_DEB_IDENTITY,
-                LauncherArtifactEvidence::NativeX86_64DebPackage,
-            ),
-        ] {
-            assert_eq!(
-                launcher_artifact_from_identity(architecture, Some(identity), Some(identity)),
-                artifact
-            );
-            assert_eq!(portable_identity(artifact), Some(identity));
-            // Each marker alone attests nothing.
-            assert_eq!(
-                launcher_artifact_from_identity(architecture, Some(identity), None),
-                LauncherArtifactEvidence::Unverified
-            );
-            assert_eq!(
-                launcher_artifact_from_identity(architecture, None, Some(identity)),
-                LauncherArtifactEvidence::Unverified
-            );
-        }
-        // A binary built for one package never passes as the other.
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "aarch64",
-                Some(AARCH64_DEB_IDENTITY),
-                Some(AARCH64_PORTABLE_IDENTITY),
-            ),
+            launcher_artifact_from_identity("x86_64", Some(AARCH64_BINARY_IDENTITY)),
             LauncherArtifactEvidence::Unverified
         );
         assert_eq!(
-            launcher_artifact_from_identity(
-                "aarch64",
-                Some(AARCH64_PORTABLE_IDENTITY),
-                Some(AARCH64_DEB_IDENTITY),
-            ),
-            LauncherArtifactEvidence::Unverified
-        );
-        // Nor on another architecture's row.
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "x86_64",
-                Some(AARCH64_DEB_IDENTITY),
-                Some(AARCH64_DEB_IDENTITY),
-            ),
-            LauncherArtifactEvidence::Unverified
+            portable_identity(LauncherArtifactEvidence::Unverified),
+            None
         );
     }
 
     #[test]
     fn package_identity_never_certifies_an_unaccepted_architecture_or_value() {
         assert_eq!(
-            launcher_artifact_from_identity(
-                "x86_64",
-                Some(AARCH64_PORTABLE_IDENTITY),
-                Some(AARCH64_PORTABLE_IDENTITY),
-            ),
+            launcher_artifact_from_identity("aarch64", Some(X86_64_BINARY_IDENTITY)),
             LauncherArtifactEvidence::Unverified
         );
+        // The identities of the package formats that were removed attest
+        // nothing.
+        for identity in ["native-aarch64-appimage", "native-aarch64-deb", "other"] {
+            assert_eq!(
+                launcher_artifact_from_identity("aarch64", Some(identity)),
+                LauncherArtifactEvidence::Unverified
+            );
+        }
         assert_eq!(
-            launcher_artifact_from_identity(
-                "aarch64",
-                Some(X86_64_PORTABLE_IDENTITY),
-                Some(X86_64_PORTABLE_IDENTITY),
-            ),
+            launcher_artifact_from_identity("riscv64", Some(AARCH64_BINARY_IDENTITY)),
             LauncherArtifactEvidence::Unverified
-        );
-        assert_eq!(
-            launcher_artifact_from_identity("aarch64", Some("other"), Some("other")),
-            LauncherArtifactEvidence::Unverified
-        );
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "riscv64",
-                Some(AARCH64_PORTABLE_IDENTITY),
-                Some(AARCH64_PORTABLE_IDENTITY),
-            ),
-            LauncherArtifactEvidence::Unverified
-        );
-    }
-
-    #[test]
-    fn packaged_x86_64_identity_is_bound_to_its_own_row() {
-        assert_eq!(
-            launcher_artifact_from_identity(
-                "x86_64",
-                Some(X86_64_PORTABLE_IDENTITY),
-                Some(X86_64_PORTABLE_IDENTITY),
-            ),
-            LauncherArtifactEvidence::NativeX86_64PortableBundle
-        );
-        assert_eq!(
-            launcher_artifact_from_identity("x86_64", None, Some(X86_64_PORTABLE_IDENTITY)),
-            LauncherArtifactEvidence::Unverified
-        );
-        assert_eq!(
-            portable_identity(LauncherArtifactEvidence::NativeX86_64PortableBundle),
-            Some(X86_64_PORTABLE_IDENTITY)
-        );
-        assert_eq!(
-            portable_identity(LauncherArtifactEvidence::NativeAarch64PortableBundle),
-            Some(AARCH64_PORTABLE_IDENTITY)
-        );
-        assert_eq!(
-            portable_identity(LauncherArtifactEvidence::Unverified),
-            None
         );
     }
 
@@ -4926,11 +4736,6 @@ mod tests {
         let custom = crate::runtime::InstalledRuntime::Custom;
         assert_eq!(game_graphics_key(pinned), game_graphics_key(pinned));
         assert_ne!(game_graphics_key(pinned), game_graphics_key(custom));
-        // The row's earlier runtime, kept for a prefix it made, has its own.
-        if let Some(retained) = crate::runtime::retained() {
-            let retained = crate::runtime::InstalledRuntime::BuiltIn(retained);
-            assert_ne!(game_graphics_key(pinned), game_graphics_key(retained));
-        }
     }
 
     #[test]

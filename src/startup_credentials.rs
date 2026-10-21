@@ -2,10 +2,10 @@
 //!
 //! The Launcher never writes this file or copies it into package/persistent
 //! state. A developer or user may provide both values through the process
-//! environment, or, for the unattended CLI only, a `.env.local` beside the
-//! current launch directory/AppImage. The interactive Launcher never reads
-//! `.env.local`: a file that happens to sit beside a double-clicked AppImage
-//! must not prefill keys or redirect downloads.
+//! environment, or, for the unattended CLI only, a `.env.local` in the
+//! current launch directory. The interactive Launcher never reads
+//! `.env.local`: a file that happens to sit beside a double-clicked
+//! executable must not prefill keys or redirect downloads.
 //! The same sources may also choose the Blizzard download as installer source
 //! (`D2_INSTALLER_SOURCE=download`) and override download URLs (`PD2_URL_*`).
 //! The process environment wins over `.env.local` for every name;
@@ -362,21 +362,9 @@ impl Drop for StartupProductKeys {
 }
 
 fn local_env_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(2);
-    if let Ok(directory) = env::current_dir() {
-        candidates.push(directory.join(LOCAL_ENV_FILE));
-    }
-    if let Some(directory) = env::var_os("APPIMAGE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-    {
-        let adjacent = directory.join(LOCAL_ENV_FILE);
-        if !candidates.contains(&adjacent) {
-            candidates.push(adjacent);
-        }
-    }
-    candidates
+    env::current_dir()
+        .map(|directory| vec![directory.join(LOCAL_ENV_FILE)])
+        .unwrap_or_default()
 }
 
 fn parse_local_env(contents: &str) -> Option<LocalEnvInputs> {

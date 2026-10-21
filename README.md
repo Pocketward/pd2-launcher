@@ -49,7 +49,9 @@ If the launcher window never appears, it saves what went wrong to `~/.pd2launche
 
 ## Building from source
 
-From a clean checkout with Podman or Docker, `scripts/build-appimage-container.sh dist <x86_64|aarch64> binary` builds the standalone executable in a pinned Ubuntu 22.04 container and writes `dist/pd2-launcher-<version>-<arch>`; the script's header describes its options. The Rust toolchain is pinned in `rust-toolchain.toml`.
+From a clean checkout with Podman or Docker, `scripts/build-appimage-container.sh dist <x86_64|aarch64> binary` builds the standalone executable in a pinned Ubuntu 22.04 container and writes `dist/pd2-launcher-<version>-<arch>`; the script's header describes its options. The container runs in a build image with the build packages from a dated Ubuntu snapshot and the Rust toolchain of `rust-toolchain.toml`: the first build makes it, and later builds use it again. The releases are built in the images on this repository's `build-images` release (`.github/workflows/build-image.yml`); load one with `zstd -dc <file> | docker load` to build in the same image.
+
+The window is the `gui` Cargo feature, which is on by default. `cargo build --release --locked --no-default-features --features release-build` builds the executable without it: the Launcher engine of the Android app, which runs only through the app.
 
 ## Disclaimer
 

@@ -63,7 +63,6 @@ pub(crate) struct BuildInfo {
     pub(crate) version: &'static str,
     pub(crate) commit: Option<&'static str>,
     pub(crate) artifact_identity: Option<&'static str>,
-    pub(crate) appimage: bool,
     pub(crate) debug: bool,
     pub(crate) x86_64_host_row: bool,
 }
@@ -1067,11 +1066,7 @@ fn audit_json(report: &InstallationReport) -> Value {
                 "name": crate::runtime::APP_RUNTIME_DISPLAY_NAME,
             }),
             crate::runtime::InstalledRuntime::BuiltIn(runtime) => json!({
-                "kind": if crate::runtime::retained().is_some_and(|retained| std::ptr::eq(retained, runtime)) {
-                    "retained"
-                } else {
-                    "pinned"
-                },
+                "kind": "pinned",
                 "identity": runtime.identity,
                 "name": runtime.display_name,
             }),
@@ -1282,7 +1277,6 @@ fn report_json(
             "version": build.version,
             "commit": build.commit,
             "artifact_identity": build.artifact_identity,
-            "appimage": build.appimage,
             "profile": if build.debug { "debug" } else { "release" },
             "x86_64_host_row": build.x86_64_host_row,
             "target_arch": std::env::consts::ARCH,
@@ -1391,13 +1385,7 @@ fn summary_text(
             build
                 .artifact_identity
                 .map_or_else(String::new, |identity| format!(", {identity}")),
-            if build.appimage {
-                ", AppImage"
-            } else if build.debug {
-                ", debug build"
-            } else {
-                ""
-            },
+            if build.debug { ", debug build" } else { "" },
         ),
     );
     line("Created", utc_time(inputs.now));
