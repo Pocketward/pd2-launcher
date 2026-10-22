@@ -1077,14 +1077,14 @@ pub(crate) trait InstallDriver {
     ) -> Result<(), VendorFailure>;
 
     /// Make a validated Diablo II installation the game: copy it into
-    /// the Managed game folder, or record it for use in place; then write
-    /// the registry the game reads and, last, the import receipt.
+    /// the Managed game folder, or record it for use in place. Nothing
+    /// else is written: no registry value, and last the record of the
+    /// import. The caller holds the installation lease.
     fn import_existing(
         &self,
         paths: &ManagedPaths,
         existing: &ExistingInstall,
         mode: ImportMode,
-        mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure>;
 
@@ -1805,11 +1805,12 @@ impl<'a> ManagedInstaller<'a> {
         })
     }
 
-    /// Step 4 for a Diablo II 1.14b or 1.14d the user already has: set up
+    /// Step 4 for a Diablo II the user already has, of any version: set up
     /// the Wine runtime and prefix when needed, then copy the game into the
-    /// Managed game folder or record it for use in place, write the
-    /// registry the game expects, and record the import. No CD
-    /// key is needed and the folder is never patched. Ends at `NeedsClient`.
+    /// Managed game folder or record it for use in place. No registry value
+    /// is written (the game writes `InstallPath` when the value is missing) and
+    /// no CD key is needed; the folder is never patched. Its files prove
+    /// it. Ends at `NeedsClient`.
     pub(crate) fn import_existing(
         &mut self,
         managed_root: &Path,
@@ -1845,17 +1846,19 @@ impl<'a> ManagedInstaller<'a> {
         control.report(match mode {
             ImportMode::Copy => WorkProgress::for_phase(WorkPhase::ImportGame)
                 .with_file_bytes(0, Some(existing.copy_bytes())),
-            // Nothing is copied: the registry and the record are written.
+            // Nothing is copied: the folder's record and the import record
+            // are written.
             ImportMode::InPlace => WorkProgress::for_phase(WorkPhase::ImportGame),
         });
         {
-            let lease = MutationLease::acquire(&paths)?;
+            let _lease = MutationLease::acquire(&paths)?;
             // A copy that stops part way leaves files only Start over
             // removes, like a Vendor installer.
             mark_stage(&paths, InterruptedStage::BaseGame, InstallStage::Import)?;
             self.driver
-                .import_existing(&paths, &existing, mode, &lease.0, control)
+                .import_existing(&paths, &existing, mode, control)
                 .map_err(|_| stage_failure(control, InstallStage::Import))?;
+            finish_stage(&paths, InterruptedStage::BaseGame, InstallStage::Import)?;
         }
         check_cancelled(control)?;
         completed_stages.push(InstallStage::Import);
@@ -2134,6 +2137,14 @@ impl<'a> ManagedInstaller<'a> {
                 }
                 (error, _) => error,
             })?;
+        finish_stage(
+            paths,
+            match product {
+                VendorProduct::BaseGame => InterruptedStage::BaseGame,
+                VendorProduct::Expansion => InterruptedStage::Expansion,
+            },
+            stage,
+        )?;
         check_cancelled(control)
     }
 
@@ -2310,6 +2321,18 @@ fn mark_stage(
     install_stage: InstallStage,
 ) -> Result<(), InstallError> {
     crate::stage_marker::write(paths.directory(), stage).map_err(|_| InstallError::StageFailed {
+        stage: install_stage,
+    })
+}
+
+/// Record that the stage's step returned without an error. The caller holds
+/// the lease.
+fn finish_stage(
+    paths: &ManagedPaths,
+    stage: InterruptedStage,
+    install_stage: InstallStage,
+) -> Result<(), InstallError> {
+    crate::stage_marker::finish(paths.directory(), stage).map_err(|_| InstallError::StageFailed {
         stage: install_stage,
     })
 }
@@ -2780,6 +2803,30 @@ mod tests {
         assert_eq!(
             read(&root),
             MarkerState::Present(InterruptedStage::Expansion)
+        );
+        // An installer that returned marks its stage finished before the
+        // audit that proves it: when the files do not show it, the
+        // finished marker stays.
+        let auditor = ScriptedAuditor::new([
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+        ]);
+        let result = ManagedInstaller::new(
+            &auditor,
+            &source,
+            &RecordingDriver::default(),
+            &client,
+            fixture_catalog(),
+        )
+        .run(fixture.path(), Some(&authorization));
+        assert!(
+            matches!(result, Err(InstallError::EvidenceDidNotAdvance { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            read(&root),
+            MarkerState::Finished(InterruptedStage::Expansion)
         );
 
         // And an interrupted stage never runs another stage.
@@ -3431,16 +3478,9 @@ mod tests {
 
     fn existing_install(fixture: &TempDir) -> ExistingInstall {
         let folder = fixture.path().join("My Games/Diablo II");
-        crate::game_folder::tests::write_game_folder(&folder, b"game-1.14d", b"archive-1.14d");
-        crate::game_folder::validate_existing_with(
-            &folder,
-            &fixture.path().join("managed"),
-            &[crate::game_folder::tests::pinned_version(
-                b"game-1.14d",
-                b"archive-1.14d",
-            )],
-        )
-        .expect("a 1.14d-shaped folder")
+        crate::game_folder::tests::write_game_folder(&folder, b"game-1.13c", b"archive-1.13c");
+        crate::game_folder::validate_existing(&folder, &fixture.path().join("managed"))
+            .expect("a complete folder of any version")
     }
 
     #[test]
@@ -3513,6 +3553,27 @@ mod tests {
             read(&Directory::open(&root_path).unwrap()),
             MarkerState::Present(InterruptedStage::BaseGame)
         );
+        // A copy that returned marks its stage finished before the audit:
+        // when the audit does not show the game, the finished marker stays.
+        let driver = RecordingDriver::default();
+        let auditor = ScriptedAuditor::new([
+            audit(InstallationStatus::NeedsBaseGame, CheckStatus::Satisfied),
+            audit(InstallationStatus::NeedsBaseGame, CheckStatus::Satisfied),
+        ]);
+        assert!(matches!(
+            ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+                .import_existing(
+                    &root_path,
+                    &existing,
+                    ImportMode::Copy,
+                    &OperationControl::default()
+                ),
+            Err(InstallError::EvidenceDidNotAdvance { .. })
+        ));
+        assert_eq!(
+            read(&Directory::open(&root_path).unwrap()),
+            MarkerState::Finished(InterruptedStage::BaseGame)
+        );
 
         // Nothing is imported over a game that is already there, or from a
         // folder that stopped being usable.
@@ -3530,12 +3591,12 @@ mod tests {
                 ),
             Err(InstallError::BaseGameInstalled)
         );
-        fs::write(existing.path().join("Game.exe"), b"game-1.14b").unwrap();
+        fs::remove_file(existing.path().join("d2exp.mpq")).unwrap();
         let auditor = ScriptedAuditor::new([audit(
             InstallationStatus::NeedsBaseGame,
             CheckStatus::Satisfied,
         )]);
-        assert!(matches!(
+        assert_eq!(
             ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
                 .import_existing(
                     &root_path,
@@ -3543,8 +3604,10 @@ mod tests {
                     ImportMode::Copy,
                     &OperationControl::default()
                 ),
-            Err(InstallError::ExistingInstallInvalid(_))
-        ));
+            Err(InstallError::ExistingInstallInvalid(
+                ExistingInstallProblem::NoExpansion
+            ))
+        );
     }
 
     #[test]
@@ -4617,7 +4680,6 @@ mod tests {
             paths: &ManagedPaths,
             _existing: &ExistingInstall,
             mode: ImportMode,
-            _mutation_lease: &File,
             _control: &OperationControl,
         ) -> Result<(), AdapterFailure> {
             self.markers

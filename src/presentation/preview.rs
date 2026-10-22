@@ -155,9 +155,10 @@ pub(crate) fn snapshot() -> Option<UiSnapshot> {
                 snapshot
             }
         }
-        "setup-existing-old" => setup().with_installer_media(existing(Some(
-            ExistingProblemView::UnsupportedVersion(Some("1.13")),
-        ))),
+        // A folder that can't be used: no Lord of Destruction in it.
+        "setup-existing-refused" => {
+            setup().with_installer_media(existing(Some(ExistingProblemView::NoExpansion)))
+        }
         "download" => setup()
             .with_active_job(Some(ActiveJobView::Download))
             .with_operation(Some(
@@ -422,10 +423,16 @@ pub(super) fn view() -> Option<ViewPreview> {
         | "guided-check-ok"
         | "guided-check-missing"
         | "prerequisites" => SetupStep::Device,
-        "setup" | "guided-location" | "folder" | "setup-existing" | "setup-existing-old"
-        | "setup-existing-pd2" | "stopped" | "unavailable" | "settings" | "diagnostics" => {
-            SetupStep::Setup
-        }
+        "setup"
+        | "guided-location"
+        | "folder"
+        | "setup-existing"
+        | "setup-existing-refused"
+        | "setup-existing-pd2"
+        | "stopped"
+        | "unavailable"
+        | "settings"
+        | "diagnostics" => SetupStep::Setup,
         "guided-download" | "download" | "download-done" | "download-start" | "environment" => {
             SetupStep::Download
         }

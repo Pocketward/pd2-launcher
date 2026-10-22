@@ -27,13 +27,6 @@ use crate::{
     stage_marker::MarkerState,
 };
 
-const SUCCESS_SENTINEL: &str = "Installation completed successfully.";
-const DIABLO_REGISTRY_SECTION: &str = "[Software\\\\Blizzard Entertainment\\\\Diablo II]";
-const EXPECTED_INSTALL_PATH: &str = "\"InstallPath\"=\"C:\\\\Program Files (x86)\\\\Diablo II\"";
-const EXPECTED_VENDOR_INSTALL_PATH: &str =
-    "\"InstallPath\"=\"C:\\\\Program Files (x86)\\\\Diablo II\\\\\"";
-const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 1024;
 const MAX_CUSTOM_RECEIPT_BYTES: u64 = 8 * 1024;
 /// Larger than any `xinput1_4.dll` Wine puts in a prefix.
@@ -55,7 +48,7 @@ pub const DOTNET_DESKTOP_INSTALLER_SHA256: &str =
     "4e77bd970df0a06528ee88d33e4a8c9fb85beedbdd7219b017083acf0c3aa39e";
 const MAX_PROTECTED_FILES: usize = 16_384;
 const MAX_PROTECTED_DEPTH: usize = 32;
-const CHECK_COUNT: usize = 8;
+const CHECK_COUNT: usize = 7;
 const PREFLIGHT_PRELOADER_FD: i32 = 200;
 const PREFLIGHT_WINE_PROOF_FD: i32 = 201;
 const PREFLIGHT_PREFIX_FD: i32 = 202;
@@ -299,9 +292,6 @@ pub enum AuditCheck {
     Prefix,
     BaseGame,
     Expansion,
-    /// The base game is a Diablo II version the Launcher accepts: Blizzard's
-    /// 1.14b or 1.14d. It is never patched.
-    GameVersion,
     Client,
     Transaction,
 }
@@ -314,19 +304,17 @@ impl AuditCheck {
             Self::Prefix => 2,
             Self::BaseGame => 3,
             Self::Expansion => 4,
-            Self::GameVersion => 5,
-            Self::Client => 6,
-            Self::Transaction => 7,
+            Self::Client => 5,
+            Self::Transaction => 6,
         }
     }
 }
 
-const FILESYSTEM_CHECKS: [AuditCheck; 6] = [
+const FILESYSTEM_CHECKS: [AuditCheck; 5] = [
     AuditCheck::Runtime,
     AuditCheck::Prefix,
     AuditCheck::BaseGame,
     AuditCheck::Expansion,
-    AuditCheck::GameVersion,
     AuditCheck::Client,
 ];
 
@@ -349,8 +337,6 @@ pub enum FindingReason {
     NotExecutable,
     SizeMismatch,
     DigestMismatch,
-    SentinelMissing,
-    RegistryMismatch,
     ProcessActive,
     AuditLeaseUnavailable,
     RuntimePreflightFailed,
@@ -384,8 +370,8 @@ pub enum FindingReason {
     /// The official launcher binary matches neither the accepted manifest
     /// nor the copy recorded after its last session.
     OfficialLauncherChanged,
-    /// The game folder used in place is unavailable, or its record or the
-    /// import receipt is not the Launcher's.
+    /// The game folder used in place is unavailable, or its record is not
+    /// the Launcher's.
     GameFolderUnavailable,
 }
 
@@ -1014,21 +1000,6 @@ impl RuntimeFileExpectations {
     }
 }
 
-/// One accepted Diablo II base game: its `Game.exe`, and its
-/// `Patch_D2.mpq` where that file is pinned. Without an archive
-/// pin, `Patch_D2.mpq` must still be present.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BaseGameExpectation {
-    game: FileSha256Expectation,
-    archive: Option<FileSha256Expectation>,
-}
-
-impl BaseGameExpectation {
-    pub fn new(game: FileSha256Expectation, archive: Option<FileSha256Expectation>) -> Self {
-        Self { game, archive }
-    }
-}
-
 impl FileSha256Expectation {
     pub fn new(size: u64, digest: Sha256Digest) -> Self {
         Self { size, digest }
@@ -1116,17 +1087,14 @@ pub enum ActivityEvidence {
 pub struct AuditPolicy {
     runtime_identity: String,
     runtime_files: RuntimeFileExpectations,
-    base_games: Vec<BaseGameExpectation>,
 }
 
 impl AuditPolicy {
-    /// `base_games` lists every accepted base game; the one whose
-    /// `Game.exe` matches decides the rest of the version check. With none,
-    /// no base game is accepted.
+    /// The Diablo II version is not part of the policy: it is never
+    /// checked.
     pub fn new(
         runtime_identity: impl Into<String>,
         runtime_files: RuntimeFileExpectations,
-        base_games: impl IntoIterator<Item = BaseGameExpectation>,
     ) -> Result<Self, InvalidRuntimeIdentity> {
         let runtime_identity = runtime_identity.into();
         if runtime_identity.contains('/') || RelativeGamePath::parse(&runtime_identity).is_err() {
@@ -1135,26 +1103,13 @@ impl AuditPolicy {
         Ok(Self {
             runtime_identity,
             runtime_files,
-            base_games: base_games.into_iter().collect(),
         })
     }
 
     fn pinned() -> Self {
         let runtime = crate::runtime::current();
-        let pinned = |(size, sha256): (u64, &str)| {
-            FileSha256Expectation::new(
-                size,
-                Sha256Digest::parse_hex(sha256).expect("static digest"),
-            )
-        };
-        Self::new(
-            runtime.identity,
-            Self::runtime_file_expectations(runtime),
-            crate::game_folder::ACCEPTED_BASE_GAMES.map(|version| {
-                BaseGameExpectation::new(pinned(version.game), version.archive.map(pinned))
-            }),
-        )
-        .expect("static runtime identity")
+        Self::new(runtime.identity, Self::runtime_file_expectations(runtime))
+            .expect("static runtime identity")
     }
 
     fn runtime_file_expectations(
@@ -1368,9 +1323,6 @@ impl Auditor {
                 Err(_) => None,
             }
         });
-        let import = managed_root
-            .as_ref()
-            .map_or(Ok(None), crate::game_folder::read_import_receipt);
         if request.activity == ActivityEvidence::Mutating {
             block_filesystem_checks(&mut results, FindingReason::ProcessActive);
         } else if lease_guard.is_none() {
@@ -1382,7 +1334,6 @@ impl Auditor {
                     AuditCheck::Prefix,
                     AuditCheck::BaseGame,
                     AuditCheck::Expansion,
-                    AuditCheck::GameVersion,
                     AuditCheck::Client,
                 ] {
                     results.push(CheckResult::root_failure(check, root_state));
@@ -1403,30 +1354,23 @@ impl Auditor {
                     check_prefix(root, policy, request, crate::android_host());
                 results.push(prefix);
                 prefix_components = components;
-                match (game_folder.as_ref(), import.as_ref()) {
-                    (Some(folder), Ok(import)) => {
+                match game_folder.as_ref() {
+                    Some(folder) => {
                         let game = match folder {
                             Some(folder) => GameTree::external(folder),
                             None => GameTree::managed(root),
                         };
-                        results.push(check_base_game(
-                            root,
-                            &game,
-                            import.as_ref(),
-                            request.activity,
-                        ));
-                        results.push(check_expansion(&game, import.as_ref(), request.activity));
-                        results.push(check_game_version(&game, policy));
+                        results.push(check_base_game(&game, request.activity));
+                        results.push(check_expansion(&game, request.activity));
                         results.push(check_client(&game, request.accepted_client.as_ref()));
                     }
                     // The recorded game folder is gone, replaced, or its
-                    // record (or the import receipt) is not the Launcher's:
-                    // nothing about the game can be established.
-                    _ => {
+                    // record is not the Launcher's: nothing about the game
+                    // can be established.
+                    None => {
                         for check in [
                             AuditCheck::BaseGame,
                             AuditCheck::Expansion,
-                            AuditCheck::GameVersion,
                             AuditCheck::Client,
                         ] {
                             results.push(single_finding(
@@ -2594,18 +2538,14 @@ fn check_prefix_dependency(
     )
 }
 
-fn check_base_game(
-    root: &Directory,
-    game: &GameTree<'_>,
-    import: Option<&crate::game_folder::ImportReceipt>,
-    activity: ActivityEvidence,
-) -> CheckResult {
-    check_installer_stage(
+/// Diablo II is installed when its files are: Blizzard's installers or an
+/// import put them there.
+fn check_base_game(game: &GameTree<'_>, activity: ActivityEvidence) -> CheckResult {
+    check_game_files(
         AuditCheck::BaseGame,
         game,
-        import,
-        "Diablo II Install Log.html",
         [
+            "Game.exe",
             "Diablo II.exe",
             "d2data.mpq",
             "d2music.mpq",
@@ -2613,94 +2553,36 @@ fn check_base_game(
             "d2speech.mpq",
             "d2video.mpq",
         ],
-        vec![inspect_registry_install_path(
-            root,
-            import.map(|import| import.install_path.as_str()),
-        )],
         activity,
     )
 }
 
-fn check_expansion(
-    game: &GameTree<'_>,
-    import: Option<&crate::game_folder::ImportReceipt>,
-    activity: ActivityEvidence,
-) -> CheckResult {
-    check_installer_stage(
+/// Lord of Destruction is installed when its files are.
+fn check_expansion(game: &GameTree<'_>, activity: ActivityEvidence) -> CheckResult {
+    check_game_files(
         AuditCheck::Expansion,
         game,
-        import,
-        "Diablo II LOD Install Log.html",
         ["d2exp.mpq", "d2xmusic.mpq", "d2xtalk.mpq", "d2xvideo.mpq"],
-        Vec::new(),
         activity,
     )
 }
 
-/// Blizzard's install log proves an installer finished. An installation
-/// the user already had was imported instead: the Launcher's own import
-/// receipt stands in for the log, never a faked log. The game
-/// files are required either way, and the pinned `Game.exe` still gates the
-/// version check.
-fn check_installer_stage<const N: usize>(
+/// A game is proven by its files alone, each a regular file: no install
+/// log, registry value or import record, and no version. The game runs
+/// from its folder without them.
+fn check_game_files<const N: usize>(
     check: AuditCheck,
     game: &GameTree<'_>,
-    import: Option<&crate::game_folder::ImportReceipt>,
-    log: &str,
     files: [&str; N],
-    mut evidence: Vec<ItemEvidence>,
     activity: ActivityEvidence,
 ) -> CheckResult {
-    if import.is_none() {
-        evidence.push(inspect_contains(
-            game.directory,
-            &game.path(log),
-            SUCCESS_SENTINEL,
-            MAX_LOG_BYTES,
-            FindingReason::SentinelMissing,
-        ));
-    }
-    evidence.extend(files.map(|file| inspect_regular(game.directory, &game.path(file))));
+    let mut evidence: Vec<_> = files
+        .map(|file| inspect_regular(game.directory, &game.path(file)))
+        .into();
     if activity == ActivityEvidence::InstallerRunning {
         evidence.push(ItemEvidence::invalid(None, FindingReason::ProcessActive));
     }
     aggregate(check, evidence)
-}
-
-/// `Game.exe` is one of the accepted base games, and so is
-/// `Patch_D2.mpq` where that version pins it; otherwise it must be present.
-/// Nothing here is ever repaired by patching: a base game that is neither
-/// 1.14b nor 1.14d is unexplained evidence.
-fn check_game_version(game: &GameTree<'_>, policy: &AuditPolicy) -> CheckResult {
-    let game_exe = game.path("Game.exe");
-    let mut rejected = None;
-    for version in &policy.base_games {
-        let evidence = inspect_sha256(game.directory, &game_exe, version.game);
-        match evidence.status {
-            CheckStatus::Satisfied => {
-                let archive = game.path("Patch_D2.mpq");
-                return aggregate(
-                    AuditCheck::GameVersion,
-                    [
-                        evidence,
-                        match version.archive {
-                            Some(pin) => inspect_sha256(game.directory, &archive, pin),
-                            None => inspect_regular(game.directory, &archive),
-                        },
-                    ],
-                );
-            }
-            // Different from this version; perhaps another one.
-            CheckStatus::Invalid => {
-                rejected.get_or_insert(evidence);
-            }
-            // Missing or unreadable is the same for every version.
-            CheckStatus::Missing | CheckStatus::Indeterminate => {
-                return aggregate(AuditCheck::GameVersion, [evidence]);
-            }
-        }
-    }
-    aggregate(AuditCheck::GameVersion, rejected)
 }
 
 fn check_client(game: &GameTree<'_>, manifest: Option<&AcceptedClientManifest>) -> CheckResult {
@@ -2981,17 +2863,47 @@ fn classify_installation(
     }
     // A marker beside incomplete evidence for its own stage is a known
     // interruption, not unexplained evidence. Missing evidence is still
-    // resumable, and complete evidence means only the clear was lost.
+    // resumable. Complete evidence means only the clear was lost when the
+    // marker is finished; a game stage's step that has not returned may
+    // have left its last file short.
     match marker {
         MarkerState::Absent => {}
         MarkerState::Invalid => return InstallationStatus::Indeterminate,
-        MarkerState::Present(stage) => {
-            let check = match stage {
-                InterruptedStage::Prefix => AuditCheck::Prefix,
-                InterruptedStage::BaseGame => AuditCheck::BaseGame,
-                InterruptedStage::Expansion => AuditCheck::Expansion,
+        MarkerState::Present(stage) | MarkerState::Finished(stage) => {
+            let finished = matches!(marker, MarkerState::Finished(_));
+            let invalid = |check: AuditCheck| checks[check.index()] == CheckStatus::Invalid;
+            let written = |check: AuditCheck| {
+                matches!(
+                    checks[check.index()],
+                    CheckStatus::Satisfied | CheckStatus::Invalid
+                )
             };
-            if checks[check.index()] == CheckStatus::Invalid {
+            let interrupted = match stage {
+                InterruptedStage::Prefix => invalid(AuditCheck::Prefix),
+                // Both game stages write in the one game folder: an import
+                // copies both games, and Lord of Destruction's installer
+                // writes `Game.exe` again. Invalid evidence of either game
+                // beside a game stage's marker is that stage's
+                // interruption.
+                _ if invalid(AuditCheck::BaseGame) || invalid(AuditCheck::Expansion) => true,
+                // The files are the only proof, and a file is there but
+                // short while it is written: a step that has not returned
+                // stopped part way once it wrote any of its files. Diablo
+                // II's files are there before Lord of Destruction's step.
+                InterruptedStage::BaseGame => {
+                    !finished && (written(AuditCheck::BaseGame) || written(AuditCheck::Expansion))
+                }
+                // A started Lord of Destruction marker beside the PD2
+                // client can only be one an earlier release left: this
+                // one never installs the client beside it, and such a
+                // release proved those files by their install log.
+                InterruptedStage::Expansion => {
+                    !finished
+                        && written(AuditCheck::Expansion)
+                        && checks[AuditCheck::Client.index()] != CheckStatus::Satisfied
+                }
+            };
+            if interrupted {
                 return InstallationStatus::StageInterrupted(stage);
             }
         }
@@ -3012,12 +2924,6 @@ fn classify_installation(
         } else {
             InstallationStatus::Indeterminate
         };
-    }
-    // Diablo II and Lord of Destruction are installed, so the base game
-    // must be an accepted version. The Launcher never patches it, so any
-    // other `Game.exe` is unexplained evidence.
-    if checks[AuditCheck::GameVersion.index()] != CheckStatus::Satisfied {
-        return InstallationStatus::Indeterminate;
     }
     match checks[AuditCheck::Client.index()] {
         CheckStatus::Satisfied => {}
@@ -3188,28 +3094,6 @@ fn inspect_executable(root: &Directory, relative: &str) -> ItemEvidence {
     }
 }
 
-fn inspect_contains(
-    root: &Directory,
-    relative: &str,
-    needle: &str,
-    limit: u64,
-    mismatch: FindingReason,
-) -> ItemEvidence {
-    let relative = relative_path(relative);
-    match safe_read(root, &relative, limit) {
-        Ok(Some(bytes))
-            if bytes
-                .windows(needle.len())
-                .any(|window| window == needle.as_bytes()) =>
-        {
-            ItemEvidence::satisfied()
-        }
-        Ok(Some(_)) => ItemEvidence::invalid(Some(relative), mismatch),
-        Ok(None) => ItemEvidence::missing(relative),
-        Err(reason) => ItemEvidence::indeterminate(Some(relative), reason),
-    }
-}
-
 /// Which kinds of provenance receipt an installed component carries,
 /// independent of the configured download sources.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3313,68 +3197,6 @@ fn inspect_exact_text(root: &Directory, relative: &str, expected: &str) -> ItemE
         Ok(None) => ItemEvidence::missing(relative),
         Err(reason) => ItemEvidence::indeterminate(Some(relative), reason),
     }
-}
-
-fn inspect_registry_install_path(root: &Directory, imported: Option<&str>) -> ItemEvidence {
-    let relative = relative_path("prefix/user.reg");
-    let bytes = match safe_read(root, &relative, MAX_REGISTRY_BYTES) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return ItemEvidence::missing(relative),
-        Err(reason) => return ItemEvidence::indeterminate(Some(relative), reason),
-    };
-    let Ok(registry) = std::str::from_utf8(&bytes) else {
-        return ItemEvidence::indeterminate(Some(relative), FindingReason::Unreadable);
-    };
-
-    let mut in_diablo_section = false;
-    let mut saw_diablo_section = false;
-    let mut install_paths = Vec::new();
-    for line in registry.lines().map(str::trim) {
-        if let Some(section) = wine_registry_section(line) {
-            in_diablo_section = section == DIABLO_REGISTRY_SECTION;
-            saw_diablo_section |= in_diablo_section;
-        } else if in_diablo_section && line.starts_with("\"InstallPath\"=") {
-            install_paths.push(line);
-        }
-    }
-
-    // An imported installation names the folder its receipt records, in
-    // `reg`'s own escaping of backslashes.
-    let imported =
-        imported.map(|path| format!("\"InstallPath\"=\"{}\"", path.replace('\\', "\\\\")));
-    let expected = match imported.as_deref() {
-        Some(imported) => install_paths == [imported],
-        None => {
-            install_paths == [EXPECTED_INSTALL_PATH]
-                || install_paths == [EXPECTED_VENDOR_INSTALL_PATH]
-        }
-    };
-    if expected {
-        ItemEvidence::satisfied()
-    } else if !saw_diablo_section {
-        // `wineboot` creates user.reg before Diablo is installed. A valid
-        // registry with no Diablo section is therefore absent BaseGame
-        // evidence, not conflicting or corrupt installation evidence.
-        ItemEvidence::missing(relative)
-    } else {
-        ItemEvidence::invalid(Some(relative), FindingReason::RegistryMismatch)
-    }
-}
-
-fn wine_registry_section(line: &str) -> Option<&str> {
-    let closing = line.find(']')?;
-    if !line.starts_with('[') {
-        return None;
-    }
-    let suffix = &line[closing + 1..];
-    if !suffix.is_empty()
-        && !suffix.strip_prefix(' ').is_some_and(|timestamp| {
-            !timestamp.is_empty() && timestamp.bytes().all(|b| b.is_ascii_digit())
-        })
-    {
-        return None;
-    }
-    Some(&line[..=closing])
 }
 
 fn inspect_sha256(

@@ -317,8 +317,8 @@ impl CoordinatorBackend for ProductionBackend {
     }
 }
 
-/// Session-only installer media choice, or a Diablo II 1.14b or 1.14d the
-/// user already has.
+/// Session-only installer media choice, or a Diablo II the user already
+/// has, of any version.
 #[derive(Clone)]
 enum InstallerChoice {
     Folder(InstallerMedia),
@@ -951,8 +951,8 @@ impl ReadyBackend {
         Ok(InstallerMediaView::BlizzardDownload)
     }
 
-    /// Check a Diablo II folder the user already has. A usable
-    /// 1.14b or 1.14d folder becomes the choice; one that isn't is returned with the
+    /// Check a Diablo II folder the user already has. A usable folder, of
+    /// any version, becomes the choice; one that isn't is returned with the
     /// reason and the earlier choice is kept.
     fn select_existing_install(&self, path: PathBuf) -> Result<InstallerMediaView, BackendFailure> {
         match crate::game_folder::validate_existing(&path, &self.paths.managed_root()) {
@@ -2891,11 +2891,6 @@ fn existing_problem_view(problem: ExistingInstallProblem) -> ExistingProblemView
         ExistingInstallProblem::NotFound => ExistingProblemView::NotFound,
         ExistingInstallProblem::Unreadable => ExistingProblemView::Unreadable,
         ExistingInstallProblem::NotDiablo => ExistingProblemView::NotDiablo,
-        ExistingInstallProblem::UnsupportedVersion(version) => {
-            ExistingProblemView::UnsupportedVersion(version.map(|version| version.label()))
-        }
-        ExistingInstallProblem::ModifiedGame => ExistingProblemView::ModifiedGame,
-        ExistingInstallProblem::ArchiveMismatch => ExistingProblemView::ArchiveMismatch,
         ExistingInstallProblem::NoExpansion => ExistingProblemView::NoExpansion,
         ExistingInstallProblem::MissingFile(name) => ExistingProblemView::MissingFile(name),
         ExistingInstallProblem::Links => ExistingProblemView::Links,
@@ -3083,7 +3078,6 @@ fn report_evidence(report: &InstallationReport) -> Vec<EvidenceView> {
         (AuditCheck::Prefix, PREFIX_EVIDENCE_LABEL),
         (AuditCheck::BaseGame, "Diablo II"),
         (AuditCheck::Expansion, "Lord of Destruction"),
-        (AuditCheck::GameVersion, "Diablo II version"),
         (AuditCheck::Client, "PD2 Game client"),
         (AuditCheck::Transaction, "Launcher transaction"),
     ]

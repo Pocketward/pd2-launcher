@@ -1,12 +1,19 @@
 //! The interrupted-stage marker.
 //!
 //! Before a stage that changes the Managed prefix in a way its own evidence
-//! cannot resume (creating a new prefix, or running a Vendor installer), the
-//! installer records that stage in `<root>/.pd2launcher-stage.json` while it
-//! holds the installation lease. It clears the marker only after a fresh
-//! audit proved the stage's evidence. An audit that finds the marker beside
-//! incomplete evidence for that stage reports `StageInterrupted`, which only
-//! a confirmed Start over resolves, instead of `Indeterminate`.
+//! cannot resume (creating a new prefix, running a Vendor installer, or
+//! importing a game), the installer records that stage in
+//! `<root>/.pd2launcher-stage.json` while it holds the installation lease.
+//! When the stage's step returned without an error, the installer marks the
+//! record finished; it clears the marker only after a fresh audit proved
+//! the stage's evidence. An audit that finds the marker beside evidence the
+//! stage left part way reports `StageInterrupted`, which only a confirmed
+//! Start over resolves, instead of `Indeterminate`.
+//!
+//! The games are proven by their files alone, and a file can be
+//! there but short while it is written. So for a game stage that is not
+//! finished, any file it wrote means the stage stopped part way; a
+//! finished one is judged by its files.
 
 use std::{
     ffi::OsStr,
@@ -35,13 +42,20 @@ enum StageName {
 struct Record {
     schema: u32,
     stage: StageName,
+    /// The stage's step returned without an error. Left out while it runs,
+    /// so such a record is the same as one an earlier release wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    finished: bool,
 }
 
 /// What the managed root says about an interrupted stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MarkerState {
     Absent,
+    /// The stage started and its step has not returned.
     Present(InterruptedStage),
+    /// The stage's step returned; only the proof and the clear are left.
+    Finished(InterruptedStage),
     /// Present but not a marker the Launcher wrote: fails closed.
     Invalid,
 }
@@ -57,17 +71,35 @@ pub(crate) fn read(root: &Directory) -> MarkerState {
         return MarkerState::Invalid;
     }
     match serde_json::from_slice::<Record>(&bytes) {
-        Ok(record) if record.schema == SCHEMA => MarkerState::Present(match record.stage {
-            StageName::Prefix => InterruptedStage::Prefix,
-            StageName::BaseGame => InterruptedStage::BaseGame,
-            StageName::Expansion => InterruptedStage::Expansion,
-        }),
+        Ok(record) if record.schema == SCHEMA => {
+            let stage = match record.stage {
+                StageName::Prefix => InterruptedStage::Prefix,
+                StageName::BaseGame => InterruptedStage::BaseGame,
+                StageName::Expansion => InterruptedStage::Expansion,
+            };
+            if record.finished {
+                MarkerState::Finished(stage)
+            } else {
+                MarkerState::Present(stage)
+            }
+        }
         _ => MarkerState::Invalid,
     }
 }
 
-/// Record `stage` durably. The caller holds the installation lease.
+/// Record `stage` durably, as started. The caller holds the installation
+/// lease.
 pub(crate) fn write(root: &Directory, stage: InterruptedStage) -> io::Result<()> {
+    write_record(root, stage, false)
+}
+
+/// Record that `stage`'s step returned without an error, before its
+/// evidence is audited. The caller holds the installation lease.
+pub(crate) fn finish(root: &Directory, stage: InterruptedStage) -> io::Result<()> {
+    write_record(root, stage, true)
+}
+
+fn write_record(root: &Directory, stage: InterruptedStage, finished: bool) -> io::Result<()> {
     let record = Record {
         schema: SCHEMA,
         stage: match stage {
@@ -75,6 +107,7 @@ pub(crate) fn write(root: &Directory, stage: InterruptedStage) -> io::Result<()>
             InterruptedStage::BaseGame => StageName::BaseGame,
             InterruptedStage::Expansion => StageName::Expansion,
         },
+        finished,
     };
     let bytes = serde_json::to_vec(&record)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stage marker encode failed"))?;
@@ -111,7 +144,15 @@ mod tests {
         ] {
             write(&root, stage).unwrap();
             assert_eq!(read(&root), MarkerState::Present(stage));
+            finish(&root, stage).unwrap();
+            assert_eq!(read(&root), MarkerState::Finished(stage));
         }
+        // A started record is written as earlier releases wrote it.
+        write(&root, InterruptedStage::BaseGame).unwrap();
+        assert_eq!(
+            fs::read(fixture.path().join(STAGE_MARKER)).unwrap(),
+            br#"{"schema":1,"stage":"base-game"}"#
+        );
         clear(&root).unwrap();
         assert_eq!(read(&root), MarkerState::Absent);
 
@@ -120,6 +161,7 @@ mod tests {
             br#"{"schema":2,"stage":"prefix"}"#,
             br#"{"schema":1,"stage":"patch"}"#,
             br#"{"schema":1,"stage":"prefix","extra":1}"#,
+            br#"{"schema":1,"stage":"prefix","finished":"yes"}"#,
         ] {
             fs::write(fixture.path().join(STAGE_MARKER), bytes).unwrap();
             assert_eq!(read(&root), MarkerState::Invalid);

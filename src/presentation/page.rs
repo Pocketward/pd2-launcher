@@ -448,7 +448,7 @@ fn present_action(action: &ActionView) -> (&'static str, bool, Option<&'static s
         (ActionId::ImportExisting, false) => (
             "Install Diablo II",
             false,
-            Some("Choose a Diablo II 1.14b or 1.14d folder first."),
+            Some("Choose a usable Diablo II folder first."),
         ),
         (ActionId::InstallProjectDiablo, _) => (action.label, false, None),
         (ActionId::ContinueInstallation, true) => (action.label, false, None),
@@ -3184,8 +3184,8 @@ impl LauncherView {
     }
 
     /// How to get Diablo II: Blizzard's download (default and recommended),
-    /// installer files the user has, or a Diablo II 1.14b or 1.14d the user
-    /// already has installed.
+    /// installer files the user has, or a Diablo II the user already has
+    /// installed, of any version.
     fn installer_section(&mut self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -3357,7 +3357,7 @@ impl LauncherView {
                                 .label("I already have Diablo II + Lord of Destruction installed")
                                 .when(selected == 2, |radio| {
                                     radio.child(div().text_xs().text_color(muted).child(
-                                        "Choose the folder that contains Game.exe (1.14b or 1.14d). No CD keys needed.",
+                                        "Choose the folder that contains Game.exe. No CD keys needed.",
                                     ))
                                 }),
                         ),
@@ -6293,9 +6293,8 @@ mod tests {
             ),
             (
                 SetupStep::Setup,
-                located(setup_snapshot()).with_installer_media(existing(Some(
-                    ExistingProblemView::UnsupportedVersion(Some("1.13")),
-                ))),
+                located(setup_snapshot())
+                    .with_installer_media(existing(Some(ExistingProblemView::NoExpansion))),
                 "guided-location",
             ),
             (

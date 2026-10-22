@@ -1,5 +1,5 @@
 //! Where the Diablo II game folder is, and Diablo II installations the user
-//! already has, which may be 1.14b or 1.14d.
+//! already has, of any version.
 //!
 //! The game normally lives in the Managed prefix at
 //! `prefix/drive_c/Program Files (x86)/Diablo II`. An existing installation
@@ -42,56 +42,19 @@ pub(crate) const GAME_RELATIVE: &str = "prefix/drive_c/Program Files (x86)/Diabl
 pub(crate) const MANAGED_WINDOWS_PATH: &str = r"C:\Program Files (x86)\Diablo II";
 /// The record of a game folder used in place, in the Managed prefix.
 pub(crate) const POINTER_NAME: &str = ".pd2launcher-game-folder.json";
-/// The Launcher's own evidence that an existing installation was imported,
-/// in the Managed prefix. It stands in for Blizzard's install logs.
-pub(crate) const IMPORT_RECEIPT_NAME: &str = ".pd2launcher-imported-game.json";
+/// The record that the game was imported, in the Managed prefix. The Android
+/// app reads that it is there (its storage words and its notice about the
+/// player's folder). The Auditor does not read it: the files prove the
+/// game. Its form is the one earlier releases wrote.
+pub(crate) const IMPORT_RECORD_NAME: &str = ".pd2launcher-imported-game.json";
 const SCHEMA: u32 = 1;
 const RECORD_LIMIT: u64 = 8 * 1024;
 /// A game folder with more entries than this is not a Diablo II folder.
 const MAX_TREE_ENTRIES: usize = 65_536;
 const MAX_TREE_DEPTH: usize = 16;
 
-/// A Diablo II version the Launcher accepts as the base game:
-/// the size and SHA-256 of its `Game.exe`, and of its `Patch_D2.mpq` where
-/// that file is the same in every language. The game is never patched:
-/// Project Diablo 2 brings its own game files in `ProjectD2`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BaseGameVersion {
-    pub(crate) game: (u64, &'static str),
-    pub(crate) archive: Option<(u64, &'static str)>,
-}
-
-/// What Blizzard's current Diablo II and Lord of Destruction installers
-/// write, which the Launcher installs: 1.14b. `Game.exe` (FileVersion
-/// 1.14.1.68) is one binary for every language. `Patch_D2.mpq` ships inside
-/// each language's installer, so only its presence is required.
-pub(crate) const BASE_GAME_1_14B: BaseGameVersion = BaseGameVersion {
-    game: (
-        3_590_120,
-        "0680e266b1fbbc8e7815b0a7c4f67267de38fd9063fceeae2da0306389a52178",
-    ),
-    archive: None,
-};
-
-/// Blizzard's 1.14d patch output, which installations made by older
-/// releases (and many existing ones) have. The one patch served every
-/// language, so both files are pinned.
-pub(crate) const BASE_GAME_1_14D: BaseGameVersion = BaseGameVersion {
-    game: (
-        3_618_792,
-        "631066c1649c4ea9ffe48bf97e24c00bca1f7a6759c21150f1a79982589adaaf",
-    ),
-    archive: Some((
-        5_727_413,
-        "531bad76d520eea8cb0601bea5a40e1ec52f51fe7b94a6892dc483d18170c607",
-    )),
-};
-
-/// Every base game the Launcher and the Auditor accept.
-pub(crate) const ACCEPTED_BASE_GAMES: [BaseGameVersion; 2] = [BASE_GAME_1_14B, BASE_GAME_1_14D];
-
-/// Files a complete Diablo II installation needs, by canonical name. The
-/// Auditor checks the same names for Diablo II and Lord of Destruction.
+/// Files a complete Diablo II installation needs, by canonical name. They
+/// must be there; their version is never checked.
 const BASE_FILES: [&str; 9] = [
     "Game.exe",
     "Patch_D2.mpq",
@@ -104,7 +67,8 @@ const BASE_FILES: [&str; 9] = [
     "d2video.mpq",
 ];
 const EXPANSION_FILES: [&str; 4] = ["d2exp.mpq", "d2xmusic.mpq", "d2xtalk.mpq", "d2xvideo.mpq"];
-/// Not copied: Project Diablo 2 is installed fresh by its own step.
+/// Copied only on the desktop, where Install Project Diablo 2 adopts it;
+/// the Android app copies folders itself.
 const PROJECT_D2: &str = "projectd2";
 
 /// Where the game folder is.
@@ -301,7 +265,7 @@ pub(crate) fn write_pointer(prefix: &Directory, external: &ExternalGameFolder) -
 }
 
 /// How an existing installation became the game.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ImportMode {
     /// Copied into the Managed game folder; the original is not used.
@@ -310,50 +274,28 @@ pub(crate) enum ImportMode {
     InPlace,
 }
 
-/// The Launcher's evidence that an existing installation was imported.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ImportReceipt {
+#[derive(Serialize)]
+struct ImportRecord<'a> {
     schema: u32,
-    pub(crate) mode: ImportMode,
-    /// The `InstallPath` the registry must name.
-    pub(crate) install_path: String,
+    mode: ImportMode,
+    /// The game folder as Windows programs see it.
+    install_path: &'a str,
 }
 
-impl ImportReceipt {
-    pub(crate) fn new(mode: ImportMode, install_path: String) -> Self {
-        Self {
-            schema: SCHEMA,
-            mode,
-            install_path,
-        }
-    }
-}
-
-/// Write the import receipt last, once the game files and the registry are
-/// in place.
-pub(crate) fn write_import_receipt(prefix: &Directory, receipt: &ImportReceipt) -> io::Result<()> {
-    let bytes = serde_json::to_vec(receipt)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "receipt encode failed"))?;
-    prefix.atomic_write(OsStr::new(IMPORT_RECEIPT_NAME), &bytes)
-}
-
-/// The import receipt, if this installation was imported. A receipt the
-/// Launcher did not write is `Err`.
-pub(crate) fn read_import_receipt(root: &Directory) -> Result<Option<ImportReceipt>, ()> {
-    let prefix = match root.open_directory(Path::new("prefix")) {
-        Ok(prefix) => prefix,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
-    };
-    let Some(bytes) = read_bounded(&prefix, IMPORT_RECEIPT_NAME)? else {
-        return Ok(None);
-    };
-    serde_json::from_slice::<ImportReceipt>(&bytes)
-        .ok()
-        .filter(|receipt| receipt.schema == SCHEMA)
-        .map(Some)
-        .ok_or(())
+/// Write the import record, once the game is in place. The caller holds the
+/// installation lease.
+pub(crate) fn write_import_record(
+    prefix: &Directory,
+    mode: ImportMode,
+    install_path: &str,
+) -> io::Result<()> {
+    let bytes = serde_json::to_vec(&ImportRecord {
+        schema: SCHEMA,
+        mode,
+        install_path,
+    })
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record encode failed"))?;
+    prefix.atomic_write(OsStr::new(IMPORT_RECORD_NAME), &bytes)
 }
 
 fn read_bounded(directory: &Directory, name: &str) -> Result<Option<Vec<u8>>, ()> {
@@ -381,13 +323,6 @@ pub(crate) enum ExistingInstallProblem {
     Unreadable,
     /// No Diablo II here.
     NotDiablo,
-    /// Diablo II, but a version other than 1.14b or 1.14d (named when
-    /// recognized).
-    UnsupportedVersion(Option<GameVersion>),
-    /// `Game.exe` names 1.14b or 1.14d but is not Blizzard's file.
-    ModifiedGame,
-    /// `Game.exe` is 1.14d but `Patch_D2.mpq` is not.
-    ArchiveMismatch,
     /// Lord of Destruction isn't installed here.
     NoExpansion,
     /// A file the game needs is missing.
@@ -400,29 +335,7 @@ pub(crate) enum ExistingInstallProblem {
     UnsupportedPath,
 }
 
-/// A Diablo II version recognized from `Game.exe`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GameVersion {
-    V113,
-    V114A,
-    V114B,
-    V114C,
-    V114D,
-}
-
-impl GameVersion {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::V113 => "1.13",
-            Self::V114A => "1.14a",
-            Self::V114B => "1.14b",
-            Self::V114C => "1.14c",
-            Self::V114D => "1.14d",
-        }
-    }
-}
-
-/// A validated Diablo II + Lord of Destruction 1.14b or 1.14d folder.
+/// A validated Diablo II + Lord of Destruction folder, of any version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExistingInstall {
     folder: ExternalGameFolder,
@@ -433,9 +346,6 @@ pub(crate) struct ExistingInstall {
     /// It holds a Project Diablo 2 to adopt: a ProjectD2 with the client's
     /// launch files (`Game.exe`, `ProjectDiablo.dll`) present and not empty.
     project_diablo: bool,
-    /// The base games it was checked against (the accepted ones, except
-    /// in tests).
-    versions: Vec<BaseGameVersion>,
     /// No Project Diablo 2 folder, or one named exactly `ProjectD2`. The
     /// Launcher reads and writes that name; Windows programs would use a
     /// differently cased one, and the two would disagree in place.
@@ -470,7 +380,7 @@ impl ExistingInstall {
     /// Validate again, for the folder recorded at the choice, right before
     /// it is imported: it must still be the same folder and still usable.
     pub(crate) fn revalidate(&self, managed_root: &Path) -> Result<Self, ExistingInstallProblem> {
-        let fresh = validate_existing_with(&self.folder.path, managed_root, &self.versions)?;
+        let fresh = validate_existing(&self.folder.path, managed_root)?;
         if fresh.folder != self.folder {
             return Err(ExistingInstallProblem::NotFound);
         }
@@ -479,22 +389,14 @@ impl ExistingInstall {
 }
 
 /// Check that `path` is the folder of a complete Diablo II + Lord of
-/// Destruction 1.14b or 1.14d installation: `Game.exe` (and, for 1.14d,
-/// `Patch_D2.mpq`) matches an accepted base game, every file the game needs
-/// is present, and no symbolic link or special file is part of it. Names are
-/// matched without regard to case, as Windows does. The folder is only read:
-/// it is never patched.
+/// Destruction installation, of any version: the player chose it, so it is
+/// used as it is. Every file the game needs (`BASE_FILES` and
+/// `EXPANSION_FILES`) is a regular file in it, and no symbolic link or
+/// special file is part of it. Names are matched without regard to case, as
+/// Windows does. The folder is only read: it is never patched.
 pub(crate) fn validate_existing(
     path: &Path,
     managed_root: &Path,
-) -> Result<ExistingInstall, ExistingInstallProblem> {
-    validate_existing_with(path, managed_root, &ACCEPTED_BASE_GAMES)
-}
-
-pub(crate) fn validate_existing_with(
-    path: &Path,
-    managed_root: &Path,
-    versions: &[BaseGameVersion],
 ) -> Result<ExistingInstall, ExistingInstallProblem> {
     if !path.is_absolute() {
         return Err(ExistingInstallProblem::NotFound);
@@ -517,27 +419,12 @@ pub(crate) fn validate_existing_with(
     if !has("game.exe") && !has("d2data.mpq") {
         return Err(ExistingInstallProblem::NotDiablo);
     }
-    let mut game = open_named(&directory, &names, "Game.exe")?
-        .ok_or(ExistingInstallProblem::MissingFile("Game.exe"))?;
-    let mut version = None;
-    for candidate in versions {
-        if matches_pin(&mut game, candidate.game)? {
-            version = Some(candidate);
-            break;
-        }
-    }
-    let Some(version) = version else {
-        return Err(match game_version(&mut game) {
-            Some(GameVersion::V114B | GameVersion::V114D) => ExistingInstallProblem::ModifiedGame,
-            other => ExistingInstallProblem::UnsupportedVersion(other),
-        });
-    };
-    if let Some(archive_pin) = version.archive {
-        let mut archive = open_named(&directory, &names, "Patch_D2.mpq")?
-            .ok_or(ExistingInstallProblem::ArchiveMismatch)?;
-        if !matches_pin(&mut archive, archive_pin)? {
-            return Err(ExistingInstallProblem::ArchiveMismatch);
-        }
+    // No version check: what `Game.exe` and `Patch_D2.mpq` hold is the
+    // player's choice. Project Diablo 2 runs its own game files from
+    // `ProjectD2`. A missing `Game.exe` is named before a missing Lord of
+    // Destruction, as the list below would not.
+    if open_named(&directory, &names, "Game.exe")?.is_none() {
+        return Err(ExistingInstallProblem::MissingFile("Game.exe"));
     }
     if open_named(&directory, &names, "d2exp.mpq")?.is_none() {
         return Err(ExistingInstallProblem::NoExpansion);
@@ -581,7 +468,6 @@ pub(crate) fn validate_existing_with(
         copy_bytes,
         project_d2_bytes,
         project_diablo,
-        versions: versions.to_vec(),
         project_d2_canonical,
     })
 }
@@ -655,19 +541,6 @@ fn open_named(
     Ok(Some(file))
 }
 
-fn matches_pin(
-    file: &mut File,
-    (size, sha256): (u64, &str),
-) -> Result<bool, ExistingInstallProblem> {
-    let metadata = file
-        .metadata()
-        .map_err(|_| ExistingInstallProblem::Unreadable)?;
-    if metadata.len() != size {
-        return Ok(false);
-    }
-    Ok(sha256_hex(file).map_err(|_| ExistingInstallProblem::Unreadable)? == sha256)
-}
-
 fn sha256_hex(file: &mut File) -> io::Result<String> {
     file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
@@ -684,42 +557,6 @@ fn sha256_hex(file: &mut File) -> io::Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-
-/// The version in `Game.exe`'s version resource, when it is one this
-/// Launcher can name.
-fn game_version(file: &mut File) -> Option<GameVersion> {
-    file.seek(SeekFrom::Start(0)).ok()?;
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
-    let key: Vec<u8> = "FileVersion\0"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let start = bytes
-        .windows(key.len())
-        .position(|window| window == key.as_slice())?
-        + key.len();
-    // The value follows after 32-bit alignment padding.
-    let value: String = bytes[start..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .skip_while(|unit| *unit == 0)
-        .take_while(|unit| *unit != 0)
-        .take(32)
-        .filter_map(|unit| char::from_u32(u32::from(unit)))
-        .collect();
-    let parts: Vec<&str> = value.split(['.', ',']).map(str::trim).collect();
-    match parts.as_slice() {
-        ["1", "14", "0", ..] => Some(GameVersion::V114A),
-        ["1", "14", "1", ..] => Some(GameVersion::V114B),
-        ["1", "14", "2", ..] => Some(GameVersion::V114C),
-        ["1", "14", "3", ..] => Some(GameVersion::V114D),
-        ["1", "0", "13", ..] => Some(GameVersion::V113),
-        _ => None,
-    }
 }
 
 /// Total size of the regular files below `directory`, refusing any link or
@@ -1016,6 +853,8 @@ pub(crate) mod tests {
         fs::write(path.join("ProjectD2/Game.exe"), b"pd2").unwrap();
     }
 
+    /// A `Game.exe` whose version resource names `version`, as Blizzard's
+    /// files do ("1, 0, 13, 60" is 1.13c).
     fn version_resource(version: &str) -> Vec<u8> {
         let mut bytes = b"MZ fixture ".to_vec();
         for text in ["FileVersion\0", "\0", version, "\0"] {
@@ -1024,38 +863,8 @@ pub(crate) mod tests {
         bytes
     }
 
-    /// A base game whose `Game.exe` and `Patch_D2.mpq` are both pinned,
-    /// as 1.14d is.
-    pub(crate) fn pinned_version(game: &[u8], archive: &[u8]) -> BaseGameVersion {
-        BaseGameVersion {
-            game: pin(game),
-            archive: Some(pin(archive)),
-        }
-    }
-
-    fn validate_with_pins(
-        path: &Path,
-        game_pin: (u64, &'static str),
-        archive_pin: (u64, &'static str),
-    ) -> Result<ExistingInstall, ExistingInstallProblem> {
-        // Blizzard's files can't be fixtures; the same rules run against
-        // fixture pins.
-        validate_existing_with(
-            path,
-            Path::new("/nonexistent/pd2-launcher"),
-            &[BaseGameVersion {
-                game: game_pin,
-                archive: Some(archive_pin),
-            }],
-        )
-    }
-
-    pub(crate) fn pin(bytes: &[u8]) -> (u64, &'static str) {
-        let digest: String = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        (bytes.len() as u64, Box::leak(digest.into_boxed_str()))
+    fn validate(path: &Path) -> Result<ExistingInstall, ExistingInstallProblem> {
+        validate_existing(path, Path::new("/nonexistent/pd2-launcher"))
     }
 
     #[test]
@@ -1080,31 +889,8 @@ pub(crate) mod tests {
             Err(ExistingInstallProblem::NotDiablo)
         );
 
-        // Another version is named from Game.exe's version resource.
-        for (version, expected) in [
-            ("1, 14, 2, 70", Some(GameVersion::V114C)),
-            ("1.14.0.64", Some(GameVersion::V114A)),
-            ("1, 0, 13, 60", Some(GameVersion::V113)),
-            ("2.0.0", None),
-        ] {
-            write_game_folder(&folder, &version_resource(version), b"archive");
-            assert_eq!(
-                validate_existing(&folder, root),
-                Err(ExistingInstallProblem::UnsupportedVersion(expected)),
-                "{version}"
-            );
-        }
-        // A Game.exe that names an accepted version but is not Blizzard's.
-        for version in ["1.14.1.68", "1, 14, 3, 71"] {
-            write_game_folder(&folder, &version_resource(version), b"archive");
-            assert_eq!(
-                validate_existing(&folder, root),
-                Err(ExistingInstallProblem::ModifiedGame),
-                "{version}"
-            );
-        }
-
         // Inside, or containing, the launcher's own folder.
+        write_game_folder(&folder, b"game", b"archive");
         assert_eq!(
             validate_existing(&folder, fixture.path()),
             Err(ExistingInstallProblem::InsideLauncher)
@@ -1119,11 +905,10 @@ pub(crate) mod tests {
     fn the_rest_of_the_folder_must_be_complete_and_link_free() {
         let fixture = tempfile::tempdir().unwrap();
         let folder = fixture.path().join("Diablo II");
-        let (game, archive) = (b"game-1.14d".as_slice(), b"archive-1.14d".as_slice());
-        let (game_pin, archive_pin) = (pin(game), pin(archive));
+        let (game, archive) = (b"game-exe".as_slice(), b"patch-archive".as_slice());
         write_game_folder(&folder, game, archive);
 
-        let valid = validate_with_pins(&folder, game_pin, archive_pin).expect("1.14d folder");
+        let valid = validate(&folder).expect("a complete folder");
         assert_eq!(valid.path(), folder);
         // The desktop's copy brings ProjectD2 along (`pd2`, 3 bytes); it
         // holds no Project Diablo 2 to adopt without its launch files.
@@ -1144,40 +929,27 @@ pub(crate) mod tests {
 
         // A ProjectD2 with the client's launch files is one to adopt.
         fs::write(folder.join("ProjectD2/ProjectDiablo.dll"), b"dll").unwrap();
-        let found = validate_with_pins(&folder, game_pin, archive_pin).expect("with PD2");
+        let found = validate(&folder).expect("with PD2");
         assert!(found.project_diablo());
         assert_eq!(found.copy_bytes(), valid.copy_bytes() + 3);
         fs::write(folder.join("ProjectD2/ProjectDiablo.dll"), b"").unwrap();
         assert!(
-            !validate_with_pins(&folder, game_pin, archive_pin)
-                .unwrap()
-                .project_diablo(),
+            !validate(&folder).unwrap().project_diablo(),
             "an empty launch file is what a stopped copy leaves"
         );
         fs::remove_file(folder.join("ProjectD2/ProjectDiablo.dll")).unwrap();
 
         // Names match without regard to case, as Windows does.
         fs::rename(folder.join("Patch_D2.mpq"), folder.join("patch_d2.mpq")).unwrap();
-        assert!(validate_with_pins(&folder, game_pin, archive_pin).is_ok());
-
-        // A wrong Patch_D2.mpq.
-        fs::write(folder.join("patch_d2.mpq"), b"older").unwrap();
-        assert_eq!(
-            validate_with_pins(&folder, game_pin, archive_pin),
-            Err(ExistingInstallProblem::ArchiveMismatch)
-        );
-        fs::write(folder.join("patch_d2.mpq"), archive).unwrap();
+        assert!(validate(&folder).is_ok());
 
         // No Lord of Destruction; a missing file.
         fs::remove_file(folder.join("d2exp.mpq")).unwrap();
-        assert_eq!(
-            validate_with_pins(&folder, game_pin, archive_pin),
-            Err(ExistingInstallProblem::NoExpansion)
-        );
+        assert_eq!(validate(&folder), Err(ExistingInstallProblem::NoExpansion));
         fs::write(folder.join("d2exp.mpq"), b"lod").unwrap();
         fs::remove_file(folder.join("d2music.mpq")).unwrap();
         assert_eq!(
-            validate_with_pins(&folder, game_pin, archive_pin),
+            validate(&folder),
             Err(ExistingInstallProblem::MissingFile("d2music.mpq"))
         );
         fs::write(folder.join("d2music.mpq"), b"music").unwrap();
@@ -1187,62 +959,70 @@ pub(crate) mod tests {
         let outside = fixture.path().join("outside");
         fs::create_dir(&outside).unwrap();
         symlink(&outside, folder.join("Save/elsewhere")).unwrap();
-        assert_eq!(
-            validate_with_pins(&folder, game_pin, archive_pin),
-            Err(ExistingInstallProblem::Links)
-        );
+        assert_eq!(validate(&folder), Err(ExistingInstallProblem::Links));
         fs::remove_file(folder.join("Save/elsewhere")).unwrap();
         fs::rename(folder.join("d2xtalk.mpq"), outside.join("d2xtalk.mpq")).unwrap();
         symlink(outside.join("d2xtalk.mpq"), folder.join("d2xtalk.mpq")).unwrap();
-        assert_eq!(
-            validate_with_pins(&folder, game_pin, archive_pin),
-            Err(ExistingInstallProblem::Links)
-        );
+        assert_eq!(validate(&folder), Err(ExistingInstallProblem::Links));
         fs::remove_file(folder.join("d2xtalk.mpq")).unwrap();
         fs::write(folder.join("d2xtalk.mpq"), b"talk").unwrap();
 
         // The folder reached through a link.
         symlink(&folder, fixture.path().join("linked")).unwrap();
         assert_eq!(
-            validate_with_pins(&fixture.path().join("linked"), game_pin, archive_pin),
+            validate(&fixture.path().join("linked")),
             Err(ExistingInstallProblem::Links)
         );
     }
 
     #[test]
-    fn either_accepted_base_game_is_used_as_it_is() {
+    fn a_folder_of_any_diablo_ii_version_is_used_as_it_is() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = Path::new("/nonexistent/pd2-launcher");
         let folder = fixture.path().join("Diablo II");
-        // As 1.14b: only Game.exe is pinned; Patch_D2.mpq must be there.
-        let unpatched = BaseGameVersion {
-            game: pin(b"game-1.14b"),
-            archive: None,
-        };
-        let patched = pinned_version(b"game-1.14d", b"archive-1.14d");
-        let versions = [unpatched, patched];
-        write_game_folder(&folder, b"game-1.14b", b"any language's archive");
-        let before = fs::read(folder.join("Game.exe")).unwrap();
-        assert!(validate_existing_with(&folder, root, &versions).is_ok());
-        write_game_folder(&folder, b"game-1.14d", b"archive-1.14d");
-        assert!(validate_existing_with(&folder, root, &versions).is_ok());
-        // 1.14d pins its archive too.
-        fs::write(folder.join("Patch_D2.mpq"), b"other").unwrap();
-        assert_eq!(
-            validate_existing_with(&folder, root, &versions),
-            Err(ExistingInstallProblem::ArchiveMismatch)
-        );
-        write_game_folder(&folder, b"game-1.14b", b"archive");
+        // 1.13c, 1.14b and 1.14d (the version resources Blizzard's files
+        // have), others, a `Game.exe` that is no Blizzard file, and a
+        // `Patch_D2.mpq` that does not match its `Game.exe`: the player
+        // chose the folder, so its version is not checked.
+        for (version, archive) in [
+            ("1, 0, 13, 60", b"1.13c archive".as_slice()),
+            ("1.14.0.64", b"1.14a archive"),
+            ("1.14.1.68", b"any language's archive"),
+            ("1, 14, 3, 71", b"not 1.14d's archive"),
+            ("2.0.0", b"archive"),
+        ] {
+            write_game_folder(&folder, &version_resource(version), archive);
+            fs::remove_dir_all(folder.join("ProjectD2")).unwrap();
+            // Without a ProjectD2: Install Project Diablo 2 installs it.
+            let found = validate(&folder).expect(version);
+            assert!(!found.project_diablo(), "{version}");
+            assert!(usable_in_place(&found), "{version}");
+            // With an older or newer Project Diablo 2: it is adopted, and
+            // its update brings it up to date.
+            fs::create_dir(folder.join("ProjectD2")).unwrap();
+            fs::write(folder.join("ProjectD2/Game.exe"), b"pd2 1.13c").unwrap();
+            fs::write(folder.join("ProjectD2/ProjectDiablo.dll"), b"older pd2").unwrap();
+            let found = validate(&folder).expect(version);
+            assert!(found.project_diablo(), "{version}");
+            // Validation only reads: nothing is patched.
+            assert_eq!(
+                fs::read(folder.join("Game.exe")).unwrap(),
+                version_resource(version)
+            );
+            assert_eq!(fs::read(folder.join("Patch_D2.mpq")).unwrap(), archive);
+        }
+        // What stays required is the files of Diablo II and Lord of
+        // Destruction.
         fs::remove_file(folder.join("Patch_D2.mpq")).unwrap();
         assert_eq!(
-            validate_existing_with(&folder, root, &versions),
+            validate(&folder),
             Err(ExistingInstallProblem::MissingFile("Patch_D2.mpq"))
         );
-        // Validation only reads: a 1.14b folder is never patched.
-        assert_eq!(fs::read(folder.join("Game.exe")).unwrap(), before);
-        // The release accepts Blizzard's 1.14b and 1.14d, nothing else.
-        assert_eq!(ACCEPTED_BASE_GAMES, [BASE_GAME_1_14B, BASE_GAME_1_14D]);
-        assert_ne!(BASE_GAME_1_14B.game.0, BASE_GAME_1_14D.game.0);
+        fs::write(folder.join("Patch_D2.mpq"), b"archive").unwrap();
+        fs::remove_file(folder.join("Game.exe")).unwrap();
+        assert_eq!(
+            validate(&folder),
+            Err(ExistingInstallProblem::MissingFile("Game.exe"))
+        );
     }
 
     #[test]
@@ -1397,13 +1177,13 @@ pub(crate) mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let game = fixture.path().join("Diablo II");
         write_game_folder(&game, b"game", b"archive");
-        let valid = validate_with_pins(&game, pin(b"game"), pin(b"archive")).unwrap();
+        let valid = validate(&game).unwrap();
         assert!(usable_in_place(&valid));
         fs::rename(game.join("ProjectD2"), game.join("projectd2")).unwrap();
-        let valid = validate_with_pins(&game, pin(b"game"), pin(b"archive")).unwrap();
+        let valid = validate(&game).unwrap();
         assert!(!usable_in_place(&valid));
         fs::remove_dir_all(game.join("projectd2")).unwrap();
-        let valid = validate_with_pins(&game, pin(b"game"), pin(b"archive")).unwrap();
+        let valid = validate(&game).unwrap();
         assert!(usable_in_place(&valid));
     }
 
@@ -1470,6 +1250,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_import_record_has_the_form_earlier_releases_wrote() {
+        let fixture = tempfile::tempdir().unwrap();
+        let prefix = Directory::open(fixture.path()).unwrap();
+        write_import_record(&prefix, ImportMode::InPlace, r"Z:\games\Diablo II").unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.path().join(IMPORT_RECORD_NAME)).unwrap(),
+            r#"{"schema":1,"mode":"in-place","install_path":"Z:\\games\\Diablo II"}"#
+        );
+    }
+
+    #[test]
     fn windows_paths_use_the_z_drive_and_refuse_unusable_names() {
         assert_eq!(
             windows_path_for(Path::new("/home/deck/Games/Diablo II")).as_deref(),
@@ -1480,22 +1271,5 @@ pub(crate) mod tests {
         assert_eq!(windows_path_for(Path::new("/games/a:b")), None);
         assert_eq!(windows_path_for(Path::new("/games/a\\b")), None);
         assert_eq!(windows_path_for(Path::new("/home/zoë/Diablo II")), None);
-    }
-
-    #[test]
-    fn the_import_receipt_round_trips_and_a_foreign_one_fails_closed() {
-        let fixture = tempfile::tempdir().unwrap();
-        fs::create_dir(fixture.path().join("prefix")).unwrap();
-        let root = Directory::open(fixture.path()).unwrap();
-        assert_eq!(read_import_receipt(&root), Ok(None));
-        let receipt = ImportReceipt::new(ImportMode::InPlace, r"Z:\games\Diablo II".to_owned());
-        write_import_receipt(&root.open_directory(Path::new("prefix")).unwrap(), &receipt).unwrap();
-        assert_eq!(read_import_receipt(&root), Ok(Some(receipt)));
-        fs::write(
-            fixture.path().join("prefix").join(IMPORT_RECEIPT_NAME),
-            br#"{"schema":1,"mode":"copy"}"#,
-        )
-        .unwrap();
-        assert_eq!(read_import_receipt(&root), Err(()));
     }
 }

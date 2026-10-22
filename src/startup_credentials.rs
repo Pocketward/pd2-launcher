@@ -40,7 +40,7 @@ pub(crate) enum StartupInstallerSource {
     Directory(PathBuf),
     /// The official downloader wrappers from the built-in Blizzard URLs.
     BlizzardDownload,
-    /// A Diablo II 1.14b or 1.14d the user already has (unattended only).
+    /// A Diablo II the user already has, of any version (unattended only).
     ExistingInstall(PathBuf),
 }
 

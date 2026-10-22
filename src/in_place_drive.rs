@@ -8,9 +8,10 @@
 //! ("not enough room on your hard disk"). So on the Android host the folder
 //! is reached through the `G:` drive instead: a link in the prefix's
 //! `dosdevices` to the folder's parent, the app's copy below `files/import` on
-//! the data partition. Its Windows path, the game's `InstallPath`, is
-//! `G:\<name>`, and every free-space question about it is answered by that
-//! partition. The desktop keeps `Z:`, a root with free space.
+//! the data partition. Its Windows path is `G:\<name>`: the game starts
+//! from there and the PD2 installer gets it as `/DIR=` (its `InstallPath`).
+//! The game writes a missing `InstallPath` as the folder it starts from.
+//! Every free-space question about `G:` is answered by that partition. The desktop keeps `Z:`, a root with free space.
 
 use std::{
     io,

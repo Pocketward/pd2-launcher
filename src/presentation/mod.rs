@@ -103,7 +103,7 @@ impl InstallerMediaView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExistingInstallView {
     pub(crate) path: PathBuf,
-    /// Why it can't be used; `None` for a usable 1.14b or 1.14d folder.
+    /// Why it can't be used; `None` for a usable folder, of any version.
     pub(crate) problem: Option<ExistingProblemView>,
     /// What a copy writes (with its ProjectD2, on the desktop).
     pub(crate) copy_bytes: u64,
@@ -120,13 +120,6 @@ pub(crate) enum ExistingProblemView {
     NotFound,
     Unreadable,
     NotDiablo,
-    /// A version other than 1.14b or 1.14d, named when recognized (such
-    /// as "1.13").
-    UnsupportedVersion(Option<&'static str>),
-    /// Game.exe names 1.14b or 1.14d but is not Blizzard's file.
-    ModifiedGame,
-    /// Game.exe is 1.14d but Patch_D2.mpq is not.
-    ArchiveMismatch,
     NoExpansion,
     MissingFile(&'static str),
     Links,
@@ -143,21 +136,6 @@ impl ExistingProblemView {
             }
             Self::NotDiablo => {
                 "Diablo II isn't in this folder. Choose the folder that contains Game.exe.".to_owned()
-            }
-            Self::UnsupportedVersion(Some(version)) => format!(
-                "This folder has Diablo II {version} — install Diablo II and Lord of Destruction with Blizzard's current installers first."
-            ),
-            Self::UnsupportedVersion(None) => {
-                "This folder's Diablo II isn't a version the launcher can use (1.14b or 1.14d) — install Diablo II and Lord of Destruction with Blizzard's current installers first."
-                    .to_owned()
-            }
-            Self::ModifiedGame => {
-                "Game.exe here was changed from Blizzard's file. Repair or reinstall Diablo II there first."
-                    .to_owned()
-            }
-            Self::ArchiveMismatch => {
-                "Patch_D2.mpq here doesn't match its Game.exe. Repair or reinstall Diablo II there first."
-                    .to_owned()
             }
             Self::NoExpansion => {
                 "Lord of Destruction isn't installed here. Install it with Blizzard's installer first."
@@ -2447,7 +2425,7 @@ pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
         ),
         "existing-install-invalid" => card(
             "Your Diablo II can't be used anymore",
-            "The folder changed since you chose it and is no longer a complete Diablo II 1.14b or 1.14d. Choose it again in Location & installers to see why.",
+            "The folder changed since you chose it and is no longer a complete Diablo II and Lord of Destruction. Choose it again in Location & installers to see why.",
             None,
         ),
         "base-game-required" => card(
@@ -4148,7 +4126,7 @@ pub(crate) fn guided_actions(
                     } else {
                         blocked(
                             ActionId::ImportExisting,
-                            "Choose a Diablo II 1.14b or 1.14d folder first.",
+                            "Choose a usable Diablo II folder first.",
                         )
                     }
                 }
@@ -4491,11 +4469,11 @@ pub(crate) enum Intent {
     ContinueInstallation,
     /// Step 3: download and verify everything.
     DownloadAll,
-    /// Step 4 for a Diablo II 1.14b or 1.14d the user already has.
+    /// Step 4 for a Diablo II the user already has, of any version.
     ImportExistingInstall(ImportModeView),
     /// Step 5: install Project Diablo 2.
     InstallProjectDiablo,
-    /// Choose a Diablo II 1.14b or 1.14d folder the user already has.
+    /// Choose a Diablo II folder the user already has, of any version.
     SelectExistingInstall(PathBuf),
     /// Use the FEX at the path, or find it automatically (`None`); ARM64.
     SaveFex(Option<PathBuf>),
@@ -6171,7 +6149,7 @@ impl LauncherView {
         }));
     }
 
-    /// Pick a Diablo II 1.14b or 1.14d folder the user already has.
+    /// Pick a Diablo II folder the user already has, of any version.
     fn choose_existing_install(&mut self, cx: &mut Context<Self>) {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -8355,8 +8333,8 @@ mod tests {
             InstallerMediaView::NotSelected,
             InstallerMediaView::Invalid("installer-media-invalid"),
             InstallerMediaView::Existing(ExistingInstallView {
-                path: PathBuf::from("/games/old"),
-                problem: Some(ExistingProblemView::UnsupportedVersion(Some("1.13"))),
+                path: PathBuf::from("/games/classic"),
+                problem: Some(ExistingProblemView::NoExpansion),
                 copy_bytes: 0,
                 in_place_possible: false,
                 project_diablo: false,
@@ -9535,16 +9513,6 @@ mod tests {
     #[test]
     fn existing_install_problems_are_named_in_player_terms() {
         for (problem, words) in [
-            (
-                ExistingProblemView::UnsupportedVersion(Some("1.13")),
-                "This folder has Diablo II 1.13 — install Diablo II and Lord of Destruction with Blizzard's current installers first",
-            ),
-            (
-                ExistingProblemView::UnsupportedVersion(None),
-                "1.14b or 1.14d",
-            ),
-            (ExistingProblemView::ModifiedGame, "Game.exe"),
-            (ExistingProblemView::ArchiveMismatch, "Patch_D2.mpq"),
             (
                 ExistingProblemView::NoExpansion,
                 "Lord of Destruction isn't installed here",

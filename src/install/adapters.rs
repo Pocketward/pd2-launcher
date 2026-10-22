@@ -4072,34 +4072,9 @@ fn x11_glx_set(user_reg: &str) -> bool {
     false
 }
 
-/// `reg add` arguments for the location values Blizzard's 1.14 installer
-/// writes: `InstallPath` and `GamePath` (`Diablo II.exe`) in the current
-/// user's hive, which the
-/// Auditor checks and the game reads, and the same two in the 32-bit
-/// machine hive. It writes no save path (the game keeps characters in
-/// `<InstallPath>\Save`) and no CD-key value, so none is written here.
-fn game_registry_arguments(install_path: &str) -> Vec<Vec<OsString>> {
-    let game_path = format!(r"{install_path}\Diablo II.exe");
-    let user = r"HKCU\Software\Blizzard Entertainment\Diablo II";
-    let machine = r"HKLM\Software\Wow6432Node\Blizzard Entertainment\Diablo II";
-    [
-        (user, "InstallPath", install_path),
-        (user, "GamePath", game_path.as_str()),
-        (machine, "InstallPath", install_path),
-        (machine, "GamePath", game_path.as_str()),
-    ]
-    .into_iter()
-    .map(|(key, name, data)| {
-        ["add", key, "/v", name, "/t", "REG_SZ", "/d", data, "/f"]
-            .into_iter()
-            .map(OsString::from)
-            .collect()
-    })
-    .collect()
-}
-
-/// The `InstallPath` of a folder used in place (`in_place_drive`): on the
-/// Android host (`android`) the `G:` drive is linked to its parent first.
+/// The Windows path of a folder used in place (`in_place_drive`), for the
+/// import record: on the Android host (`android`) the `G:` drive is linked
+/// to its parent first, so the game starts from there.
 fn in_place_install_path(
     paths: &ManagedPaths,
     folder: &Path,
@@ -4726,10 +4701,9 @@ impl InstallDriver for ProductionInstallDriver {
         paths: &ManagedPaths,
         existing: &crate::game_folder::ExistingInstall,
         mode: crate::game_folder::ImportMode,
-        mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure> {
-        use crate::game_folder::{ImportMode, ImportReceipt};
+        use crate::game_folder::ImportMode;
         let source = existing
             .folder()
             .open()
@@ -4767,23 +4741,8 @@ impl InstallDriver for ProductionInstallDriver {
             }
         };
         reject_artifact_cancelled(control)?;
-        for arguments in game_registry_arguments(&install_path) {
-            self.run_wine(WineInvocation {
-                paths,
-                runtime: self.installed_runtime(paths),
-                working_directory: paths.root(),
-                program: WineProgram::Builtin(OsString::from("reg")),
-                verified_argument: None,
-                arguments,
-                profile: WineProfile::Install,
-                timeout: RUNTIME_TIMEOUT,
-                mutation_lease,
-                control,
-                ui_helper: None,
-                stall: None,
-                accepted_exit_codes: &[],
-            })?;
-        }
+        // No registry value is written: the game writes `InstallPath` when
+        // the value is missing, and the files prove the game.
         let prefix = paths
             .directory()
             .open_directory(Path::new("prefix"))
@@ -4792,7 +4751,8 @@ impl InstallDriver for ProductionInstallDriver {
             crate::game_folder::write_pointer(&prefix, existing.folder())
                 .map_err(|_| AdapterFailure::here())?;
         }
-        crate::game_folder::write_import_receipt(&prefix, &ImportReceipt::new(mode, install_path))
+        // Last, the record that the game was imported, for the Android app.
+        crate::game_folder::write_import_record(&prefix, mode, &install_path)
             .map_err(|_| AdapterFailure::here())
     }
 
@@ -7087,50 +7047,6 @@ mod tests {
     }
 
     #[test]
-    fn an_imported_game_gets_the_registry_values_blizzards_installer_writes() {
-        let written = game_registry_arguments(r"Z:\games\Diablo II")
-            .into_iter()
-            .map(|arguments| {
-                arguments
-                    .into_iter()
-                    .map(|argument| argument.into_string().unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let user = r"HKCU\Software\Blizzard Entertainment\Diablo II";
-        let machine = r"HKLM\Software\Wow6432Node\Blizzard Entertainment\Diablo II";
-        let values = written
-            .iter()
-            .map(|arguments| {
-                assert_eq!(arguments[0], "add");
-                assert_eq!(arguments[2], "/v");
-                assert_eq!(&arguments[4..6], ["/t", "REG_SZ"]);
-                assert_eq!(arguments[6], "/d");
-                assert_eq!(arguments[8], "/f");
-                (
-                    arguments[1].as_str(),
-                    arguments[3].as_str(),
-                    arguments[7].as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            [
-                (user, "InstallPath", r"Z:\games\Diablo II"),
-                (user, "GamePath", r"Z:\games\Diablo II\Diablo II.exe"),
-                (machine, "InstallPath", r"Z:\games\Diablo II"),
-                (machine, "GamePath", r"Z:\games\Diablo II\Diablo II.exe"),
-            ]
-        );
-        // Nothing about keys or saves: the installer writes neither.
-        assert!(written.iter().all(|arguments| {
-            let name = arguments[3].to_lowercase();
-            !name.contains("key") && !name.contains("save")
-        }));
-    }
-
-    #[test]
     fn a_successful_acquisition_leaves_no_empty_partial_slot() {
         let cache = tempfile::tempdir().unwrap();
         let bytes = b"verified fixture";
@@ -8754,14 +8670,6 @@ mod tests {
         assert_eq!(
             fs::read_link(fixture.path().join("prefix/dosdevices/g:")).unwrap(),
             copy.parent().unwrap()
-        );
-        // The game's registry values name the folder there.
-        assert!(
-            game_registry_arguments(r"G:\Diablo II")
-                .iter()
-                .any(|arguments| arguments
-                    .iter()
-                    .any(|argument| argument == r"G:\Diablo II\Diablo II.exe"))
         );
 
         // The desktop keeps the host root's drive and links nothing.

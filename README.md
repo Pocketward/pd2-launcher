@@ -6,7 +6,7 @@ A Linux-native installer, updater, and launcher for [Project Diablo 2](https://w
 
 ## Install
 
-You need your Diablo II and Lord of Destruction CD keys (two different keys), an internet connection, and about 8 GB of free space. The launcher downloads everything else, including Blizzard's official installers (about 2.2 GB). If you already have Diablo II and Lord of Destruction 1.14b or 1.14d installed, you can use that folder instead and need no CD keys.
+You need your Diablo II and Lord of Destruction CD keys (two different keys), an internet connection, and about 8 GB of free space. The launcher downloads everything else, including Blizzard's official installers (about 2.2 GB). If you already have Diablo II and Lord of Destruction installed, of any version, you can use that folder as it is instead and need no CD keys.
 
 Download the executable `pd2-launcher-<version>-<arch>` from the [releases page](https://github.com/Pocketward/pd2-launcher/releases) (`x86_64` for PCs, `aarch64` for ARM computers). It is one file with nothing to install: make it executable (`chmod +x pd2-launcher-*`) and run it.
 

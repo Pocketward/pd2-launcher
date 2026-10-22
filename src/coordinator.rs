@@ -162,7 +162,7 @@ pub(crate) trait CoordinatorBackend: Send + Sync + 'static {
     ) -> Result<Vec<DownloadSourceView>, BackendFailure> {
         Err(BackendFailure::new("download-sources-unavailable"))
     }
-    /// Choose a Diablo II 1.14b or 1.14d folder the user already has. A
+    /// Choose a Diablo II folder the user already has, of any version. A
     /// folder that can't be used is returned with the reason.
     fn select_existing_install(
         &self,
@@ -2501,9 +2501,9 @@ mod tests {
             self.notify(state);
             Ok(InstallerMediaView::Existing(
                 crate::presentation::ExistingInstallView {
-                    problem: path.ends_with("old").then_some(
-                        crate::presentation::ExistingProblemView::UnsupportedVersion(Some("1.13")),
-                    ),
+                    problem: path
+                        .ends_with("classic")
+                        .then_some(crate::presentation::ExistingProblemView::NoExpansion),
                     path,
                     copy_bytes: 1_900_000_000,
                     in_place_possible: true,
@@ -4942,15 +4942,17 @@ mod tests {
         ));
         let mut harness = Harness::start(backend.clone());
         harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
-        // A folder that isn't 1.14b or 1.14d is shown with its reason and
+        // A folder without Lord of Destruction is shown with its reason and
         // blocks.
         harness
             .intents
-            .send(Intent::SelectExistingInstall(PathBuf::from("/games/old")))
+            .send(Intent::SelectExistingInstall(PathBuf::from(
+                "/games/classic",
+            )))
             .unwrap();
-        let old = harness.wait_for(|snapshot| snapshot.installer_media().existing().is_some());
-        assert!(!old.installer_media().is_ready());
-        assert!(!old.downloads_ready());
+        let classic = harness.wait_for(|snapshot| snapshot.installer_media().existing().is_some());
+        assert!(!classic.installer_media().is_ready());
+        assert!(!classic.downloads_ready());
         harness
             .intents
             .send(Intent::ImportExistingInstall(ImportModeView::Copy))

@@ -862,11 +862,7 @@ fn steps(inputs: &ReportInputs, activity: &[ActivityEntry]) -> Vec<(String, Stri
         report.map(InstallationReport::installation_status)
     {
         format!("Interrupted ({stage:?} stage; Start over continues)")
-    } else if satisfied(&[
-        AuditCheck::BaseGame,
-        AuditCheck::Expansion,
-        AuditCheck::GameVersion,
-    ]) {
+    } else if satisfied(&[AuditCheck::BaseGame, AuditCheck::Expansion]) {
         "Done".to_owned()
     } else {
         job_state(&[JobKind::InstallBaseGame, JobKind::Install])
@@ -1029,7 +1025,6 @@ fn audit_json(report: &InstallationReport) -> Value {
         AuditCheck::Prefix,
         AuditCheck::BaseGame,
         AuditCheck::Expansion,
-        AuditCheck::GameVersion,
         AuditCheck::Client,
         AuditCheck::Transaction,
     ]

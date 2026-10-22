@@ -210,7 +210,7 @@ pub(crate) enum Command {
         mode: ImportMode,
     },
     InstallProjectDiablo,
-    /// A Diablo II 1.14b or 1.14d folder the player already has (an
+    /// A Diablo II folder the player already has, of any version (an
     /// absolute path).
     SelectExistingInstall {
         path: String,
@@ -723,11 +723,15 @@ pub(crate) enum ExistingProblem {
     NotFound,
     Unreadable,
     NotDiablo,
-    /// Not 1.14b or 1.14d; `version` when recognized, such as `1.13`.
+    /// Not sent: a folder of any Diablo II version is used as it is. This
+    /// code and the next two stay so that the protocol, and an app that
+    /// decodes them, are unchanged.
     UnsupportedVersion {
         version: Option<String>,
     },
+    /// Not sent.
     ModifiedGame,
+    /// Not sent.
     ArchiveMismatch,
     NoExpansion,
     MissingFile {
@@ -1171,11 +1175,6 @@ fn existing_problem(problem: ExistingProblemView) -> ExistingProblem {
         ExistingProblemView::NotFound => ExistingProblem::NotFound,
         ExistingProblemView::Unreadable => ExistingProblem::Unreadable,
         ExistingProblemView::NotDiablo => ExistingProblem::NotDiablo,
-        ExistingProblemView::UnsupportedVersion(version) => ExistingProblem::UnsupportedVersion {
-            version: version.map(str::to_owned),
-        },
-        ExistingProblemView::ModifiedGame => ExistingProblem::ModifiedGame,
-        ExistingProblemView::ArchiveMismatch => ExistingProblem::ArchiveMismatch,
         ExistingProblemView::NoExpansion => ExistingProblem::NoExpansion,
         ExistingProblemView::MissingFile(file) => ExistingProblem::MissingFile {
             file: file.to_owned(),
@@ -2158,7 +2157,7 @@ mod tests {
             .with_authorization(AuthorizationView::Authorized)
             .with_installer_media(InstallerMediaView::Existing(ExistingInstallView {
                 path: PathBuf::from("/storage/emulated/0/Diablo II"),
-                problem: Some(ExistingProblemView::UnsupportedVersion(Some("1.13"))),
+                problem: Some(ExistingProblemView::NoExpansion),
                 copy_bytes: 2_000_000_000,
                 in_place_possible: false,
                 project_diablo: false,
@@ -2225,6 +2224,23 @@ mod tests {
         }
     }
 
+    /// The full snapshot with the `unsupported_version` problem, which the
+    /// engine no longer sends but the protocol keeps: its
+    /// fixture stays as the Android app's decoder reads it.
+    fn full_snapshot_message() -> EngineMessage {
+        let mut snapshot = Snapshot::project(&full_ui_snapshot());
+        let Installer::Existing { problem, .. } = &mut snapshot.installer else {
+            unreachable!("the full snapshot has an existing installation");
+        };
+        *problem = Some(ExistingProblem::UnsupportedVersion {
+            version: Some("1.13".to_owned()),
+        });
+        EngineMessage::Snapshot {
+            seq: 1,
+            snapshot: Box::new(snapshot),
+        }
+    }
+
     fn engine_messages() -> Vec<(&'static str, EngineMessage)> {
         vec![
             (
@@ -2241,7 +2257,7 @@ mod tests {
                 },
             ),
             ("snapshot-initial", snapshot_message(&UiSnapshot::initial())),
-            ("snapshot-full", snapshot_message(&full_ui_snapshot())),
+            ("snapshot-full", full_snapshot_message()),
             (
                 "command-error",
                 EngineMessage::CommandError {
