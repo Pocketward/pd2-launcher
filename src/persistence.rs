@@ -329,6 +329,13 @@ pub(crate) struct LauncherSettings {
     /// turned off, and written only when off.
     #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
     app_menu_entry: bool,
+    /// Look for Project Diablo 2's updates (at the start, after a job and
+    /// when asked) and hold its client to the accepted manifest's contents.
+    /// On unless turned off, and written only when off. Off, no update check
+    /// runs and the client is accepted as installed: mods and other versions
+    /// play as they are.
+    #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
+    update_checks: bool,
     /// Settings this build does not use (a Wine on this computer, the host
     /// environment), still accepted in files that carry them, and dropped
     /// when the settings are next saved.
@@ -444,6 +451,7 @@ impl Default for LauncherSettings {
             download_sources: SavedSources::default(),
             official_launcher_software_rendering: true,
             app_menu_entry: true,
+            update_checks: true,
             parked_existing_wine: None,
             parked_environment: None,
             fex_source: None,
@@ -501,6 +509,15 @@ impl LauncherSettings {
 
     pub(crate) fn with_app_menu_entry(mut self, enabled: bool) -> Self {
         self.app_menu_entry = enabled;
+        self
+    }
+
+    pub(crate) fn update_checks(&self) -> bool {
+        self.update_checks
+    }
+
+    pub(crate) fn with_update_checks(mut self, enabled: bool) -> Self {
+        self.update_checks = enabled;
         self
     }
 
@@ -1056,6 +1073,41 @@ mod tests {
                 .contains(r#""app_menu_entry":false"#)
         );
         assert!(!store.load().expect("load").app_menu_entry());
+    }
+
+    #[test]
+    fn update_checks_are_on_unless_saved_off() {
+        let fixture = TempDir::new().expect("fixture");
+        let path = fixture.path().join("config/settings.json");
+        let store = SettingsStore::new(&path);
+        // A file written before the setting existed reads as on.
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{"schema":1,"renderer":"glide","skip_to_bnet":true,"sound_in_background":false,"network_concurrency":2}"#,
+        )
+        .unwrap();
+        assert!(store.load().expect("load").update_checks());
+        assert!(LauncherSettings::default().update_checks());
+
+        // On is not written, so older Launchers still read the file; off is
+        // written and survives a restart.
+        store.save(&LauncherSettings::default()).expect("save");
+        assert!(!fs::read_to_string(&path).unwrap().contains("update_checks"));
+        store
+            .save(&LauncherSettings::default().with_update_checks(false))
+            .expect("save");
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""update_checks":false"#)
+        );
+        assert!(
+            !SettingsStore::new(&path)
+                .load()
+                .expect("load")
+                .update_checks()
+        );
     }
 
     #[cfg(unix)]

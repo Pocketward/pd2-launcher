@@ -215,9 +215,15 @@ pub(crate) trait CoordinatorBackend: Send + Sync + 'static {
     /// update it made. Cancellation closes it.
     /// `confirmed`: the user agreed to run a binary that matches neither
     /// the manifest nor the copy recorded after its last session.
+    /// `strict_memory_order`: a game that it starts gets Box64's strict x86
+    /// memory order (the Android app's Strict CPU emulation);
+    /// `detailed_logging`: its Wine, and the game it starts, log in detail
+    /// (the Android app's Detailed logging). Neither from the desktop.
     fn open_official_launcher(
         &self,
         _confirmed: bool,
+        _strict_memory_order: bool,
+        _detailed_logging: bool,
         _cancellation: &OperationControl,
     ) -> Result<(), BackendFailure> {
         Err(BackendFailure::new("official-launcher-unavailable"))
@@ -249,12 +255,18 @@ pub(crate) trait CoordinatorBackend: Send + Sync + 'static {
         Err(BackendFailure::new("location-previous-unavailable"))
     }
     /// `driver` and `profile` are the Android app's graphics driver and D2GL
-    /// graphics profile for this launch (no profile from the desktop). A
-    /// returned notice is shown for this launch only.
+    /// graphics profile for this launch (no profile from the desktop);
+    /// `strict_memory_order` whether the game gets Box64's strict x86 memory
+    /// order (the Android app's Strict CPU emulation), `detailed_logging`
+    /// whether its Wine logs in detail (the Android app's Detailed logging);
+    /// neither from the desktop. A returned notice is shown for this launch
+    /// only.
     fn launch_game(
         &self,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
+        strict_memory_order: bool,
+        detailed_logging: bool,
     ) -> Result<Option<GameNoticeView>, BackendFailure>;
     fn poll_game(&self) -> BackendGameState;
     fn request_game_stop(&self) -> Result<(), BackendFailure>;
@@ -417,7 +429,7 @@ fn service_loop<B: CoordinatorBackend>(
 ) {
     let (completion_sender, completion_receiver) = channel();
     let mut coordinator = Coordinator::new(endpoint.event_sender);
-    coordinator.startup(backend.clone(), completion_sender.clone());
+    coordinator.startup(backend.clone(), completion_sender.clone(), false);
     let mut shutdown_requested = false;
 
     loop {
@@ -467,6 +479,12 @@ struct Coordinator {
     relocation_target: Option<(std::path::PathBuf, bool)>,
     /// The next official-launcher job was confirmed for an unverified binary.
     official_launcher_confirmed: bool,
+    /// A game that the next official-launcher job starts gets Box64's strict
+    /// x86 memory order (the Android app's Strict CPU emulation).
+    official_launcher_strict_memory_order: bool,
+    /// The next official-launcher job's Wine logs in detail (the Android
+    /// app's Detailed logging).
+    official_launcher_detailed_logging: bool,
     /// How the next Install Diablo II job imports the existing installation.
     import_mode: Option<ImportModeView>,
     /// Download speed of the running job's byte progress.
@@ -528,13 +546,24 @@ impl Coordinator {
             pending_return: None,
             relocation_target: None,
             official_launcher_confirmed: false,
+            official_launcher_strict_memory_order: false,
+            official_launcher_detailed_logging: false,
             import_mode: None,
             byte_rate: ByteRate::default(),
             android_host: crate::android_host(),
         }
     }
 
-    fn startup<B: CoordinatorBackend>(&mut self, backend: Arc<B>, completions: Sender<Completion>) {
+    /// The host audit, then the update check. `asked`: Check again. On the
+    /// Android host the update check runs only then, and only for a game
+    /// that is installed: the app asks when the player presses Play, the
+    /// only time Project Diablo 2's update is checked there.
+    fn startup<B: CoordinatorBackend>(
+        &mut self,
+        backend: Arc<B>,
+        completions: Sender<Completion>,
+        asked: bool,
+    ) {
         // The Android app keeps its own record.
         if !self.android_host {
             self.change_setup_record(backend.setup_record());
@@ -576,7 +605,11 @@ impl Coordinator {
             Ok(audit) => {
                 self.apply_audit(audit);
                 self.change_operation(None);
-                self.start_update_check(backend, completions);
+                if !self.android_host
+                    || (asked && self.snapshot.installation() == InstallationStatus::Ready)
+                {
+                    self.start_update_check(backend, completions);
+                }
             }
             Err(error) => self.fail_closed(error),
         }
@@ -589,7 +622,13 @@ impl Coordinator {
         completions: Sender<Completion>,
     ) {
         let fresh_only = matches!(intent, Intent::UseFreshInstallLocation(_));
-        let official_launcher_confirmed = matches!(intent, Intent::OpenOfficialLauncherConfirmed);
+        let official_launcher_confirmed =
+            matches!(intent, Intent::OpenOfficialLauncherConfirmed(..));
+        let (official_launcher_strict_memory_order, official_launcher_detailed_logging) =
+            match intent {
+                Intent::OpenOfficialLauncherConfirmed(strict, detailed) => (strict, detailed),
+                _ => (false, false),
+            };
         match intent {
             Intent::SelectInstallerMedia(path) => {
                 if self.media_guard() {
@@ -627,7 +666,7 @@ impl Coordinator {
                     self.change_fex_setting(Some(setting));
                     // The other FEX is checked at once, as at startup.
                     if self.active_mutation.is_none() && self.snapshot.game() == GameView::Idle {
-                        self.startup(backend, completions);
+                        self.startup(backend, completions, false);
                     }
                 }
                 Err(error) => self.publish_guard_failure(error.code()),
@@ -707,7 +746,7 @@ impl Coordinator {
                 // transient service failure may have passed: check again
                 // exactly as at startup, without a restart.
                 if self.active_mutation.is_none() && self.snapshot.game() == GameView::Idle {
-                    self.startup(backend, completions);
+                    self.startup(backend, completions, true);
                 } else {
                     self.publish_guard_failure("check-again-not-permitted");
                 }
@@ -781,15 +820,23 @@ impl Coordinator {
                     "Applying the Available update",
                 );
             }
-            Intent::LaunchGame(driver, profile) => {
-                self.launch_game(backend.as_ref(), driver, profile);
+            Intent::LaunchGame(driver, profile, strict_memory_order, detailed_logging) => {
+                self.launch_game(
+                    backend.as_ref(),
+                    driver,
+                    profile,
+                    strict_memory_order,
+                    detailed_logging,
+                );
             }
-            Intent::OpenOfficialLauncher | Intent::OpenOfficialLauncherConfirmed => {
+            Intent::OpenOfficialLauncher | Intent::OpenOfficialLauncherConfirmed(..) => {
                 if !self.official_launcher_guard() {
                     self.publish_guard_failure("official-launcher-not-permitted");
                     return;
                 }
                 self.official_launcher_confirmed = official_launcher_confirmed;
+                self.official_launcher_strict_memory_order = official_launcher_strict_memory_order;
+                self.official_launcher_detailed_logging = official_launcher_detailed_logging;
                 self.start_mutation(
                     backend,
                     completions,
@@ -800,7 +847,12 @@ impl Coordinator {
                 );
             }
             Intent::ChangeSettings(change) => match backend.update_settings(change) {
-                Ok(settings) => self.change_settings(settings),
+                Ok(settings) => {
+                    self.change_settings(settings);
+                    if let SettingsChange::UpdateChecks(_) = change {
+                        self.update_checks_changed(backend, completions);
+                    }
+                }
                 Err(error) => {
                     self.change_settings(self.snapshot.settings().failed(error.code()));
                 }
@@ -839,7 +891,7 @@ impl Coordinator {
             }
             Intent::RetryLocation => {
                 if self.active_mutation.is_none() && self.snapshot.location_unavailable() {
-                    self.startup(backend, completions);
+                    self.startup(backend, completions, false);
                 } else {
                     self.publish_guard_failure("location-retry-not-permitted");
                 }
@@ -992,6 +1044,13 @@ impl Coordinator {
             }
             Completion::UpdateChecked(result) => {
                 self.update_check_active = false;
+                // A check that was running when the checks were turned off
+                // says nothing.
+                if !self.snapshot.settings().update_checks() {
+                    self.update_check_pending = false;
+                    self.change_update(UpdateStatus::Unknown);
+                    return false;
+                }
                 self.change_update(result.unwrap_or(UpdateStatus::CheckFailed));
                 std::mem::take(&mut self.update_check_pending)
             }
@@ -1119,17 +1178,33 @@ impl Coordinator {
                 }
                 // A stop of the official launcher can accept the update it
                 // made, so the update check runs again, as after it closes.
-                (operation_succeeded || (kind == MutationKind::OfficialLauncher && stopped))
-                    && self.snapshot.installation() != InstallationStatus::RepairRequired
+                let check = (operation_succeeded
+                    || (kind == MutationKind::OfficialLauncher && stopped))
+                    && self.snapshot.installation() != InstallationStatus::RepairRequired;
+                // On the Android host no check follows a job: the client may
+                // have changed, so the update is unknown until Play asks.
+                if self.android_host {
+                    if check {
+                        self.change_update(UpdateStatus::Unknown);
+                    }
+                    return false;
+                }
+                check
             }
         }
     }
 
+    /// The read-only update check, unless the player turned the checks off:
+    /// then none runs and the update stays unknown.
     fn start_update_check<B: CoordinatorBackend>(
         &mut self,
         backend: Arc<B>,
         completions: Sender<Completion>,
     ) {
+        if !self.snapshot.settings().update_checks() {
+            self.change_update(UpdateStatus::Unknown);
+            return;
+        }
         if self.snapshot.host() != HostView::Supported {
             return;
         }
@@ -1149,6 +1224,36 @@ impl Coordinator {
         }
     }
 
+    /// The update checks were turned on or off. Off, the update is unknown
+    /// at once. The client is held to another rule, so an idle Launcher
+    /// audits again at once (as after a navigation to Operations), then
+    /// checks for an update when they are on (on the Android host only Play
+    /// checks). While the game or a job runs, the next audit applies the
+    /// rule; turned on then, the next check is a job's end, Check again or
+    /// the next start.
+    fn update_checks_changed<B: CoordinatorBackend>(
+        &mut self,
+        backend: Arc<B>,
+        completions: Sender<Completion>,
+    ) {
+        if !self.snapshot.settings().update_checks() {
+            self.change_update(UpdateStatus::Unknown);
+        }
+        let idle = self.active_mutation.is_none() && self.snapshot.game() == GameView::Idle;
+        if idle {
+            match backend.audit(ActivityEvidence::Idle) {
+                Ok(audit) => self.apply_audit(audit),
+                Err(error) => {
+                    self.fail_closed(error);
+                    return;
+                }
+            }
+        }
+        if (idle || !self.snapshot.settings().update_checks()) && !self.android_host {
+            self.start_update_check(backend, completions);
+        }
+    }
+
     fn start_mutation<B: CoordinatorBackend>(
         &mut self,
         backend: Arc<B>,
@@ -1164,6 +1269,10 @@ impl Coordinator {
         }
         let relocation_target = self.relocation_target.take();
         let official_launcher_confirmed = std::mem::take(&mut self.official_launcher_confirmed);
+        let official_launcher_strict_memory_order =
+            std::mem::take(&mut self.official_launcher_strict_memory_order);
+        let official_launcher_detailed_logging =
+            std::mem::take(&mut self.official_launcher_detailed_logging);
         let import_mode = self.import_mode.take();
         let (progress, progress_receiver) = progress_channel();
         let cancellation = OperationControl::with_progress(progress);
@@ -1190,9 +1299,12 @@ impl Coordinator {
                 MutationKind::InstallProjectDiablo => backend.install_project_diablo(&cancellation),
                 MutationKind::Update => backend.apply_update(&cancellation),
                 MutationKind::Repair => backend.repair(&cancellation),
-                MutationKind::OfficialLauncher => {
-                    backend.open_official_launcher(official_launcher_confirmed, &cancellation)
-                }
+                MutationKind::OfficialLauncher => backend.open_official_launcher(
+                    official_launcher_confirmed,
+                    official_launcher_strict_memory_order,
+                    official_launcher_detailed_logging,
+                    &cancellation,
+                ),
                 MutationKind::Reset => backend.reset_installation(&cancellation),
                 MutationKind::RemovePrevious => backend.remove_previous_installation(&cancellation),
                 MutationKind::Relocate => match relocation_target {
@@ -1249,6 +1361,8 @@ impl Coordinator {
         backend: &dyn CoordinatorBackend,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
+        strict_memory_order: bool,
+        detailed_logging: bool,
     ) {
         if !self.play_guard() {
             self.publish_guard_failure("play-not-permitted");
@@ -1267,7 +1381,7 @@ impl Coordinator {
             self.play_failed("play-preflight-rejected");
             return;
         }
-        let launched = backend.launch_game(driver, profile);
+        let launched = backend.launch_game(driver, profile, strict_memory_order, detailed_logging);
         // The keep before it may have put characters aside, even when the
         // game then did not start.
         self.note_saves_put_aside(backend.take_saves_put_aside());
@@ -2256,6 +2370,8 @@ mod tests {
         launch_calls: usize,
         launch_driver: GraphicsDriver,
         launch_profile: Option<GraphicsProfile>,
+        launch_strict_memory_order: bool,
+        launch_detailed_logging: bool,
         launch_notice: Option<GameNoticeView>,
         cancellation_observed: bool,
         settings: LaunchSettingsView,
@@ -2265,6 +2381,8 @@ mod tests {
         install_failure: Option<BackendFailure>,
         official_launcher_calls: usize,
         official_launcher_confirmed: bool,
+        official_launcher_strict_memory_order: bool,
+        official_launcher_detailed_logging: bool,
         official_launcher_failure: Option<BackendFailure>,
         /// Locations reported by successive opens; the last one repeats.
         locations: VecDeque<Option<LocationView>>,
@@ -2314,6 +2432,8 @@ mod tests {
                     launch_calls: 0,
                     launch_driver: GraphicsDriver::Standard,
                     launch_profile: None,
+                    launch_strict_memory_order: false,
+                    launch_detailed_logging: false,
                     launch_notice: None,
                     cancellation_observed: false,
                     settings: LaunchSettingsView::new(RendererPreferenceView::Glide, true, false),
@@ -2323,6 +2443,8 @@ mod tests {
                     install_failure: None,
                     official_launcher_calls: 0,
                     official_launcher_confirmed: false,
+                    official_launcher_strict_memory_order: false,
+                    official_launcher_detailed_logging: false,
                     official_launcher_failure: None,
                     locations: VecDeque::new(),
                     location: None,
@@ -2607,11 +2729,15 @@ mod tests {
         fn open_official_launcher(
             &self,
             confirmed: bool,
+            strict_memory_order: bool,
+            detailed_logging: bool,
             cancellation: &CancellationToken,
         ) -> Result<(), BackendFailure> {
             {
                 let mut state = self.state.lock().expect("state");
                 state.official_launcher_confirmed = confirmed;
+                state.official_launcher_strict_memory_order = strict_memory_order;
+                state.official_launcher_detailed_logging = detailed_logging;
                 state.calls.push("official-launcher");
                 state.official_launcher_calls += 1;
                 self.notify(state);
@@ -2632,6 +2758,8 @@ mod tests {
             &self,
             driver: GraphicsDriver,
             profile: Option<GraphicsProfile>,
+            strict_memory_order: bool,
+            detailed_logging: bool,
         ) -> Result<Option<GameNoticeView>, BackendFailure> {
             let mut state = self.state.lock().expect("state");
             state.calls.push("launch-game");
@@ -2642,6 +2770,8 @@ mod tests {
             }
             state.launch_driver = driver;
             state.launch_profile = profile;
+            state.launch_strict_memory_order = strict_memory_order;
+            state.launch_detailed_logging = detailed_logging;
             state.game = BackendGameState::Running;
             let notice = state.launch_notice;
             self.notify(state);
@@ -2709,6 +2839,7 @@ mod tests {
                     current.with_direct_draw_renderer(renderer)
                 }
                 SettingsChange::AppMenuEntry(enabled) => current.with_app_menu_entry(enabled),
+                SettingsChange::UpdateChecks(enabled) => current.with_update_checks(enabled),
             };
             state.settings_updates += 1;
             let settings = state.settings;
@@ -3454,7 +3585,12 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::UpToDate);
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .unwrap();
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness.intents.send(Intent::StartOver).unwrap();
@@ -3517,7 +3653,7 @@ mod tests {
             "nothing is audited there"
         );
         for intent in [
-            Intent::LaunchGame(GraphicsDriver::Standard, None),
+            Intent::LaunchGame(GraphicsDriver::Standard, None, false, false),
             Intent::ContinueInstallation,
             Intent::StartOver,
         ] {
@@ -3597,7 +3733,12 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::UpToDate);
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .unwrap();
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -3699,10 +3840,17 @@ mod tests {
         assert!(crate::presentation::official_launcher_available(&snapshot));
         harness
             .intents
-            .send(Intent::OpenOfficialLauncherConfirmed)
+            .send(Intent::OpenOfficialLauncherConfirmed(false, false))
             .unwrap();
         backend.wait_for(|state| state.official_launcher_calls == 1);
         assert!(backend.state.lock().unwrap().official_launcher_confirmed);
+        assert!(
+            !backend
+                .state
+                .lock()
+                .unwrap()
+                .official_launcher_strict_memory_order
+        );
         backend.official_launcher_gate.release();
         harness.wait_for(|snapshot| {
             snapshot.operation().is_some_and(|operation| {
@@ -3713,6 +3861,51 @@ mod tests {
         harness.intents.send(Intent::OpenOfficialLauncher).unwrap();
         backend.wait_for(|state| state.official_launcher_calls == 2);
         assert!(!backend.state.lock().unwrap().official_launcher_confirmed);
+    }
+
+    #[test]
+    fn a_game_that_the_official_launcher_starts_gets_strict_memory_order_only_when_asked() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::UpToDate,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| {
+            crate::presentation::official_launcher_available(snapshot)
+                && snapshot.update() == UpdateStatus::UpToDate
+        });
+        harness
+            .intents
+            .send(Intent::OpenOfficialLauncherConfirmed(true, true))
+            .unwrap();
+        backend.wait_for(|state| state.official_launcher_calls == 1);
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .official_launcher_strict_memory_order
+        );
+        backend.official_launcher_gate.release();
+        harness.wait_for(|snapshot| {
+            snapshot.operation().is_some_and(|operation| {
+                operation.phase() == OperationPhase::OfficialLauncher
+                    && operation.status() == OperationStatusView::Succeeded
+            })
+        });
+        assert!(
+            backend
+                .state
+                .lock()
+                .unwrap()
+                .official_launcher_detailed_logging
+        );
+        // The next job asks again: nothing is kept from the last one.
+        harness.intents.send(Intent::OpenOfficialLauncher).unwrap();
+        backend.wait_for(|state| state.official_launcher_calls == 2);
+        let state = backend.state.lock().unwrap();
+        assert!(!state.official_launcher_strict_memory_order);
+        assert!(!state.official_launcher_detailed_logging);
     }
 
     #[test]
@@ -4062,7 +4255,12 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.installation(), InstallationStatus::Ready);
@@ -4119,6 +4317,8 @@ mod tests {
             .send(Intent::LaunchGame(
                 GraphicsDriver::Compatibility,
                 Some(GraphicsProfile::Performance),
+                true,
+                true,
             ))
             .expect("play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
@@ -4128,7 +4328,244 @@ mod tests {
             state.launch_calls == 1
                 && state.launch_driver == GraphicsDriver::Compatibility
                 && state.launch_profile == Some(GraphicsProfile::Performance)
+                && state.launch_strict_memory_order
+                && state.launch_detailed_logging
         });
+    }
+
+    #[test]
+    fn with_update_checks_off_no_check_runs_and_play_starts() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        backend.state.lock().expect("state").settings =
+            LaunchSettingsView::new(RendererPreferenceView::Glide, true, false)
+                .with_update_checks(false);
+        let mut harness = Harness::start(backend.clone());
+        let ready = harness.wait_for(|snapshot| {
+            snapshot.installation() == InstallationStatus::Ready
+                && snapshot.launch_preflight_passed()
+                && !snapshot.settings().update_checks()
+        });
+        assert_eq!(ready.update(), UpdateStatus::Unknown);
+
+        // Check again runs the start's audit again, without the check.
+        harness
+            .intents
+            .send(Intent::CheckAgain)
+            .expect("check again");
+        backend.wait_for(|state| state.calls.iter().filter(|call| **call == "audit").count() >= 2);
+        harness
+            .intents
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
+            .expect("play intent");
+        let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
+        assert_eq!(running.update(), UpdateStatus::Unknown);
+        assert!(
+            !backend.calls().contains(&"check-update"),
+            "{:?}",
+            backend.calls()
+        );
+    }
+
+    #[test]
+    fn turning_update_checks_on_audits_and_checks_and_off_forgets_the_update() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::Available);
+
+        harness
+            .intents
+            .send(Intent::ChangeSettings(SettingsChange::UpdateChecks(false)))
+            .expect("settings change");
+        harness.wait_for(|snapshot| {
+            !snapshot.settings().update_checks() && snapshot.update() == UpdateStatus::Unknown
+        });
+        let audits = |calls: &[&str]| calls.iter().filter(|call| **call == "audit").count();
+        // The client is held to the other rule at once.
+        assert_eq!(audits(&backend.calls()), 2);
+        let checks = |calls: &[&str]| calls.iter().filter(|call| **call == "check-update").count();
+        assert_eq!(checks(&backend.calls()), 1);
+
+        harness
+            .intents
+            .send(Intent::ChangeSettings(SettingsChange::UpdateChecks(true)))
+            .expect("settings change");
+        harness.wait_for(|snapshot| {
+            snapshot.settings().update_checks() && snapshot.update() == UpdateStatus::Available
+        });
+        assert_eq!(audits(&backend.calls()), 3);
+        assert_eq!(checks(&backend.calls()), 2);
+    }
+
+    #[test]
+    fn turning_update_checks_off_while_the_game_runs_forgets_the_update_without_an_audit() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.update() == UpdateStatus::Available);
+        harness
+            .intents
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
+            .expect("play intent");
+        harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
+        let audits = |calls: &[&str]| calls.iter().filter(|call| **call == "audit").count();
+        let before = audits(&backend.calls());
+
+        harness
+            .intents
+            .send(Intent::ChangeSettings(SettingsChange::UpdateChecks(false)))
+            .expect("settings change");
+        let off = harness.wait_for(|snapshot| {
+            !snapshot.settings().update_checks() && snapshot.update() == UpdateStatus::Unknown
+        });
+        assert_eq!(off.game(), GameView::Running);
+        assert_eq!(audits(&backend.calls()), before, "no audit under the game");
+    }
+
+    /// An Android coordinator, with the channel its workers report on.
+    fn android_coordinator() -> (
+        Coordinator,
+        Sender<Completion>,
+        std::sync::mpsc::Receiver<Completion>,
+    ) {
+        let (events, _receiver) = std::sync::mpsc::sync_channel(1);
+        let mut coordinator = Coordinator::new(events);
+        coordinator.android_host = true;
+        let (completions, finished) = channel();
+        (coordinator, completions, finished)
+    }
+
+    /// On the Android host Project Diablo 2's update is checked only when
+    /// the app asks (Check again, which it sends at Play), and only for an
+    /// installed game: never at the engine's start.
+    #[test]
+    fn on_android_only_check_again_checks_for_an_update() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        let (mut coordinator, completions, finished) = android_coordinator();
+        coordinator.startup(backend.clone(), completions.clone(), false);
+        assert_eq!(
+            coordinator.snapshot.installation(),
+            InstallationStatus::Ready
+        );
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Unknown);
+        assert!(!coordinator.update_check_active);
+
+        coordinator.handle_intent(Intent::CheckAgain, backend.clone(), completions);
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Checking);
+        let checked = finished.recv_timeout(WAIT).expect("the check ends");
+        assert!(!coordinator.handle_completion(checked));
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Available);
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| **call == "check-update")
+                .count(),
+            1
+        );
+
+        // Check again before the game is installed checks nothing.
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::NeedsBaseGame)],
+            UpdateStatus::Available,
+        ));
+        let (mut coordinator, completions, _finished) = android_coordinator();
+        coordinator.handle_intent(Intent::CheckAgain, backend.clone(), completions);
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Unknown);
+        assert!(!backend.calls().contains(&"check-update"));
+    }
+
+    /// On the Android host no check follows a job: the update is unknown
+    /// after it until Play asks again. A failed job leaves the update as it
+    /// was, so Update can be tried again.
+    #[test]
+    fn on_android_no_check_follows_a_job_and_the_update_is_unknown_after_it() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        let (mut coordinator, completions, finished) = android_coordinator();
+        coordinator.startup(backend.clone(), completions.clone(), false);
+        coordinator.handle_intent(Intent::CheckAgain, backend.clone(), completions.clone());
+        let checked = finished.recv_timeout(WAIT).expect("the check ends");
+        coordinator.handle_completion(checked);
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Available);
+
+        coordinator.handle_intent(Intent::ApplyUpdate, backend.clone(), completions);
+        let updated = finished.recv_timeout(WAIT).expect("the update ends");
+        assert!(matches!(updated, Completion::MutationFinished { .. }));
+        assert!(!coordinator.handle_completion(updated), "no check after it");
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Unknown);
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| **call == "check-update")
+                .count(),
+            1
+        );
+    }
+
+    /// On the Android host turning the checks on audits again but checks
+    /// nothing: Play does.
+    #[test]
+    fn on_android_turning_update_checks_on_checks_nothing() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Ready)],
+            UpdateStatus::Available,
+        ));
+        backend.state.lock().expect("state").settings =
+            LaunchSettingsView::new(RendererPreferenceView::Glide, true, false)
+                .with_update_checks(false);
+        let (mut coordinator, completions, _finished) = android_coordinator();
+        coordinator.startup(backend.clone(), completions.clone(), false);
+        assert!(!coordinator.snapshot.settings().update_checks());
+        coordinator.handle_intent(
+            Intent::ChangeSettings(SettingsChange::UpdateChecks(true)),
+            backend.clone(),
+            completions,
+        );
+        assert!(coordinator.snapshot.settings().update_checks());
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Unknown);
+        let calls = backend.calls();
+        assert_eq!(calls.iter().filter(|call| **call == "audit").count(), 2);
+        assert!(!calls.contains(&"check-update"), "{calls:?}");
+    }
+
+    /// A check that was running when the checks were turned off says
+    /// nothing, and runs no other check after it.
+    #[test]
+    fn a_check_that_ends_after_the_checks_were_turned_off_is_dropped() {
+        let (events, _receiver) = std::sync::mpsc::sync_channel(64);
+        let mut coordinator = Coordinator::new(events);
+        coordinator.update_check_active = true;
+        coordinator.update_check_pending = true;
+        coordinator.change_settings(LaunchSettingsView::default().with_update_checks(false));
+        let check_again =
+            coordinator.handle_completion(Completion::UpdateChecked(Ok(UpdateStatus::Available)));
+        assert!(!check_again);
+        assert!(!coordinator.update_check_active && !coordinator.update_check_pending);
+        assert_eq!(coordinator.snapshot.update(), UpdateStatus::Unknown);
     }
 
     #[test]
@@ -4143,7 +4580,12 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.game_notice(), Some(GameNoticeView::FirstD2glLaunch));
@@ -4160,7 +4602,12 @@ mod tests {
         backend.state.lock().expect("state").launch_notice = None;
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("second play intent");
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(running.game_notice(), None);
@@ -4396,7 +4843,7 @@ mod tests {
 
         // Nothing else may run while it is open.
         for intent in [
-            Intent::LaunchGame(GraphicsDriver::Standard, None),
+            Intent::LaunchGame(GraphicsDriver::Standard, None, false, false),
             Intent::ApplyUpdate,
             Intent::ContinueInstallation,
             Intent::OpenOfficialLauncher,
@@ -4438,7 +4885,12 @@ mod tests {
         });
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         backend.wait_for(|state| state.launch_calls == 1);
     }
@@ -4454,7 +4906,12 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -4542,7 +4999,12 @@ mod tests {
 
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         harness
@@ -4564,7 +5026,12 @@ mod tests {
         backend.wait_for(|state| state.update_calls == 1);
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .expect("play intent");
         thread::sleep(Duration::from_millis(80));
         assert_eq!(backend.state.lock().expect("state").launch_calls, 1);
@@ -4729,7 +5196,12 @@ mod tests {
         backend.state.lock().unwrap().saves_put_aside = Some(put_aside(1, 0, 0, "/b/backup-1"));
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .unwrap();
         let running = harness.wait_for(|snapshot| snapshot.game() == GameView::Running);
         assert_eq!(
@@ -5084,7 +5556,12 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.launch_preflight_passed());
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .unwrap();
         let failed = harness.wait_for(|snapshot| {
             snapshot
@@ -5118,7 +5595,12 @@ mod tests {
         harness.wait_for(|snapshot| snapshot.launch_preflight_passed());
         harness
             .intents
-            .send(Intent::LaunchGame(GraphicsDriver::Standard, None))
+            .send(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            ))
             .unwrap();
         let failed = harness.wait_for(|snapshot| {
             snapshot

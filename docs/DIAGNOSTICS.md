@@ -33,8 +33,14 @@ file's location. Attach the file when you open an issue.
 
 Every text in the report passes through `src/redact.rs` first:
 
-- CD keys, and every token shaped like one, become `<cd-key>`.
-- Your home folder becomes `~` and your user name `<user>`.
+- CD keys, and every run shaped like one (16 or 26 of the characters CD keys
+  use, in any case, solid or in groups), become `<cd-key>`. A whole UUID
+  stays, and so do the hex words of a crash report's memory dump in the
+  game's own logs (`D2*.txt`, `d2gl.log`, `ddraw.log`, `cnc-ddraw.log` and
+  `BnetLog.txt`).
+- Your home folder becomes `~` and your user name `<user>`, and so does the
+  user of a Windows profile folder (`C:\Users\<name>`) in logs from a
+  folder copied from a PC; `Public` and `Default` stay.
 - URLs lose credentials, query string and fragment; download sources are
   reduced to host names.
 - Account, character and game names in Battle.net and game logs become

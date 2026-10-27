@@ -1163,6 +1163,7 @@ pub struct AuditRequest {
     launcher_artifact: LauncherArtifactEvidence,
     custom_sources: Vec<CustomComponent>,
     xinput_bridge: bool,
+    client_as_installed: bool,
 }
 
 impl AuditRequest {
@@ -1174,6 +1175,7 @@ impl AuditRequest {
             launcher_artifact: LauncherArtifactEvidence::Unverified,
             custom_sources: Vec::new(),
             xinput_bridge: false,
+            client_as_installed: false,
         }
     }
 
@@ -1210,6 +1212,16 @@ impl AuditRequest {
     /// `xinput1_4.dll`.
     pub fn with_xinput_bridge(mut self) -> Self {
         self.xinput_bridge = true;
+        self
+    }
+
+    /// The player turned Project Diablo 2's update checks off: its client
+    /// is accepted as installed. Every file the accepted manifest names must
+    /// still be there, but what it holds is not compared, so a mod, or the
+    /// files another launcher changed, play as they are. `Game.exe` keeps
+    /// its digest: the launch runs only the accepted one.
+    pub fn with_client_as_installed(mut self) -> Self {
+        self.client_as_installed = true;
         self
     }
 }
@@ -1360,9 +1372,24 @@ impl Auditor {
                             Some(folder) => GameTree::external(folder),
                             None => GameTree::managed(root),
                         };
-                        results.push(check_base_game(&game, request.activity));
-                        results.push(check_expansion(&game, request.activity));
-                        results.push(check_client(&game, request.accepted_client.as_ref()));
+                        // An imported game on the Android host is proven by
+                        // the files its import checked (the owner's rule of
+                        // 2026-10-26); one that Blizzard's installers put
+                        // there, and the desktop's, by all of them.
+                        let imported = crate::android_host()
+                            && root
+                                .open_file(
+                                    &Path::new("prefix")
+                                        .join(crate::game_folder::IMPORT_RECORD_NAME),
+                                )
+                                .is_ok();
+                        results.push(check_base_game(&game, request.activity, imported));
+                        results.push(check_expansion(&game, request.activity, imported));
+                        results.push(check_client(
+                            &game,
+                            request.accepted_client.as_ref(),
+                            request.client_as_installed,
+                        ));
                     }
                     // The recorded game folder is gone, replaced, or its
                     // record is not the Launcher's: nothing about the game
@@ -2539,12 +2566,13 @@ fn check_prefix_dependency(
 }
 
 /// Diablo II is installed when its files are: Blizzard's installers or an
-/// import put them there.
-fn check_base_game(game: &GameTree<'_>, activity: ActivityEvidence) -> CheckResult {
-    check_game_files(
-        AuditCheck::BaseGame,
-        game,
-        [
+/// import put them there. An `imported` game (on the Android host) is
+/// proven by the files its import checked.
+fn check_base_game(game: &GameTree<'_>, activity: ActivityEvidence, imported: bool) -> CheckResult {
+    let files: &[&str] = if imported {
+        &crate::game_folder::IMPORT_BASE_FILES
+    } else {
+        &[
             "Game.exe",
             "Diablo II.exe",
             "d2data.mpq",
@@ -2552,40 +2580,49 @@ fn check_base_game(game: &GameTree<'_>, activity: ActivityEvidence) -> CheckResu
             "d2sfx.mpq",
             "d2speech.mpq",
             "d2video.mpq",
-        ],
-        activity,
-    )
+        ]
+    };
+    check_game_files(AuditCheck::BaseGame, game, files, activity)
 }
 
-/// Lord of Destruction is installed when its files are.
-fn check_expansion(game: &GameTree<'_>, activity: ActivityEvidence) -> CheckResult {
-    check_game_files(
-        AuditCheck::Expansion,
-        game,
-        ["d2exp.mpq", "d2xmusic.mpq", "d2xtalk.mpq", "d2xvideo.mpq"],
-        activity,
-    )
+/// Lord of Destruction is installed when its files are; an `imported` game's
+/// by the files its import checked.
+fn check_expansion(game: &GameTree<'_>, activity: ActivityEvidence, imported: bool) -> CheckResult {
+    let files: &[&str] = if imported {
+        &crate::game_folder::IMPORT_EXPANSION_FILES
+    } else {
+        &["d2exp.mpq", "d2xmusic.mpq", "d2xtalk.mpq", "d2xvideo.mpq"]
+    };
+    check_game_files(AuditCheck::Expansion, game, files, activity)
 }
 
 /// A game is proven by its files alone, each a regular file: no install
 /// log, registry value or import record, and no version. The game runs
 /// from its folder without them.
-fn check_game_files<const N: usize>(
+fn check_game_files(
     check: AuditCheck,
     game: &GameTree<'_>,
-    files: [&str; N],
+    files: &[&str],
     activity: ActivityEvidence,
 ) -> CheckResult {
     let mut evidence: Vec<_> = files
+        .iter()
         .map(|file| inspect_regular(game.directory, &game.path(file)))
-        .into();
+        .collect();
     if activity == ActivityEvidence::InstallerRunning {
         evidence.push(ItemEvidence::invalid(None, FindingReason::ProcessActive));
     }
     aggregate(check, evidence)
 }
 
-fn check_client(game: &GameTree<'_>, manifest: Option<&AcceptedClientManifest>) -> CheckResult {
+/// Every file of the accepted manifest, each with the digest the manifest
+/// names; `as_installed` (update checks off) asks only that each is there,
+/// but for `Game.exe`, which the launch checks against its digest.
+fn check_client(
+    game: &GameTree<'_>,
+    manifest: Option<&AcceptedClientManifest>,
+    as_installed: bool,
+) -> CheckResult {
     let Some(manifest) = manifest else {
         return single_finding(
             AuditCheck::Client,
@@ -2599,7 +2636,10 @@ fn check_client(game: &GameTree<'_>, manifest: Option<&AcceptedClientManifest>) 
         AuditCheck::Client,
         manifest.files.iter().map(|(path, digest)| {
             let relative = game.path(&format!("ProjectD2/{}", path.as_str()));
-            if is_known_protected(path.as_str()) || is_official_launcher_file(path.as_str()) {
+            if (as_installed && path.as_str() != "Game.exe")
+                || is_known_protected(path.as_str())
+                || is_official_launcher_file(path.as_str())
+            {
                 inspect_regular(game.directory, &relative)
             } else {
                 inspect_md5(game.directory, &relative, *digest)
@@ -3574,6 +3614,53 @@ mod tests {
             reasons(&desktop),
             [FindingReason::DisplaySessionUnavailable]
         );
+    }
+
+    /// An imported game (Android) is proven by the files its import
+    /// checked: no music, speech or video archive is asked for; a game that
+    /// Blizzard's installers put there, by all of them.
+    #[test]
+    fn an_imported_game_is_proven_by_the_files_its_import_checked() {
+        let folder = tempfile::TempDir::new().unwrap();
+        for name in crate::game_folder::IMPORT_BASE_FILES
+            .into_iter()
+            .chain(crate::game_folder::IMPORT_EXPANSION_FILES)
+        {
+            std::fs::write(folder.path().join(name), b"x").unwrap();
+        }
+        let directory = Directory::open(folder.path()).unwrap();
+        let game = GameTree {
+            directory: &directory,
+            base: "",
+            names: BTreeSet::new(),
+        };
+        let satisfied = |result: CheckResult| result.status == CheckStatus::Satisfied;
+        assert!(satisfied(check_base_game(
+            &game,
+            ActivityEvidence::Idle,
+            true
+        )));
+        assert!(satisfied(check_expansion(
+            &game,
+            ActivityEvidence::Idle,
+            true
+        )));
+        assert!(!satisfied(check_base_game(
+            &game,
+            ActivityEvidence::Idle,
+            false
+        )));
+        assert!(!satisfied(check_expansion(
+            &game,
+            ActivityEvidence::Idle,
+            false
+        )));
+        std::fs::remove_file(folder.path().join("d2char.mpq")).unwrap();
+        assert!(!satisfied(check_base_game(
+            &game,
+            ActivityEvidence::Idle,
+            true
+        )));
     }
 
     #[test]

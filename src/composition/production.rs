@@ -65,8 +65,8 @@ use crate::{
         UpdateTransactionProbe,
     },
     update::{
-        GameActivity, ManifestOnlyPd2Source, PrefetchedPd2Source, ProtectedInventoryEvidence,
-        UpdateError, VerifiedUpdater,
+        GameActivity, InstalledClientPd2Source, ManifestOnlyPd2Source, PrefetchedPd2Source,
+        ProtectedInventoryEvidence, UpdateError, VerifiedUpdater,
     },
 };
 
@@ -218,10 +218,16 @@ impl CoordinatorBackend for ProductionBackend {
     fn open_official_launcher(
         &self,
         confirmed: bool,
+        strict_memory_order: bool,
+        detailed_logging: bool,
         cancellation: &CancellationToken,
     ) -> Result<(), BackendFailure> {
-        self.ready()?
-            .open_official_launcher(confirmed, cancellation)
+        self.ready()?.open_official_launcher(
+            confirmed,
+            strict_memory_order,
+            detailed_logging,
+            cancellation,
+        )
     }
 
     fn request_mutation_safe_stop(&self) -> Result<(), BackendFailure> {
@@ -252,8 +258,11 @@ impl CoordinatorBackend for ProductionBackend {
         &self,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
+        strict_memory_order: bool,
+        detailed_logging: bool,
     ) -> Result<Option<GameNoticeView>, BackendFailure> {
-        self.ready()?.launch_game(driver, profile)
+        self.ready()?
+            .launch_game(driver, profile, strict_memory_order, detailed_logging)
     }
 
     fn poll_game(&self) -> BackendGameState {
@@ -725,7 +734,7 @@ impl ReadyBackend {
         let lease = HeldAuditLease(&mutation);
         let report = self
             .auditor
-            .audit_report_with_lease(activity, &lease, &root)?;
+            .audit_report_for_play(activity, &lease, &root)?;
         self.record(
             if report.installation_status() == InstallationStatus::Ready {
                 DiagnosticCode::AuditReady
@@ -921,11 +930,56 @@ impl ReadyBackend {
             }
         };
         let accepted = read_optional_bounded_at(&layout, ACCEPTED_MANIFEST_LIMIT)?;
-        Ok(if accepted.as_deref() == Some(manifest.raw()) {
-            UpdateStatus::UpToDate
-        } else {
-            UpdateStatus::Available
-        })
+        if accepted.as_deref() == Some(manifest.raw()) {
+            return Ok(UpdateStatus::UpToDate);
+        }
+        // The first check after an import, whose record the copied files
+        // made: the files themselves decide. A client that already is the
+        // current release gets PD2's record, with no question and no
+        // download; any other is offered the update.
+        if accepted
+            .as_deref()
+            .is_some_and(|accepted| crate::install::is_copied_client_record(&root, accepted))
+        {
+            let base = crate::network::Pd2Source::client_base(&*source);
+            drop(source);
+            let mut fetched = crate::update::FetchedManifestSource::new(base, &manifest);
+            let sequence = self.transaction_sequence.fetch_add(1, Ordering::Relaxed);
+            // The record is written only while the installation's lease is
+            // held, so that no game starts meanwhile.
+            let hold = || {
+                InstallationMutationLease::acquire(&root)
+                    .ok()
+                    .map(|lease| Box::new(lease) as Box<dyn std::any::Any>)
+            };
+            let current = VerifiedUpdater::with_layout(layout, &mut fetched).accept_if_current(
+                &format!("check-{}-{sequence}", std::process::id()),
+                &crate::operation::OperationControl::default(),
+                &hold,
+            );
+            eprintln!(
+                "pd2-launcher: the first update check after an import compared the copied files with Project Diablo 2's: {}",
+                match current {
+                    Ok(crate::update::CurrentClient::Recorded) => {
+                        "they are the current release, so its record is written"
+                    }
+                    Ok(crate::update::CurrentClient::Busy) => {
+                        "they are the current release; the installation was busy, so the next check writes its record"
+                    }
+                    Ok(crate::update::CurrentClient::Differs) => {
+                        "a file differs or is missing, so the update is offered"
+                    }
+                    Err(_) => "they could not be compared, so the update is offered",
+                }
+            );
+            if matches!(
+                current,
+                Ok(crate::update::CurrentClient::Recorded | crate::update::CurrentClient::Busy)
+            ) {
+                return Ok(UpdateStatus::UpToDate);
+            }
+        }
+        Ok(UpdateStatus::Available)
     }
 
     fn select_installer_media(&self, path: PathBuf) -> Result<InstallerMediaView, BackendFailure> {
@@ -1166,7 +1220,8 @@ impl ReadyBackend {
             &driver,
             &client,
             ArtifactCatalog::with_sources(&sources),
-        );
+        )
+        .with_client_as_installed(client_as_installed(&self.settings));
         let result = run(&mut installer);
         self.record_custom_sources(activity, &sources, &used.take())?;
         if let Err(error) = &result {
@@ -1439,9 +1494,14 @@ impl ReadyBackend {
     /// the official PD2 launcher in the managed prefix, holding the
     /// exclusive installation lease so no install, update, repair, or game
     /// launch overlaps it, until it and everything it started exit.
+    /// `strict_memory_order`: a game that it starts gets Box64's strict x86
+    /// memory order, as for Play; `detailed_logging`: its Wine and that game
+    /// log in detail.
     fn open_official_launcher(
         &self,
         confirmed: bool,
+        strict_memory_order: bool,
+        detailed_logging: bool,
         cancellation: &CancellationToken,
     ) -> Result<(), BackendFailure> {
         let activity = self.begin_job(
@@ -1471,16 +1531,8 @@ impl ReadyBackend {
             if !official_launcher_permitted(&audit) {
                 return Err(backend_failure("official-launcher-preflight-rejected"));
             }
-            match audit.official_launcher() {
-                OfficialLauncherTrust::Verified => {}
-                OfficialLauncherTrust::Unrecorded | OfficialLauncherTrust::Changed if confirmed => {
-                }
-                OfficialLauncherTrust::Unrecorded | OfficialLauncherTrust::Changed => {
-                    return Err(backend_failure("official-launcher-confirmation-required"));
-                }
-                OfficialLauncherTrust::Absent | OfficialLauncherTrust::Indeterminate => {
-                    return Err(backend_failure("official-launcher-preflight-rejected"));
-                }
+            if let Some(code) = official_launcher_refusal(audit.official_launcher(), confirmed) {
+                return Err(backend_failure(code));
             }
             // Its Play starts the game, which saves characters too.
             self.keep_saves_under(&root)?;
@@ -1488,7 +1540,9 @@ impl ReadyBackend {
                 .install_driver
                 .clone()
                 .with_custom_wine(audit.uses_custom_runtime())
-                .with_wpf_software_rendering(self.official_launcher_software_rendering());
+                .with_wpf_software_rendering(self.official_launcher_software_rendering())
+                .with_game_strict_memory_order(strict_memory_order)
+                .with_detailed_logging(detailed_logging);
             let session =
                 driver.run_official_launcher(&self.paths.managed_root(), &lease.0, cancellation);
             // The official launcher updates itself; the binary it leaves
@@ -1515,8 +1569,10 @@ impl ReadyBackend {
     /// differ. With [`OfficialClientFiles::InstalledOnly`] it fetches only
     /// the manifest, in one try, and leaves the cache as it is: a client the
     /// launcher updated only in part is not accepted, and it and its record
-    /// stay as they are. Only an updater result reported as indeterminate
-    /// is `operation-indeterminate`, for Repair.
+    /// stay as they are. With the update checks off, nothing is downloaded:
+    /// what the official launcher left is recorded as it is installed
+    /// ([`InstalledClientPd2Source`]). Only an updater result reported as
+    /// indeterminate is `operation-indeterminate`, for Repair.
     fn reconcile_official_client(
         &self,
         activity: &ActiveDiagnostic<'_>,
@@ -1548,34 +1604,60 @@ impl ReadyBackend {
         let transaction_id = format!("official-{}-{sequence}", std::process::id());
         let mut source = self.updater_source()?;
         let layout = self.update_layout(root)?;
-        let applied = match files {
-            OfficialClientFiles::Download => {
-                refresh_client_cache(root, &layout, &mut *source, cancellation).and_then(|cache| {
-                    let mut cached = PrefetchedPd2Source::new(&mut *source, Some(cache));
-                    VerifiedUpdater::with_layout(layout, &mut cached).apply_controlled(
-                        &transaction_id,
-                        GameActivity::Idle,
-                        ProtectedInventoryEvidence::Complete,
-                        cancellation,
-                    )
-                })
-            }
-            OfficialClientFiles::InstalledOnly => {
-                // A failure only keeps what is there, so one try is enough.
-                let mut installed = ManifestOnlyPd2Source::new(&mut *source);
-                let applied = VerifiedUpdater::with_layout(layout, &mut installed)
-                    .with_retry_policy(crate::network::RetryPolicy::once())
-                    .apply_controlled(
-                        &transaction_id,
-                        GameActivity::Idle,
-                        ProtectedInventoryEvidence::Complete,
-                        cancellation,
-                    );
-                eprintln!(
-                    "pd2-launcher: official launcher stopped: {}",
-                    stopped_client_outcome(&applied, installed.refused_a_file())
+        let applied = if client_as_installed(&self.settings) {
+            let project = layout
+                .open_project()
+                .map_err(|_| backend_failure("client-reconcile-failed"))?;
+            let mut kept = InstalledClientPd2Source::new(&mut *source, &project);
+            let applied = VerifiedUpdater::with_layout(layout, &mut kept)
+                .with_retry_policy(crate::network::RetryPolicy::once())
+                .apply_controlled(
+                    &transaction_id,
+                    GameActivity::Idle,
+                    ProtectedInventoryEvidence::Complete,
+                    cancellation,
                 );
-                applied
+            eprintln!(
+                "pd2-launcher: official launcher closed: the update checks are off, so its client is {}",
+                if applied.is_ok() {
+                    "recorded as it is installed"
+                } else {
+                    "not recorded"
+                }
+            );
+            applied
+        } else {
+            match files {
+                OfficialClientFiles::Download => {
+                    refresh_client_cache(root, &layout, &mut *source, cancellation).and_then(
+                        |cache| {
+                            let mut cached = PrefetchedPd2Source::new(&mut *source, Some(cache));
+                            VerifiedUpdater::with_layout(layout, &mut cached).apply_controlled(
+                                &transaction_id,
+                                GameActivity::Idle,
+                                ProtectedInventoryEvidence::Complete,
+                                cancellation,
+                            )
+                        },
+                    )
+                }
+                OfficialClientFiles::InstalledOnly => {
+                    // A failure only keeps what is there, so one try is enough.
+                    let mut installed = ManifestOnlyPd2Source::new(&mut *source);
+                    let applied = VerifiedUpdater::with_layout(layout, &mut installed)
+                        .with_retry_policy(crate::network::RetryPolicy::once())
+                        .apply_controlled(
+                            &transaction_id,
+                            GameActivity::Idle,
+                            ProtectedInventoryEvidence::Complete,
+                            cancellation,
+                        );
+                    eprintln!(
+                        "pd2-launcher: official launcher stopped: {}",
+                        stopped_client_outcome(&applied, installed.refused_a_file())
+                    );
+                    applied
+                }
             }
         };
         applied.map(drop).map_err(|error| {
@@ -1873,6 +1955,8 @@ impl ReadyBackend {
         &self,
         driver: GraphicsDriver,
         profile: Option<GraphicsProfile>,
+        strict_memory_order: bool,
+        detailed_logging: bool,
     ) -> Result<Option<GameNoticeView>, BackendFailure> {
         let settings = self
             .settings
@@ -1898,6 +1982,9 @@ impl ReadyBackend {
                 GraphicsProfile::Performance => crate::process::GraphicsProfile::Performance,
             });
         }
+        options = options
+            .with_strict_memory_order(strict_memory_order)
+            .with_detailed_logging(detailed_logging);
         if let Err(failure) = self.keep_saves() {
             self.record(DiagnosticCode::GameLaunchFailed)?;
             return Err(failure);
@@ -2101,6 +2188,7 @@ impl ReadyBackend {
                 "sound_in_background": settings.sound_in_background(),
                 "official_launcher_software_rendering":
                     settings.official_launcher_software_rendering(),
+                "update_checks": settings.update_checks(),
                 "custom_download_sources": settings
                     .download_sources()
                     .iter()
@@ -2427,7 +2515,10 @@ impl ProductionAuditor {
         }
     }
 
-    /// Audit against the currently effective download sources.
+    /// Audit against the currently effective download sources, with the
+    /// client held to the accepted manifest: the audit of every job (an
+    /// update, the official launcher and its reconciliation, a move, Start
+    /// over) and of the report.
     fn audit_report_with_lease(
         &self,
         activity: ActivityEvidence,
@@ -2435,17 +2526,34 @@ impl ProductionAuditor {
         root: &Directory,
     ) -> Result<InstallationReport, BackendFailure> {
         let sources = effective_sources(&self.settings, &self.source_environment);
-        self.audit_report_with_sources(activity, lease, root, &sources)
+        self.audit_report_with_sources(activity, lease, root, &sources, false)
+    }
+
+    /// The audit that decides Play: the Launcher's own (its state) and the
+    /// launch's. With the update checks off it takes the client as installed
+    /// ([`client_as_installed`]); jobs keep the accepted manifest's rule, so
+    /// the official launcher's update is still accepted into it.
+    fn audit_report_for_play(
+        &self,
+        activity: ActivityEvidence,
+        lease: &dyn AuditLease,
+        root: &Directory,
+    ) -> Result<InstallationReport, BackendFailure> {
+        let sources = effective_sources(&self.settings, &self.source_environment);
+        let as_installed = client_as_installed(&self.settings);
+        self.audit_report_with_sources(activity, lease, root, &sources, as_installed)
     }
 
     /// A custom-unverified receipt satisfies the audit only for components
-    /// whose source in `sources` is custom.
+    /// whose source in `sources` is custom. `as_installed`: the client is
+    /// taken as installed ([`AuditRequest::with_client_as_installed`]).
     fn audit_report_with_sources(
         &self,
         activity: ActivityEvidence,
         lease: &dyn AuditLease,
         root: &Directory,
         sources: &DownloadSources,
+        as_installed: bool,
     ) -> Result<InstallationReport, BackendFailure> {
         let layout = anchored_update_layout(&self.paths, root)?;
         let transaction = UpdateTransactionProbe::new(layout.clone());
@@ -2453,6 +2561,9 @@ impl ProductionAuditor {
             .with_launcher_artifact(launcher_artifact());
         if self.android_host() {
             request = request.with_xinput_bridge();
+        }
+        if as_installed {
+            request = request.with_client_as_installed();
         }
         for (artifact, component) in [
             (DownloadArtifact::Wine, CustomComponent::WineRuntime),
@@ -2493,7 +2604,13 @@ impl ProductionAuditor {
             .map_err(|_| AdapterFailure::here())?;
         let lease = RetainedFileAuditLease(lock);
         let report = self
-            .audit_report_with_sources(ActivityEvidence::Idle, &lease, paths.directory(), sources)
+            .audit_report_with_sources(
+                ActivityEvidence::Idle,
+                &lease,
+                paths.directory(),
+                sources,
+                false,
+            )
             .map_err(|_| AdapterFailure::here())?;
         let components = report.prefix_components();
         // A prefix whose own Wine files are not established is recreated
@@ -2608,6 +2725,24 @@ impl ClientSynchronizer for RecordingClientSynchronizer<'_> {
         self.used.record(DownloadArtifact::Pd2ClientBase);
         self.inner.synchronize(paths, control)
     }
+
+    fn accept_installed(
+        &self,
+        paths: &ManagedPaths,
+        control: &crate::operation::OperationControl,
+    ) -> Result<(), AdapterFailure> {
+        self.used.record(DownloadArtifact::Pd2ClientBase);
+        self.inner.accept_installed(paths, control)
+    }
+
+    /// Offline: no download source is used.
+    fn record_copied(
+        &self,
+        paths: &ManagedPaths,
+        control: &crate::operation::OperationControl,
+    ) -> Result<(), AdapterFailure> {
+        self.inner.record_copied(paths, control)
+    }
 }
 
 /// The Auditor for one install job, bound to the sources resolved at the
@@ -2637,7 +2772,7 @@ impl GameAuditor for ProductionAuditor {
             .map_err(|_| GameAuditFailure)?;
         let lease = RetainedFileAuditLease(lock);
         let report = self
-            .audit_report_with_lease(ActivityEvidence::Idle, &lease, retained_root)
+            .audit_report_for_play(ActivityEvidence::Idle, &lease, retained_root)
             .map_err(|_| GameAuditFailure)?;
         let layout =
             anchored_update_layout(&self.paths, retained_root).map_err(|_| GameAuditFailure)?;
@@ -3062,6 +3197,25 @@ fn official_launcher_permitted(report: &InstallationReport) -> bool {
         ]
         .into_iter()
         .all(|check| report.check(check) == CheckStatus::Satisfied)
+}
+
+/// Why the official launcher binary as found may not run, or None when it
+/// may. A missing binary has its own code: the game folder lacks
+/// ProjectD2/PD2Launcher.exe (an incomplete imported copy, for example), and
+/// only the player can fix the folder.
+fn official_launcher_refusal(
+    trust: OfficialLauncherTrust,
+    confirmed: bool,
+) -> Option<&'static str> {
+    match trust {
+        OfficialLauncherTrust::Verified => None,
+        OfficialLauncherTrust::Unrecorded | OfficialLauncherTrust::Changed if confirmed => None,
+        OfficialLauncherTrust::Unrecorded | OfficialLauncherTrust::Changed => {
+            Some("official-launcher-confirmation-required")
+        }
+        OfficialLauncherTrust::Absent => Some("official-launcher-missing"),
+        OfficialLauncherTrust::Indeterminate => Some("official-launcher-preflight-rejected"),
+    }
 }
 
 fn host_view(host: HostSupport) -> HostView {
@@ -3534,6 +3688,7 @@ fn launch_settings_view(settings: &crate::persistence::LauncherSettings) -> Laun
     )
     .with_official_launcher_software_rendering(settings.official_launcher_software_rendering())
     .with_app_menu_entry(settings.app_menu_entry())
+    .with_update_checks(settings.update_checks())
     .with_direct_draw_renderer(match settings.direct_draw_renderer() {
         crate::persistence::DirectDrawRendererSetting::Untouched
         | crate::persistence::DirectDrawRendererSetting::Pd2 => DirectDrawRendererView::Pd2,
@@ -3573,6 +3728,15 @@ fn game_launch_notice(d2gl_setup: D2glSetup) -> Option<GameNoticeView> {
     (d2gl_setup == D2glSetup::ConfigurationAbsent).then_some(GameNoticeView::FirstD2glLaunch)
 }
 
+/// The player turned Project Diablo 2's update checks off: the audits that
+/// decide Play take the client as installed. Settings that cannot be read
+/// keep the checks on, and with them the accepted manifest's rule.
+fn client_as_installed(settings: &SettingsStore) -> bool {
+    settings
+        .load()
+        .is_ok_and(|settings| !settings.update_checks())
+}
+
 fn update_launch_settings(
     store: &SettingsStore,
     change: SettingsChange,
@@ -3596,6 +3760,7 @@ fn update_launch_settings(
             settings.with_direct_draw_renderer(direct_draw_setting(renderer))
         }
         SettingsChange::AppMenuEntry(enabled) => settings.with_app_menu_entry(enabled),
+        SettingsChange::UpdateChecks(enabled) => settings.with_update_checks(enabled),
     };
     store
         .save(&settings)
@@ -3790,6 +3955,7 @@ fn install_failure_code(error: &InstallError) -> &'static str {
         InstallError::BaseGameInstalled => "base-game-installed",
         InstallError::ExistingInstallInvalid(_) => "existing-install-invalid",
         InstallError::GameFolderUnavailable => "game-folder-unavailable",
+        InstallError::ClientNotKept => "client-not-kept",
         InstallError::AuthorizationRequired => "authorization-required",
         InstallError::DownloadCacheUnusable { .. } => "download-cache-unusable",
         InstallError::AcquisitionFailed { artifact }
@@ -3821,6 +3987,29 @@ mod tests {
     use crate::operation::WorkProgress;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_missing_official_launcher_binary_has_its_own_failure() {
+        use OfficialLauncherTrust::{Absent, Changed, Indeterminate, Unrecorded, Verified};
+        for confirmed in [false, true] {
+            assert_eq!(official_launcher_refusal(Verified, confirmed), None);
+            assert_eq!(
+                official_launcher_refusal(Absent, confirmed),
+                Some("official-launcher-missing")
+            );
+            assert_eq!(
+                official_launcher_refusal(Indeterminate, confirmed),
+                Some("official-launcher-preflight-rejected")
+            );
+        }
+        for trust in [Unrecorded, Changed] {
+            assert_eq!(
+                official_launcher_refusal(trust, false),
+                Some("official-launcher-confirmation-required")
+            );
+            assert_eq!(official_launcher_refusal(trust, true), None);
+        }
+    }
 
     #[test]
     fn a_device_fex_must_be_the_full_path_of_an_executable_file() {
@@ -4001,7 +4190,7 @@ mod tests {
         // A new process starts with the standard driver in use.
         let restart = || crate::wine_environment::use_compatibility_driver(false);
         // A Play with the Compatibility driver (no game starts here).
-        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None, false, false);
         assert!(in_use());
         // The next engine uses it from its start: the official launcher's
         // game gets it before any Play.
@@ -4009,17 +4198,17 @@ mod tests {
         let _next = engine(true);
         assert!(in_use());
         // A Play with the standard driver, and the engine after it.
-        let _ = engine(true).launch_game(GraphicsDriver::Standard, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Standard, None, false, false);
         assert!(!in_use());
         restart();
         let _next = engine(true);
         assert!(!in_use());
         // The desktop keeps no driver and uses none.
-        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None);
+        let _ = engine(true).launch_game(GraphicsDriver::Compatibility, None, false, false);
         restart();
         let desktop = engine(false);
         assert!(!in_use());
-        let _ = desktop.launch_game(GraphicsDriver::Standard, None);
+        let _ = desktop.launch_game(GraphicsDriver::Standard, None, false, false);
         assert!(compatibility_driver_saved(paths.config_root()));
     }
 
@@ -4317,6 +4506,27 @@ mod tests {
         assert_eq!(
             game_launch_options(&loaded),
             GameLaunchOptions::new(GameRenderer::DirectDraw, false).with_sound_in_background(true)
+        );
+    }
+
+    #[test]
+    fn update_checks_turned_off_persist_and_reach_the_settings_view() {
+        let fixture = TempDir::new().expect("fixture");
+        let path = fixture.path().join("config/settings.json");
+        let store = SettingsStore::new(&path);
+        assert!(launch_settings_view(&store.load().expect("load")).update_checks());
+
+        assert!(!client_as_installed(&store));
+        let saved = update_launch_settings(&store, SettingsChange::UpdateChecks(false))
+            .expect("update checks");
+        assert!(!saved.update_checks());
+        assert!(client_as_installed(&store));
+        let loaded = SettingsStore::new(&path).load().expect("restart load");
+        assert!(!launch_settings_view(&loaded).update_checks());
+        // The other settings stay as they were.
+        assert_eq!(
+            launch_settings_view(&loaded).with_update_checks(true),
+            launch_settings_view(&crate::persistence::LauncherSettings::default())
         );
     }
 

@@ -131,11 +131,14 @@ fn fex_strict_settings_on(android: bool) -> Vec<crate::wine_environment::Setting
 /// names get the settings (our Box64 patch 0006): the installer runs as
 /// [`ANDROID_CLIENT_INSTALLER`], so Inno Setup's copy is
 /// `ProjectD2Installer.tmp`. Only this installer's run gets them; every other
-/// program keeps Box64's defaults.
+/// program keeps Box64's defaults. The list ends with `;`: wowbox64 reads it
+/// into a reused buffer without ending it with a NUL, so an earlier, longer
+/// value's leftover bytes would join the last name (`process.rs` has the
+/// details).
 const BOX64_INSTALLER_ENVIRONMENT: [(&str, &str); 2] = [
     (
         "BOX64_DYNAREC_PROGRAMS",
-        "ProjectD2Installer.exe;ProjectD2Installer.tmp",
+        "ProjectD2Installer.exe;ProjectD2Installer.tmp;",
     ),
     ("BOX64_DYNAREC_SAFEFLAGS", "2"),
 ];
@@ -144,11 +147,27 @@ const BOX64_INSTALLER_ENVIRONMENT: [(&str, &str); 2] = [
 /// updater: its multithreaded .NET (JIT-compiled code, the garbage
 /// collector, the thread pool) relies on x86 memory ordering
 /// (`BOX64_DYNAREC_STRONGMEM=1`), and code it writes must run at once
-/// (`BOX64_DYNAREC_WAIT=0`). Only these programs get them (as above).
+/// (`BOX64_DYNAREC_WAIT=0`). Only these programs get them (as above), and
+/// the list ends with `;` for the same reason.
 const BOX64_LAUNCHER_ENVIRONMENT: [(&str, &str); 3] = [
     (
         "BOX64_DYNAREC_PROGRAMS",
-        "PD2Launcher.exe;UpdateUtility.exe",
+        "PD2Launcher.exe;UpdateUtility.exe;",
+    ),
+    ("BOX64_DYNAREC_STRONGMEM", "1"),
+    ("BOX64_DYNAREC_WAIT", "0"),
+];
+
+/// [`BOX64_LAUNCHER_ENVIRONMENT`] when a game that the official launcher
+/// starts gets Box64's strict x86 memory order (the Android app's Strict CPU
+/// emulation). The game inherits the launcher's environment, so its entry
+/// names the settings it gets (our Box64 patch 0009: `name:SETTING`): only
+/// those that Play gives it (`crate::process::BOX64_STRICT_GAME_ENVIRONMENT`),
+/// not the launcher's `WAIT=0`.
+const BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT: [(&str, &str); 3] = [
+    (
+        "BOX64_DYNAREC_PROGRAMS",
+        "PD2Launcher.exe;UpdateUtility.exe;Game.exe:STRONGMEM;",
     ),
     ("BOX64_DYNAREC_STRONGMEM", "1"),
     ("BOX64_DYNAREC_WAIT", "0"),
@@ -2245,6 +2264,12 @@ pub(crate) struct ProductionInstallDriver {
     host: Arc<dyn HostExecution>,
     custom_wine: bool,
     wpf_software_rendering: bool,
+    /// A game that the official launcher starts gets Box64's strict x86
+    /// memory order ([`BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT`]).
+    game_strict_memory_order: bool,
+    /// The official launcher's Wine, and a game that it starts, log in detail
+    /// (the Android app's Detailed logging).
+    detailed_logging: bool,
     download_stall_limit: Duration,
     download_resume_limit: Duration,
     download_empty_limit: Duration,
@@ -2255,6 +2280,9 @@ pub(crate) struct ProductionInstallDriver {
     /// runtime, its prefix and the Android Wine settings. Tests set it for
     /// either host.
     android: bool,
+    /// The official launcher's x86 .NET runs translated
+    /// ([`TRANSLATED_DOTNET`]). Tests set it for either kind of host.
+    translated_dotnet: bool,
 }
 
 impl ProductionInstallDriver {
@@ -2263,6 +2291,8 @@ impl ProductionInstallDriver {
             host,
             custom_wine: false,
             wpf_software_rendering: true,
+            game_strict_memory_order: false,
+            detailed_logging: false,
             download_stall_limit: DOWNLOAD_STALL_LIMIT,
             download_resume_limit: DOWNLOAD_RESUME_LIMIT,
             download_empty_limit: DOWNLOAD_EMPTY_LIMIT,
@@ -2270,6 +2300,7 @@ impl ProductionInstallDriver {
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
             android: crate::android_host(),
+            translated_dotnet: TRANSLATED_DOTNET,
         }
     }
 
@@ -2280,6 +2311,14 @@ impl ProductionInstallDriver {
     #[cfg(test)]
     fn on_android_host(mut self, android: bool) -> Self {
         self.android = android;
+        self
+    }
+
+    /// The driver of a host whose official launcher's .NET runs translated
+    /// (`translated`, ARM64) or natively, for tests on any host.
+    #[cfg(test)]
+    fn with_translated_dotnet(mut self, translated: bool) -> Self {
+        self.translated_dotnet = translated;
         self
     }
 
@@ -2307,8 +2346,25 @@ impl ProductionInstallDriver {
         self
     }
 
+    /// Whether a game that the official launcher starts gets Box64's strict
+    /// x86 memory order (the Android app's Strict CPU emulation).
+    pub(crate) fn with_game_strict_memory_order(mut self, enabled: bool) -> Self {
+        self.game_strict_memory_order = enabled;
+        self
+    }
+
+    /// Whether the official launcher's Wine, and a game that it starts, log
+    /// in detail (the Android app's Detailed logging).
+    pub(crate) fn with_detailed_logging(mut self, enabled: bool) -> Self {
+        self.detailed_logging = enabled;
+        self
+    }
+
     /// Set or remove the WPF software rendering value in the prefix to match
-    /// the setting.
+    /// the setting, with Wine's `reg` only when the prefix's `user.reg` does
+    /// not match it already. Each `reg` run starts the prefix and then waits
+    /// for its wineserver to exit, which took about 5 s of each official
+    /// launcher start on a slow phone.
     fn sync_wpf_software_rendering(
         &self,
         paths: &ManagedPaths,
@@ -2316,6 +2372,11 @@ impl ProductionInstallDriver {
         mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure> {
+        if prefix_user_reg(paths).is_some_and(|user_reg| {
+            wpf_software_rendering_matches(&user_reg, self.wpf_software_rendering)
+        }) {
+            return Ok(());
+        }
         self.run_wine(WineInvocation {
             paths,
             runtime,
@@ -2350,14 +2411,7 @@ impl ProductionInstallDriver {
         mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure> {
-        let mut user_reg = Vec::new();
-        if paths
-            .directory()
-            .open_beneath(Path::new("prefix/user.reg"), OFlags::RDONLY)
-            .and_then(|mut file| file.read_to_end(&mut user_reg))
-            .is_ok()
-            && x11_glx_set(&String::from_utf8_lossy(&user_reg))
-        {
+        if prefix_user_reg(paths).is_some_and(|user_reg| x11_glx_set(&user_reg)) {
             return Ok(());
         }
         self.run_wine(WineInvocation {
@@ -2635,6 +2689,17 @@ impl ProductionInstallDriver {
                 return Err(AdapterFailure::here());
             }
         };
+        // The Box64 line names the program: a descriptor's by what it runs.
+        let shown = managed_program.as_ref().map_or_else(
+            || {
+                if program.as_encoded_bytes().starts_with(b"/proc/") {
+                    label.trim_start_matches("wine ").to_owned()
+                } else {
+                    program.to_string_lossy().into_owned()
+                }
+            },
+            |(relative, _)| relative.to_string_lossy().into_owned(),
+        );
         let home = validated_directory_environment("HOME")?;
         let working = match invocation
             .working_directory
@@ -2705,7 +2770,10 @@ impl ProductionInstallDriver {
                     .map_err(|_| AdapterFailure::here())?,
             )
             .with_cleared_environment()
-            .with_output_limit(PROCESS_OUTPUT_LIMIT);
+            .with_output_limit(PROCESS_OUTPUT_LIMIT)
+            .with_detailed_output(
+                self.detailed_logging && invocation.profile == WineProfile::OfficialLauncher,
+            );
         use crate::wine_environment::{Kind, Setting};
         let mut settings = wine_settings(home);
         match invocation.profile {
@@ -2744,27 +2812,39 @@ impl ProductionInstallDriver {
                 // collector, the thread pool), and a game it starts inherits
                 // this environment.
                 settings.extend(fex_strict_settings_on(self.android));
-                settings.extend(android_settings(&BOX64_LAUNCHER_ENVIRONMENT, self.android));
+                let box64 = if self.game_strict_memory_order {
+                    &BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT
+                } else {
+                    &BOX64_LAUNCHER_ENVIRONMENT
+                };
+                settings.extend(android_settings(box64, self.android));
+                settings.extend(crate::wine_environment::detailed_settings(
+                    self.detailed_logging,
+                    crate::dev_build::SETUP_WINEDEBUG,
+                ));
                 // Only where its .NET runs translated (ARM64: FEX, or Box64
                 // on the Android host); on x86-64 it runs natively and needs
                 // neither.
-                if TRANSLATED_DOTNET {
+                if self.translated_dotnet {
                     settings.push(Setting::new(
                         DOTNET_WRITE_XOR_EXECUTE,
                         "0",
                         Kind::Preference,
                     ));
-                    settings.push(Setting::new(
-                        DOTNET_TIERED_COMPILATION,
-                        "0",
-                        Kind::Preference,
-                    ));
+                    settings.extend(
+                        dotnet_tiered_compilation(self.android)
+                            .iter()
+                            .map(|(name, value)| Setting::new(*name, *value, Kind::Preference)),
+                    );
                 }
             }
         }
-        for (name, value) in
-            crate::wine_environment::compose_on(env::vars_os(), &settings, self.android)
-        {
+        let environment =
+            crate::wine_environment::compose_on(env::vars_os(), &settings, self.android);
+        if let Some(line) = crate::wine_environment::box64_line(&shown, &environment) {
+            eprintln!("{line}");
+        }
+        for (name, value) in environment {
             request = request.with_environment(name, value);
         }
         for argument in invocation.arguments {
@@ -3985,15 +4065,40 @@ fn managed_complete_payload_directory(
 /// .NET's W^X writes generated code through a second mapping of the memory
 /// it executes, which FEX's code-change tracking can miss. With it on, the
 /// official launcher's .NET runtime crashes (`c0000005`) under FEX; tiered
-/// compilation (below) must be off as well.
+/// compilation must not replace code either ([`dotnet_tiered_compilation`]).
 const DOTNET_WRITE_XOR_EXECUTE: &str = "DOTNET_EnableWriteXorExecute";
 /// Tiered compilation later replaces a method's quick code and repoints its
 /// entry jumps while other threads run it; under FEX on ARM64 the official
 /// launcher then jumps into unmapped code (an execute fault) as soon as
 /// its filter list loads. With it off, each method is compiled once.
 const DOTNET_TIERED_COMPILATION: &str = "DOTNET_TieredCompilation";
-/// The ARM64 row runs the official launcher's x86 .NET through FEX.
+/// Call counting is what makes tiered compilation compile a method again,
+/// with full optimization: without it, and without on-stack replacement
+/// (which .NET 6 on x86 does not have), no method is compiled again.
+const DOTNET_TIERED_CALL_COUNTING: &str = "DOTNET_TC_CallCounting";
+/// The ARM64 row runs the official launcher's x86 .NET through FEX, and the
+/// Android host through Box64.
 const TRANSLATED_DOTNET: bool = cfg!(target_arch = "aarch64");
+
+/// The tiered compilation settings of the official launcher's translated
+/// .NET (its .NET 6 for x86). Under FEX (the desktop's ARM64 row) tiered
+/// compilation is off. On the Android host (Box64) it is on without call
+/// counting: a method without precompiled code is still compiled only
+/// once, by the quick JIT unless it has a loop (as with tiered compilation
+/// off), and its code is never replaced, so its entry jump does not change
+/// again while other threads run it. The launcher's window then showed
+/// 1 to 2 s sooner on a slow phone than with tiered compilation off, when
+/// every such method is compiled with full optimization.
+fn dotnet_tiered_compilation(android: bool) -> &'static [(&'static str, &'static str)] {
+    if android {
+        &[
+            (DOTNET_TIERED_COMPILATION, "1"),
+            (DOTNET_TIERED_CALL_COUNTING, "0"),
+        ]
+    } else {
+        &[(DOTNET_TIERED_COMPILATION, "0")]
+    }
+}
 
 /// The WPF value that draws the official PD2 launcher in software for the
 /// prefix's user. With WPF's hardware rendering its window stays black
@@ -4054,22 +4159,63 @@ fn x11_glx_arguments() -> Vec<OsString> {
     .collect()
 }
 
-/// Whether the text of a prefix's `user.reg` has the X11 driver's `UseEGL`
-/// set to "N": the line `"UseEGL"="N"` in its `[Software\\Wine\\X11 Driver]`
-/// section (Wine writes key names with doubled backslashes; their case does
-/// not count).
-fn x11_glx_set(user_reg: &str) -> bool {
+/// The text of the prefix's `user.reg`, the registry of the prefix's user
+/// as its last wineserver saved it. `None` when it cannot be read.
+fn prefix_user_reg(paths: &ManagedPaths) -> Option<String> {
+    let mut user_reg = Vec::new();
+    paths
+        .directory()
+        .open_beneath(Path::new("prefix/user.reg"), OFlags::RDONLY)
+        .and_then(|mut file| file.read_to_end(&mut user_reg))
+        .ok()?;
+    Some(String::from_utf8_lossy(&user_reg).into_owned())
+}
+
+/// The values named `value` in the section of `key` of a prefix's
+/// `user.reg` text: what follows `"<value>"=` on each such line. `key` is
+/// written as Wine writes key names there, with doubled backslashes. Key
+/// and value names are compared without their case, as Windows does, and
+/// spaces at the start of a line do not count.
+fn user_reg_values<'a>(user_reg: &'a str, key: &str, value: &str) -> Vec<&'a str> {
+    let section = format!("{}]", key.to_ascii_lowercase());
+    let name = format!(r#""{}"="#, value.to_ascii_lowercase());
     let mut in_section = false;
-    for line in user_reg.lines() {
-        if let Some(name) = line.strip_prefix('[') {
-            in_section = name
-                .to_ascii_lowercase()
-                .starts_with(r"software\\wine\\x11 driver]");
-        } else if in_section && line.trim_end() == r#""UseEGL"="N""# {
-            return true;
+    let mut values = Vec::new();
+    for line in user_reg.lines().map(str::trim_start) {
+        if let Some(found) = line.strip_prefix('[') {
+            in_section = found.to_ascii_lowercase().starts_with(&section);
+        } else if in_section && line.to_ascii_lowercase().starts_with(&name) {
+            values.push(line[name.len()..].trim_end());
         }
     }
-    false
+    values
+}
+
+/// Whether the text of a prefix's `user.reg` already matches the WPF
+/// software rendering setting: with `enabled`, its
+/// `[Software\\Microsoft\\Avalon.Graphics]` section has
+/// `"DisableHWAcceleration"=dword:00000001` and no other value of that
+/// name; without, the section has no value of that name. Any other text is
+/// no match, so Wine's `reg` sets the value.
+fn wpf_software_rendering_matches(user_reg: &str, enabled: bool) -> bool {
+    let values = user_reg_values(
+        user_reg,
+        r"Software\\Microsoft\\Avalon.Graphics",
+        WPF_SOFTWARE_RENDERING_VALUE,
+    );
+    if enabled {
+        !values.is_empty() && values.iter().all(|value| *value == "dword:00000001")
+    } else {
+        values.is_empty()
+    }
+}
+
+/// Whether the text of a prefix's `user.reg` has the X11 driver's `UseEGL`
+/// set to "N": `"UseEGL"="N"`, and no other value of that name, in its
+/// `[Software\\Wine\\X11 Driver]` section.
+fn x11_glx_set(user_reg: &str) -> bool {
+    let values = user_reg_values(user_reg, r"Software\\Wine\\X11 Driver", X11_USE_EGL_VALUE);
+    !values.is_empty() && values.iter().all(|value| *value == r#""N""#)
 }
 
 /// The Windows path of a folder used in place (`in_place_drive`), for the
@@ -6150,6 +6296,22 @@ impl ClientSynchronizer for UpdaterClientSynchronizer {
         paths: &ManagedPaths,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure> {
+        self.apply(paths, control, false)
+    }
+
+    fn accept_installed(
+        &self,
+        paths: &ManagedPaths,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure> {
+        self.apply(paths, control, true)
+    }
+
+    fn record_copied(
+        &self,
+        paths: &ManagedPaths,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure> {
         let project_d2 = paths.game().join("ProjectD2");
         let relative = Path::new("ProjectD2");
         let game = paths.open_game().map_err(|_| AdapterFailure::here())?;
@@ -6158,18 +6320,11 @@ impl ClientSynchronizer for UpdaterClientSynchronizer {
             .map_err(|_| AdapterFailure::here())?;
         validate_inventory_at(project.try_clone().map_err(|_| AdapterFailure::here())?)?;
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let transaction_id = format!("install-{}-{sequence}", std::process::id());
-        let mut source = self.source.lock().map_err(|_| AdapterFailure::here())?;
-        // Client files the Download step verified are served from the
-        // cache; only files that changed since are fetched.
-        let cache = paths
-            .directory()
-            .open_directory(Path::new(crate::install::CLIENT_PREFETCH))
-            .ok();
-        let mut cached = crate::update::PrefetchedPd2Source::new(source.as_mut(), cache);
+        let transaction_id = format!("import-{}-{sequence}", std::process::id());
+        let mut copied = crate::update::CopiedClientPd2Source::new(&project);
         VerifiedUpdater::with_layout(
             UpdateLayout::anchored(project_d2, game, relative),
-            &mut cached,
+            &mut copied,
         )
         .apply_controlled(
             &transaction_id,
@@ -6178,8 +6333,6 @@ impl ClientSynchronizer for UpdaterClientSynchronizer {
             control,
         )
         .map_err(|_| AdapterFailure::here())?;
-        // The cache keeps its copy: Start over and a later Download reuse
-        // it instead of fetching the client again.
         Ok(())
     }
 
@@ -6201,6 +6354,56 @@ impl ClientSynchronizer for UpdaterClientSynchronizer {
         let mut source = self.source.lock().map_err(|_| AdapterFailure::here())?;
         crate::update::prefetch_client(source.as_mut(), &cache, installed.as_ref(), control)
             .map_err(|_| AdapterFailure::here())
+    }
+}
+
+impl UpdaterClientSynchronizer {
+    /// The client of the current manifest from the verified updater; with
+    /// `as_installed`, the client as it is installed, recorded as the
+    /// accepted one without a change to its files
+    /// ([`crate::update::InstalledClientPd2Source`]).
+    fn apply(
+        &self,
+        paths: &ManagedPaths,
+        control: &OperationControl,
+        as_installed: bool,
+    ) -> Result<(), AdapterFailure> {
+        let project_d2 = paths.game().join("ProjectD2");
+        let relative = Path::new("ProjectD2");
+        let game = paths.open_game().map_err(|_| AdapterFailure::here())?;
+        let project = game
+            .open_directory(relative)
+            .map_err(|_| AdapterFailure::here())?;
+        validate_inventory_at(project.try_clone().map_err(|_| AdapterFailure::here())?)?;
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let transaction_id = format!("install-{}-{sequence}", std::process::id());
+        let mut source = self.source.lock().map_err(|_| AdapterFailure::here())?;
+        // Client files the Download step verified are served from the
+        // cache; only files that changed since are fetched. As installed, the
+        // cache only gives the manifest when the server cannot.
+        let cache = paths
+            .directory()
+            .open_directory(Path::new(crate::install::CLIENT_PREFETCH))
+            .ok();
+        let mut cached = crate::update::PrefetchedPd2Source::new(source.as_mut(), cache);
+        let mut kept;
+        let source: &mut dyn Pd2Source = if as_installed {
+            kept = crate::update::InstalledClientPd2Source::new(&mut cached, &project);
+            &mut kept
+        } else {
+            &mut cached
+        };
+        VerifiedUpdater::with_layout(UpdateLayout::anchored(project_d2, game, relative), source)
+            .apply_controlled(
+                &transaction_id,
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+                control,
+            )
+            .map_err(|_| AdapterFailure::here())?;
+        // The cache keeps its copy: Start over and a later Download reuse
+        // it instead of fetching the client again.
+        Ok(())
     }
 }
 
@@ -8739,6 +8942,197 @@ mod tests {
     }
 
     #[test]
+    fn the_official_launcher_opens_without_reg_when_user_reg_already_matches_the_setting() {
+        let section = "[Software\\\\Microsoft\\\\Avalon.Graphics] 1792627165\n#time=1dd61b8\n";
+        let with_value = format!(
+            "WINE REGISTRY Version 2\n\n{section}\"DisableHWAcceleration\"=dword:00000001\n"
+        );
+        let without_value = format!("WINE REGISTRY Version 2\n\n{section}");
+        for (enabled, user_reg, reg_runs) in [
+            (true, &with_value, false),
+            (true, &without_value, true),
+            (false, &without_value, false),
+            (false, &with_value, true),
+        ] {
+            let (fixture, paths) = managed_paths_with_runtime();
+            let project = paths.game().join("ProjectD2");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join("PD2Launcher.exe"), minimal_pe()).unwrap();
+            fs::create_dir_all(fixture.path().join("prefix")).unwrap();
+            fs::write(fixture.path().join("prefix/user.reg"), user_reg).unwrap();
+            let lease = fixture_lease(fixture.path());
+            let host = Arc::new(FailedChildHost {
+                requests: Mutex::new(Vec::new()),
+            });
+            ProductionInstallDriver::new(host.clone())
+                .with_wpf_software_rendering(enabled)
+                .run_official_launcher(fixture.path(), &lease, &OperationControl::default())
+                .unwrap();
+            let requests = host.requests.lock().unwrap();
+            let case = format!("software rendering {enabled}, user.reg {user_reg:?}");
+            // `reg` and its own `wineserver -w` run only when the value
+            // must change; then the launcher and its `wineserver -w`.
+            let reg = requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .arguments
+                        .ends_with(&wpf_software_rendering_arguments(enabled))
+                })
+                .count();
+            assert_eq!(reg, usize::from(reg_runs), "{case}");
+            assert_eq!(requests.len(), if reg_runs { 4 } else { 2 }, "{case}");
+            assert!(
+                requests[requests.len() - 2]
+                    .arguments
+                    .ends_with(&[OsString::from("PD2Launcher.exe")]),
+                "{case}"
+            );
+            assert_wineserver_wait_profile(&requests[requests.len() - 1], &paths);
+        }
+    }
+
+    #[test]
+    fn wpf_software_rendering_is_seen_only_in_the_avalon_graphics_section() {
+        let section = "[Software\\\\Microsoft\\\\Avalon.Graphics] 1792627165\n#time=1dd61b8\n";
+        let matches = |user_reg: &str| {
+            (
+                wpf_software_rendering_matches(user_reg, true),
+                wpf_software_rendering_matches(user_reg, false),
+            )
+        };
+        // Set: matches the setting on; no value: matches it off.
+        assert_eq!(
+            matches(&format!(
+                "{section}\"DisableHWAcceleration\"=dword:00000001\n"
+            )),
+            (true, false)
+        );
+        assert_eq!(matches(section), (false, true));
+        assert_eq!(matches(""), (false, true));
+        // Names in any case; a line end of Windows' kind.
+        assert_eq!(
+            matches(
+                "[software\\\\microsoft\\\\avalon.graphics] 1\r\n\"disablehwacceleration\"=dword:00000001\r\n"
+            ),
+            (true, false)
+        );
+        // Spaces at the start of a line do not count.
+        assert_eq!(
+            matches(&format!(
+                "{section}  \"DisableHWAcceleration\"=dword:00000001\n"
+            )),
+            (true, false)
+        );
+        // Another value of that name matches neither: `reg` sets it.
+        assert_eq!(
+            matches(&format!(
+                "{section}\"DisableHWAcceleration\"=dword:00000000\n"
+            )),
+            (false, false)
+        );
+        assert_eq!(
+            matches(&format!(
+                "{section}\"DisableHWAcceleration\"=dword:00000001\n\"disablehwacceleration\"=\"1\"\n"
+            )),
+            (false, false)
+        );
+        // Another value name that starts the same is not it.
+        assert_eq!(
+            matches(&format!(
+                "{section}\"DisableHWAccelerationX\"=dword:00000001\n"
+            )),
+            (false, true)
+        );
+        // The same value under another key, or after the section, is not it.
+        assert_eq!(
+            matches(
+                "[Software\\\\Microsoft\\\\Avalon.Graphics\\\\Other] 1\n\"DisableHWAcceleration\"=dword:00000001\n"
+            ),
+            (false, true)
+        );
+        assert_eq!(
+            matches(&format!(
+                "{section}\n[Software\\\\Wine] 1\n\"DisableHWAcceleration\"=dword:00000001\n"
+            )),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn tiered_compilation_is_off_under_fex_and_has_no_call_counting_on_android() {
+        assert_eq!(
+            dotnet_tiered_compilation(false),
+            [("DOTNET_TieredCompilation", "0")]
+        );
+        assert_eq!(
+            dotnet_tiered_compilation(true),
+            [
+                ("DOTNET_TieredCompilation", "1"),
+                ("DOTNET_TC_CallCounting", "0")
+            ]
+        );
+        // Each kind of host, whatever the host the test runs on.
+        for (translated, android) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (fixture, paths) = managed_paths_with_runtime();
+            app_runtime_fixture(fixture.path());
+            initialized_prefix_fixture(fixture.path());
+            let project = paths.game().join("ProjectD2");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
+            let lease = fixture_lease(fixture.path());
+            let host = Arc::new(RecordingHost::default());
+            ProductionInstallDriver::new(host.clone())
+                .on_android_host(android)
+                .with_translated_dotnet(translated)
+                .run_official_launcher(fixture.path(), &lease, &OperationControl::default())
+                .unwrap();
+            let requests = host.requests.lock().unwrap();
+            let launcher = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .arguments
+                        .ends_with(&[OsString::from(OFFICIAL_LAUNCHER)])
+                })
+                .expect("the official launcher ran");
+            // Only where its .NET runs translated (ARM64).
+            let case = format!("translated {translated}, android {android}");
+            let expected = match (translated, android) {
+                (false, _) => (None, None),
+                (true, true) => (Some("1"), Some("0")),
+                (true, false) => (Some("0"), None),
+            };
+            let value = |name| environment_value(launcher, name).and_then(OsStr::to_str);
+            assert_eq!(
+                (
+                    value("DOTNET_TieredCompilation"),
+                    value("DOTNET_TC_CallCounting")
+                ),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                value("DOTNET_EnableWriteXorExecute"),
+                translated.then_some("0"),
+                "{case}"
+            );
+            // No other Wine run gets them.
+            for request in requests
+                .iter()
+                .filter(|request| !std::ptr::eq(*request, launcher))
+            {
+                assert_eq!(
+                    environment_value(request, "DOTNET_TC_CallCounting"),
+                    None,
+                    "{case}: {:?}",
+                    request.arguments
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wpf_software_rendering_is_added_or_deleted_for_the_prefix_user() {
         assert_eq!(
             wpf_software_rendering_arguments(true),
@@ -11093,10 +11487,14 @@ mod tests {
             .unwrap();
         let exe = ANDROID_CLIENT_INSTALLER.rsplit('\\').next().unwrap();
         assert_eq!(exe, ANDROID_CLIENT_INSTALLER_NAME);
-        assert_eq!(
-            programs,
-            format!("{exe};{}.tmp", exe.trim_end_matches(".exe"))
-        );
+        // The names, without the empty one after the list's last `;`.
+        let names = programs
+            .split(';')
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        let tmp = format!("{}.tmp", exe.trim_end_matches(".exe"));
+        assert_eq!(names, [exe, tmp.as_str()]);
+        assert!(programs.ends_with(';'));
         // It runs from the program copies, which the download watch never counts.
         assert_eq!(
             ANDROID_CLIENT_INSTALLER,
@@ -11590,7 +11988,7 @@ mod tests {
                 .map(|(name, value)| (*name, (*value).to_owned()))
                 .collect::<BTreeMap<_, _>>()
         };
-        for android in [true, false] {
+        for (android, strict) in [(true, false), (true, true), (false, false), (false, true)] {
             let (fixture, paths) = managed_paths_with_runtime();
             app_runtime_fixture(fixture.path());
             initialized_prefix_fixture(fixture.path());
@@ -11599,7 +11997,9 @@ mod tests {
             fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
             let lease = fixture_lease(fixture.path());
             let host = Arc::new(RecordingHost::default());
-            let driver = ProductionInstallDriver::new(host.clone()).on_android_host(android);
+            let driver = ProductionInstallDriver::new(host.clone())
+                .on_android_host(android)
+                .with_game_strict_memory_order(strict);
             // PD2's installer, then the official launcher, each with the
             // other Wine runs around it (`reg`, Wine's update, `wineserver`).
             let bootstrap = verified_test_artifact(
@@ -11626,7 +12026,11 @@ mod tests {
                     .ends_with(&[OsString::from(OFFICIAL_LAUNCHER)])
                 {
                     launcher += 1;
-                    expected(&BOX64_LAUNCHER_ENVIRONMENT)
+                    expected(if strict {
+                        &BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT
+                    } else {
+                        &BOX64_LAUNCHER_ENVIRONMENT
+                    })
                 } else {
                     BTreeMap::new()
                 };
@@ -11634,13 +12038,128 @@ mod tests {
                 assert_eq!(
                     box64(request),
                     want,
-                    "android {android}: {:?}",
+                    "android {android}, strict {strict}: {:?}",
                     request.arguments
                 );
             }
-            assert_eq!((installer, launcher), (1, 1), "android {android}");
+            assert_eq!(
+                (installer, launcher),
+                (1, 1),
+                "android {android}, strict {strict}"
+            );
             assert!(requests.len() > 2, "the other runs were seen");
         }
+    }
+
+    #[test]
+    fn the_official_launcher_gets_detailed_logging_and_strict_memory_order_as_asked() {
+        for (strict, detailed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (fixture, paths) = managed_paths_with_runtime();
+            app_runtime_fixture(fixture.path());
+            initialized_prefix_fixture(fixture.path());
+            let project = paths.game().join("ProjectD2");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
+            let lease = fixture_lease(fixture.path());
+            let host = Arc::new(RecordingHost::default());
+            ProductionInstallDriver::new(host.clone())
+                .on_android_host(true)
+                .with_game_strict_memory_order(strict)
+                .with_detailed_logging(detailed)
+                .run_official_launcher(fixture.path(), &lease, &OperationControl::default())
+                .unwrap();
+            let requests = host.requests.lock().unwrap();
+            let launcher = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .arguments
+                        .ends_with(&[OsString::from(OFFICIAL_LAUNCHER)])
+                })
+                .expect("the official launcher ran");
+            let value = |name: &str| {
+                environment_value(launcher, name).map(|value| value.to_string_lossy().into_owned())
+            };
+            let programs = value("BOX64_DYNAREC_PROGRAMS").unwrap_or_default();
+            assert_eq!(
+                programs.contains("Game.exe:STRONGMEM"),
+                strict,
+                "strict {strict}, detailed {detailed}: {programs}"
+            );
+            let winedebug = value("WINEDEBUG").unwrap_or_default();
+            assert_eq!(
+                winedebug.contains("+winsock"),
+                detailed,
+                "strict {strict}, detailed {detailed}: {winedebug}"
+            );
+            assert_eq!(
+                value("BOX64_LOG").as_deref() == Some("1"),
+                detailed,
+                "strict {strict}, detailed {detailed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_game_that_the_official_launcher_starts_gets_what_play_gives_it() {
+        let value = |environment: &[(&'static str, &'static str)], name: &str| {
+            environment
+                .iter()
+                .find(|(found, _)| *found == name)
+                .map(|(_, value)| *value)
+        };
+        const PROGRAMS: &str = "BOX64_DYNAREC_PROGRAMS";
+        let game = crate::process::BOX64_STRICT_GAME_ENVIRONMENT;
+        // Play's settings for the game, the program list aside.
+        let play = game
+            .iter()
+            .filter(|(name, _)| *name != PROGRAMS)
+            .collect::<Vec<_>>();
+        let entry = format!(
+            "{}:{};",
+            value(&game, PROGRAMS).unwrap().trim_end_matches(';'),
+            play.iter()
+                .map(|(name, _)| name.trim_start_matches("BOX64_DYNAREC_"))
+                .collect::<Vec<_>>()
+                .join(":")
+        );
+        assert_eq!(
+            value(&BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT, PROGRAMS).unwrap(),
+            format!(
+                "{}{entry}",
+                value(&BOX64_LAUNCHER_ENVIRONMENT, PROGRAMS).unwrap()
+            )
+        );
+        // The launcher's own settings stay as they are; the game's entry
+        // takes the values that Play gives.
+        for (name, launcher) in BOX64_LAUNCHER_ENVIRONMENT
+            .iter()
+            .filter(|(name, _)| *name != PROGRAMS)
+        {
+            assert_eq!(
+                value(&BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT, name),
+                Some(*launcher),
+                "{name}"
+            );
+        }
+        for (name, played) in play {
+            assert_eq!(
+                value(&BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT, name),
+                Some(*played),
+                "{name}"
+            );
+        }
+        // And nothing else.
+        let names = |environment: &[(&'static str, &'static str)]| {
+            environment
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            names(&BOX64_LAUNCHER_STRICT_GAME_ENVIRONMENT),
+            &names(&BOX64_LAUNCHER_ENVIRONMENT) | &names(&game)
+        );
     }
 
     #[test]

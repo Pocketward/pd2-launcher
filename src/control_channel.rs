@@ -60,7 +60,7 @@ use crate::{
 };
 
 /// The protocol version this engine speaks.
-pub(crate) const PROTOCOL: u32 = 4;
+pub(crate) const PROTOCOL: u32 = 5;
 
 /// The largest frame either side may send: 1 MiB of JSON.
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -222,21 +222,35 @@ pub(crate) enum Command {
     /// Apply the Available update. The player pressed Update on Play, so
     /// the command is the confirmed intent.
     ApplyUpdate,
-    /// Play, with the app's graphics driver (`standard` when absent) and its
+    /// Play, with the app's graphics driver (`standard` when absent), its
     /// D2GL graphics profile (none when absent: `d2gl.json`'s graphics stay
-    /// as they are). The app may also send the X screen's size (`display`),
-    /// which the engine does not use: D2GL sizes the full-screen game from
-    /// the X screen itself.
+    /// as they are), and whether the game gets Box64's strict x86 memory
+    /// order (the app's Strict CPU emulation, Automatic already resolved; off
+    /// when absent), and the app's Detailed logging (off when absent; it
+    /// goes with the intent, [`Command::into_intent`]). The app may also
+    /// send the X screen's size (`display`), which the engine does not use:
+    /// D2GL sizes the full-screen game from the X screen itself.
     LaunchGame {
         #[serde(default)]
         graphics_driver: GraphicsDriver,
         #[serde(default)]
         graphics_profile: Option<GraphicsProfile>,
+        #[serde(default)]
+        strict_memory_order: bool,
+        #[serde(default)]
+        detailed_logging: bool,
     },
     /// Open the official PD2 launcher. The player pressed its own button, so
     /// the command is the confirmed intent: the launcher updates itself and
     /// is never pinned, and Android has no separate confirmation for it.
-    OpenOfficialLauncher,
+    /// Whether a game that it starts gets Box64's strict x86 memory order is
+    /// as for Play, and the app's Detailed logging (each off when absent).
+    OpenOfficialLauncher {
+        #[serde(default)]
+        strict_memory_order: bool,
+        #[serde(default)]
+        detailed_logging: bool,
+    },
     /// A confirmed Start over.
     StartOver,
     /// Resolve an unavailable install location again.
@@ -388,10 +402,22 @@ pub(crate) enum GraphicsProfile {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub(crate) enum SettingChange {
-    Renderer { renderer: Renderer },
-    DirectDrawRenderer { renderer: DirectDrawRenderer },
-    SkipToBnet { enabled: bool },
-    SoundInBackground { enabled: bool },
+    Renderer {
+        renderer: Renderer,
+    },
+    DirectDrawRenderer {
+        renderer: DirectDrawRenderer,
+    },
+    SkipToBnet {
+        enabled: bool,
+    },
+    SoundInBackground {
+        enabled: bool,
+    },
+    /// Project Diablo 2's update checks; off, the client plays as installed.
+    UpdateChecks {
+        enabled: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -412,7 +438,10 @@ pub(crate) enum DirectDrawRenderer {
 
 impl Command {
     /// The Launcher action this command asks for, or the `command_error`
-    /// reason it is refused with.
+    /// reason it is refused with. A Play and a press of the official PD2
+    /// launcher carry the app's Detailed logging in their intent, for the
+    /// Wine processes they start (a game that the official launcher starts
+    /// inherits the launcher's).
     pub(crate) fn into_intent(self) -> Result<Intent, &'static str> {
         Ok(match self {
             Self::Navigate { destination } => Intent::Navigate(match destination {
@@ -452,6 +481,8 @@ impl Command {
             Self::LaunchGame {
                 graphics_driver,
                 graphics_profile,
+                strict_memory_order,
+                detailed_logging,
             } => Intent::LaunchGame(
                 match graphics_driver {
                     GraphicsDriver::Standard => presentation::GraphicsDriver::Standard,
@@ -461,8 +492,13 @@ impl Command {
                     GraphicsProfile::Default => presentation::GraphicsProfile::Default,
                     GraphicsProfile::Performance => presentation::GraphicsProfile::Performance,
                 }),
+                strict_memory_order,
+                detailed_logging,
             ),
-            Self::OpenOfficialLauncher => Intent::OpenOfficialLauncherConfirmed,
+            Self::OpenOfficialLauncher {
+                strict_memory_order,
+                detailed_logging,
+            } => Intent::OpenOfficialLauncherConfirmed(strict_memory_order, detailed_logging),
             Self::StartOver => Intent::StartOver,
             Self::RetryLocation => Intent::RetryLocation,
             Self::ChangeSettings { change } => Intent::ChangeSettings(match change {
@@ -482,6 +518,7 @@ impl Command {
                 SettingChange::SoundInBackground { enabled } => {
                     SettingsChange::SoundInBackground(enabled)
                 }
+                SettingChange::UpdateChecks { enabled } => SettingsChange::UpdateChecks(enabled),
             }),
             Self::ExportDiagnostics => Intent::ExportDiagnostics,
             Self::RevealReport => Intent::RevealReport,
@@ -916,6 +953,9 @@ pub(crate) struct Settings {
     pub(crate) direct_draw_renderer: DirectDrawRenderer,
     pub(crate) skip_to_bnet: bool,
     pub(crate) sound_in_background: bool,
+    /// Project Diablo 2's update checks run (the default); off, none runs,
+    /// the update stays unknown and the client plays as installed.
+    pub(crate) update_checks: bool,
     pub(crate) persistence: SettingsPersistence,
 }
 
@@ -1095,6 +1135,7 @@ impl Snapshot {
                 },
                 skip_to_bnet: settings.skip_to_bnet(),
                 sound_in_background: settings.sound_in_background(),
+                update_checks: settings.update_checks(),
                 persistence: match settings.persistence() {
                     SettingsPersistenceView::Loading => SettingsPersistence::Loading,
                     SettingsPersistenceView::Saved => SettingsPersistence::Saved,
@@ -1812,8 +1853,13 @@ mod tests {
             Command::LaunchGame {
                 graphics_driver: GraphicsDriver::Compatibility,
                 graphics_profile: Some(GraphicsProfile::Performance),
+                strict_memory_order: true,
+                detailed_logging: true,
             },
-            Command::OpenOfficialLauncher,
+            Command::OpenOfficialLauncher {
+                strict_memory_order: true,
+                detailed_logging: true,
+            },
             Command::StartOver,
             Command::RetryLocation,
             Command::ChangeSettings {
@@ -1831,6 +1877,9 @@ mod tests {
             },
             Command::ChangeSettings {
                 change: SettingChange::SoundInBackground { enabled: true },
+            },
+            Command::ChangeSettings {
+                change: SettingChange::UpdateChecks { enabled: false },
             },
             Command::ExportDiagnostics,
             Command::RevealReport,
@@ -1867,7 +1916,7 @@ mod tests {
             Command::RequestSafeStop => "Request safe stop",
             Command::ApplyUpdate => "Apply Available update",
             Command::LaunchGame { .. } => "Launch Game client",
-            Command::OpenOfficialLauncher => "Open the unverified official PD2 launcher",
+            Command::OpenOfficialLauncher { .. } => "Open the unverified official PD2 launcher",
             Command::StartOver => "Start over",
             Command::RetryLocation => "Check the install location again",
             Command::ChangeSettings { change } => match change {
@@ -1875,6 +1924,7 @@ mod tests {
                 SettingChange::DirectDrawRenderer { .. } => "Change how DirectDraw draws",
                 SettingChange::SkipToBnet { .. } => "Change next-launch online shortcut",
                 SettingChange::SoundInBackground { .. } => "Change next-launch background sound",
+                SettingChange::UpdateChecks { .. } => "Change Project Diablo 2's update checks",
             },
             Command::ExportDiagnostics => "Save a redacted report",
             Command::RevealReport => "Open the report's folder",
@@ -1948,6 +1998,8 @@ mod tests {
             refused(Command::LaunchGame {
                 graphics_driver: GraphicsDriver::Standard,
                 graphics_profile: None,
+                strict_memory_order: false,
+                detailed_logging: false,
             }),
             None
         );
@@ -1963,15 +2015,20 @@ mod tests {
         };
         assert!(matches!(
             intent(r#"{"type":"launch_game"}"#),
-            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None)
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None, false, false)
         ));
         assert!(matches!(
             intent(r#"{"type":"launch_game","display":null,"graphics_driver":"compatibility"}"#),
-            Intent::LaunchGame(presentation::GraphicsDriver::Compatibility, None)
+            Intent::LaunchGame(
+                presentation::GraphicsDriver::Compatibility,
+                None,
+                false,
+                false
+            )
         ));
         assert!(matches!(
             intent(r#"{"type":"launch_game","display":null,"graphics_profile":null}"#),
-            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None)
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None, false, false)
         ));
         // The X screen's size, which the app sends, changes nothing, whatever
         // it is.
@@ -1985,7 +2042,9 @@ mod tests {
                 )),
                 Intent::LaunchGame(
                     presentation::GraphicsDriver::Standard,
-                    Some(presentation::GraphicsProfile::Performance)
+                    Some(presentation::GraphicsProfile::Performance),
+                    false,
+                    false
                 )
             ));
         }
@@ -1997,13 +2056,99 @@ mod tests {
                 intent(&format!(
                     r#"{{"type":"launch_game","display":null,"graphics_profile":"{json}"}}"#
                 )),
-                Intent::LaunchGame(presentation::GraphicsDriver::Standard, Some(chosen))
+                Intent::LaunchGame(presentation::GraphicsDriver::Standard, Some(chosen), false, false)
                     if chosen == profile
             ));
         }
         assert!(
             serde_json::from_str::<Command>(
                 r#"{"type":"launch_game","display":null,"graphics_profile":"ultra"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn play_and_the_official_launcher_carry_detailed_logging_in_their_intent_off_when_absent() {
+        let intent = |json: &str| {
+            serde_json::from_str::<Command>(json)
+                .expect("decodes")
+                .into_intent()
+                .expect("accepted")
+        };
+        assert!(matches!(
+            intent(r#"{"type":"launch_game","display":null}"#),
+            Intent::LaunchGame(_, _, false, false)
+        ));
+        assert!(matches!(
+            intent(r#"{"type":"launch_game","display":null,"detailed_logging":true}"#),
+            Intent::LaunchGame(_, _, false, true)
+        ));
+        assert!(matches!(
+            intent(r#"{"type":"open_official_launcher"}"#),
+            Intent::OpenOfficialLauncherConfirmed(false, false)
+        ));
+        assert!(matches!(
+            intent(
+                r#"{"type":"open_official_launcher","strict_memory_order":true,"detailed_logging":true}"#
+            ),
+            Intent::OpenOfficialLauncherConfirmed(true, true)
+        ));
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"open_official_launcher","detailed_logging":"yes"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn play_asks_for_strict_memory_order_only_when_it_says_so() {
+        let intent = |json: &str| {
+            serde_json::from_str::<Command>(json)
+                .expect("decodes")
+                .into_intent()
+                .expect("accepted")
+        };
+        assert!(matches!(
+            intent(r#"{"type":"launch_game","display":null,"strict_memory_order":true}"#),
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None, true, false)
+        ));
+        assert!(matches!(
+            intent(r#"{"type":"launch_game","display":null,"strict_memory_order":false}"#),
+            Intent::LaunchGame(presentation::GraphicsDriver::Standard, None, false, false)
+        ));
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"launch_game","display":null,"strict_memory_order":"on"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_official_launcher_asks_for_strict_memory_order_for_its_game_only_when_it_says_so() {
+        let intent = |json: &str| {
+            serde_json::from_str::<Command>(json)
+                .expect("decodes")
+                .into_intent()
+                .expect("accepted")
+        };
+        assert!(matches!(
+            intent(r#"{"type":"open_official_launcher"}"#),
+            Intent::OpenOfficialLauncherConfirmed(false, false)
+        ));
+        assert!(matches!(
+            intent(r#"{"type":"open_official_launcher","strict_memory_order":true}"#),
+            Intent::OpenOfficialLauncherConfirmed(true, false)
+        ));
+        assert!(matches!(
+            intent(r#"{"type":"open_official_launcher","strict_memory_order":false}"#),
+            Intent::OpenOfficialLauncherConfirmed(false, false)
+        ));
+        assert!(
+            serde_json::from_str::<Command>(
+                r#"{"type":"open_official_launcher","strict_memory_order":"on"}"#
             )
             .is_err()
         );
@@ -2094,7 +2239,13 @@ mod tests {
             decode_command(&frame(serde_json::json!({
                 "type": "command", "seq": 8, "intent": {"type": "open_official_launcher"}
             }))),
-            Ok((8, Command::OpenOfficialLauncher))
+            Ok((
+                8,
+                Command::OpenOfficialLauncher {
+                    strict_memory_order: false,
+                    detailed_logging: false
+                }
+            ))
         ));
         assert!(matches!(
             decode_command(&frame(serde_json::json!({
@@ -2192,6 +2343,7 @@ mod tests {
             .with_settings(
                 LaunchSettingsView::new(RendererPreferenceView::DirectDraw, false, true)
                     .with_direct_draw_renderer(DirectDrawRendererView::OpenGl)
+                    .with_update_checks(false)
                     .failed("settings-unwritable"),
             )
             .with_download_sources(vec![DownloadSourceView {
@@ -2508,6 +2660,58 @@ mod tests {
             }
         }
         assert_eq!(errors, vec![(7, "install-not-permitted".to_owned())]);
+    }
+
+    #[test]
+    fn a_command_the_channel_refuses_changes_nothing_for_the_next_one() {
+        let write = |stream: &mut UnixStream, seq: u64, intent: serde_json::Value| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "command", "seq": seq, "intent": intent
+            }))
+            .unwrap();
+            stream
+                .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                .unwrap();
+            stream.write_all(&body).unwrap();
+        };
+        let (mut app, engine) = UnixStream::pair().unwrap();
+        // The service's queue is full: the first Play is refused.
+        let (intents, received) = std::sync::mpsc::sync_channel(1);
+        intents.send(Intent::CheckAgain).unwrap();
+        let outbox = Outbox::default();
+        let taken = AtomicU64::new(0);
+        let server = std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve_commands(&engine, &intents, &outbox, &taken));
+            write(
+                &mut app,
+                1,
+                serde_json::json!({"type": "launch_game", "display": null, "detailed_logging": true}),
+            );
+            // Once that Play is refused, the queue has room again.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while outbox.state.lock().unwrap().errors.is_empty() {
+                assert!(Instant::now() < deadline, "no refusal");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(received.recv().unwrap(), Intent::CheckAgain));
+            write(
+                &mut app,
+                2,
+                serde_json::json!({"type": "launch_game", "display": null}),
+            );
+            let next = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(app);
+            (serving.join().unwrap(), next)
+        });
+        assert_eq!(server.0, 0);
+        // The refused Play's Detailed logging reaches nothing: the next
+        // Play's intent has its own value.
+        assert!(matches!(server.1, Intent::LaunchGame(_, _, false, false)));
+        outbox.close();
+        assert!(matches!(
+            outbox.next(),
+            Some(Outgoing::Error(1, reason)) if reason == "engine-busy"
+        ));
     }
 
     #[test]

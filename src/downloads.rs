@@ -262,11 +262,21 @@ pub(crate) fn readiness(root: &Directory) -> DownloadReadiness {
 /// [`readiness`] on the Android host (`android`) or the desktop. Only the
 /// recorded files the current plan downloads on that host count
 /// ([`counted`]), and only their bytes.
-fn readiness_on(root: &Directory, android: bool) -> DownloadReadiness {
+pub(crate) fn readiness_on(root: &Directory, android: bool) -> DownloadReadiness {
     let Some(record) = read(root) else {
         return DownloadReadiness::Incomplete;
     };
-    if record.schema != SCHEMA || record.items.is_empty() || record.items.len() > MAX_ITEMS {
+    // An import on the Android host downloads nothing: the app provides the
+    // game environment, and the folder brings Diablo II, Lord of
+    // Destruction and Project Diablo 2 (the owner's import rule of
+    // 2026-10-26). Its record without a file is complete. Any other record
+    // without a file is not.
+    let nothing_to_download =
+        android && record.plan == DownloadPlan::ExistingInstall && record.items.is_empty();
+    if record.schema != SCHEMA
+        || (record.items.is_empty() && !nothing_to_download)
+        || record.items.len() > MAX_ITEMS
+    {
         return DownloadReadiness::Incomplete;
     }
     let mut uncounted = 0_u64;
@@ -673,6 +683,36 @@ mod tests {
                 "{gone}"
             );
         }
+    }
+
+    /// An import on the Android host downloads nothing: its record without a
+    /// file is complete and serves the import. A record without a file for
+    /// Blizzard's installers, or on the desktop, is not.
+    #[test]
+    fn on_android_an_imports_download_with_nothing_to_fetch_is_complete() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = Directory::open(fixture.path()).unwrap();
+        let fresh = DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, false);
+        assert_eq!(readiness_on(&root, true), DownloadReadiness::Incomplete);
+        assert_eq!(
+            record(&root, DownloadPlan::ExistingInstall, fresh, &[]).unwrap(),
+            0
+        );
+        let android = readiness_on(&root, true);
+        assert_eq!(
+            android,
+            DownloadReadiness::Complete {
+                plan: DownloadPlan::ExistingInstall,
+                total_bytes: 0,
+                reach: DownloadReach::BaseGame,
+                prefix: false,
+            }
+        );
+        assert!(android.serves(DownloadPlan::ExistingInstall, fresh));
+        assert!(!android.serves(DownloadPlan::Installers, fresh));
+        assert_eq!(readiness_on(&root, false), DownloadReadiness::Incomplete);
+        record(&root, DownloadPlan::Installers, fresh, &[]).unwrap();
+        assert_eq!(readiness_on(&root, true), DownloadReadiness::Incomplete);
     }
 
     #[test]

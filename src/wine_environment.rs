@@ -148,6 +148,52 @@ pub(crate) fn use_compatibility_driver(compatibility: bool) {
     );
 }
 
+/// Wine's debug channels that Detailed logging adds: each line's time and
+/// process, every exception, each DLL that loads, and Winsock, whose
+/// connects, closes and errors the engine keeps and whose other lines (one
+/// for each send, receive and wait) it drops
+/// ([`crate::activity::winsock_line`]).
+pub(crate) const DETAILED_WINEDEBUG: &str = "+timestamp,+pid,warn+seh,+loaddll,+winsock";
+
+/// What a Wine process of the game or the official launcher gets for the
+/// Android app's Detailed logging (`detailed`, which a Play or a press of
+/// the official launcher carries) over `winedebug`, its own debug channels:
+/// those with [`DETAILED_WINEDEBUG`], and Box64's log (the settings it took
+/// and the CPU it found). Nothing while Detailed logging is off.
+pub(crate) fn detailed_settings(detailed: bool, winedebug: &str) -> Vec<Setting> {
+    if !detailed {
+        return Vec::new();
+    }
+    vec![
+        Setting::new(
+            "WINEDEBUG",
+            format!("{winedebug},{DETAILED_WINEDEBUG}"),
+            Kind::Preference,
+        ),
+        Setting::new("BOX64_LOG", "1", Kind::Preference),
+    ]
+}
+
+/// The log line with the Box64 settings that `program` (a path or a name)
+/// starts with: every `BOX64_*` of its `environment` ([`compose`] puts them
+/// in name order); none when it has none (the desktop).
+pub(crate) fn box64_line(program: &str, environment: &[(OsString, OsString)]) -> Option<String> {
+    let settings = environment
+        .iter()
+        .filter(|(name, _)| name.as_bytes().starts_with(b"BOX64_"))
+        .map(|(name, value)| format!("{}={}", name.to_string_lossy(), value.to_string_lossy()))
+        .collect::<Vec<_>>();
+    if settings.is_empty() {
+        return None;
+    }
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    // A setting from the host can name a path in the home folder.
+    Some(crate::activity::redacted(&format!(
+        "pd2-launcher: Box64 for {name}: {}",
+        settings.join(" ")
+    )))
+}
+
 /// Whether the host's `name` reaches Wine.
 fn passes_through(name: &OsStr, value: &OsStr, android: bool) -> bool {
     let name = name.as_bytes();
@@ -345,6 +391,38 @@ mod tests {
         assert_eq!(get(&compatibility, "TU_DEBUG"), Some("sysmem,noubwc,nolrz"));
         assert_eq!(get(&desktop, "TU_DEBUG"), Some("sysmem"));
         assert_eq!(get(&compose_on(app, &[], true), "TU_DEBUG"), Some("sysmem"));
+    }
+
+    #[test]
+    fn detailed_logging_adds_wine_channels_and_box64s_log_over_the_programs_own() {
+        assert!(detailed_settings(false, "fixme-all").is_empty());
+        let mut settings = vec![Setting::new("WINEDEBUG", "fixme-all", Kind::Preference)];
+        settings.extend(detailed_settings(true, "fixme-all"));
+        let environment = compose_on(host(&[("BOX64_LOG", "0")]), &settings, true);
+        assert_eq!(
+            get(&environment, "WINEDEBUG"),
+            Some("fixme-all,+timestamp,+pid,warn+seh,+loaddll,+winsock")
+        );
+        assert_eq!(get(&environment, "BOX64_LOG"), Some("1"));
+    }
+
+    #[test]
+    fn the_box64_line_names_the_program_and_its_box64_settings_only() {
+        let environment = host(&[
+            ("BOX64_NOBANNER", "1"),
+            ("BOX64_DYNAREC_PROGRAMS", "Game.exe;"),
+            ("WINEDEBUG", "fixme-all"),
+        ]);
+        assert_eq!(
+            box64_line("C:\\Diablo II\\ProjectD2\\Game.exe", &environment).as_deref(),
+            Some(
+                "pd2-launcher: Box64 for Game.exe: BOX64_NOBANNER=1 BOX64_DYNAREC_PROGRAMS=Game.exe;"
+            )
+        );
+        assert_eq!(
+            box64_line("Game.exe", &host(&[("WINEDEBUG", "-all")])),
+            None
+        );
     }
 
     #[test]

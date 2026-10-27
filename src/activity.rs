@@ -184,26 +184,268 @@ pub(crate) fn redacted(text: &str) -> String {
     live_redactor().text(text)
 }
 
+/// [`redacted`] for a line of the game's own logs: a row of a crash report's
+/// memory dump keeps its hex words ([`Redactor::game_log_text`]).
+pub(crate) fn redacted_game_log(text: &str) -> String {
+    live_redactor().game_log_text(text)
+}
+
 fn live_redactor() -> &'static Redactor {
     static LIVE: std::sync::OnceLock<Redactor> = std::sync::OnceLock::new();
     LIVE.get_or_init(Redactor::from_environment)
 }
 
 /// One line a running program wrote, for the progress log as it happens.
-pub(crate) fn live_output(line: &str) {
-    let line = redacted(line.trim_end());
-    let line = line.as_str();
-    if line.trim().is_empty() {
+/// A line of Wine's Winsock channel (Detailed logging) goes to standard
+/// error alone, and only when [`winsock_line`] keeps it. The line's class
+/// comes first: Wine writes a Winsock line for each call, and the many it
+/// drops need no redaction.
+pub(crate) fn live_output(line: &str, detailed: bool) {
+    let raw = line.trim_end();
+    if raw.trim().is_empty() {
         return;
     }
-    // Also on standard error, where DroidDeck's session log keeps it.
-    eprintln!("pd2-launcher: | {}", bounded(line, 300));
+    if NETWORK_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed) {
+        network_lines(|lines, millis| lines.second_passed(millis));
+    }
+    match winsock_line(raw) {
+        WinsockLine::Other => {}
+        WinsockLine::Dropped => return,
+        WinsockLine::Kept(event) => {
+            let event = redacted(&event);
+            network_lines(|lines, millis| lines.event(millis, &event));
+            return;
+        }
+    }
+    let line = redacted(raw);
+    let line = line.as_str();
+    // Also on standard error, where DroidDeck's session log keeps it. With
+    // Detailed logging longer, so a .NET stack trace keeps its lines.
+    let limit = output_line_limit(detailed);
+    eprintln!("pd2-launcher: | {}", bounded(line, limit));
     if let Ok(mut recent) = RECENT.lock() {
         if recent.len() == RECENT_LINES {
             recent.pop_front();
         }
         recent.push_back(format!("  {}", bounded(line, 300)));
         RECENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How long a program's output line on standard error may be: with Detailed
+/// logging longer, so a .NET stack trace keeps its lines.
+const fn output_line_limit(detailed: bool) -> usize {
+    if detailed { 1000 } else { 300 }
+}
+
+/// What [`live_output`] does with a line of a program's output.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum WinsockLine {
+    /// Not Wine's Winsock channel: shown as it is.
+    Other,
+    /// A Winsock line of no use (a send, a receive, a wait): left out.
+    Dropped,
+    /// A Winsock line kept: Wine's process and thread, the function and its
+    /// words, without Wine's own clock.
+    Kept(String),
+}
+
+/// The Winsock functions whose lines Detailed logging keeps: connects and
+/// closes, with the address, and name lookups. Errors and warnings are
+/// kept from every function.
+const WINSOCK_KEPT: [&str; 10] = [
+    "connect",
+    "WSAConnect",
+    "WS2_ConnectEx",
+    "closesocket",
+    "shutdown",
+    "WSASocketW",
+    "getaddrinfo",
+    "GetAddrInfoW",
+    "GetAddrInfoExW",
+    "gethostbyname",
+];
+
+/// `line` as a line of Wine's Winsock debug channel
+/// (`[time:][pid:]tid:class:winsock:function words`), which Detailed logging
+/// turns on ([`crate::wine_environment::DETAILED_WINEDEBUG`]): Wine writes one
+/// for each call, so most go.
+pub(crate) fn winsock_line(line: &str) -> WinsockLine {
+    let Some(at) = line.find(":winsock:") else {
+        return WinsockLine::Other;
+    };
+    let mut head = line[..at].split(':').collect::<Vec<_>>();
+    let class = head.pop().unwrap_or_default();
+    let rest = &line[at + ":winsock:".len()..];
+    let (function, words) = rest.split_once(' ').unwrap_or((rest, ""));
+    let error = matches!(class, "err" | "warn");
+    if !error && !WINSOCK_KEPT.contains(&function) {
+        return WinsockLine::Dropped;
+    }
+    // Wine's own clock (`123.456`) is time since boot: the engine gives its own.
+    let ids = head
+        .into_iter()
+        .filter(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut kept = String::new();
+    if !ids.is_empty() {
+        kept.push_str(&ids);
+        kept.push(' ');
+    }
+    if error {
+        kept.push_str(class);
+        kept.push(' ');
+    }
+    kept.push_str(function);
+    if !words.trim().is_empty() {
+        kept.push(' ');
+        kept.push_str(words.trim());
+    }
+    WinsockLine::Kept(bounded(&kept, 300))
+}
+
+/// At most this many network lines a second; the rest are counted.
+const NETWORK_LINES_PER_SECOND: u32 = 20;
+
+/// The network lines of one wall-clock second: those written, and those left
+/// out, whose count goes out once that second is over (at the next line of
+/// any program, or when a program's output ends) with the second it
+/// belongs to.
+#[derive(Debug, Default)]
+pub(crate) struct NetworkLines {
+    second: u64,
+    lines: u32,
+    left_out: u32,
+}
+
+impl NetworkLines {
+    /// The lines to write for a kept Winsock `event` at `millis` (UTC, ms
+    /// since 1970).
+    pub(crate) fn event(&mut self, millis: u64, event: &str) -> Vec<String> {
+        let mut out = self.second_passed(millis);
+        let second = millis / 1000;
+        if self.lines > 0 && second == self.second {
+            if self.lines >= NETWORK_LINES_PER_SECOND {
+                self.left_out += 1;
+                return out;
+            }
+            self.lines += 1;
+        } else {
+            self.second = second;
+            self.lines = 1;
+        }
+        out.push(format!(
+            "pd2-launcher: network {} {event}",
+            crate::report::utc_time_millis(millis)
+        ));
+        out
+    }
+
+    /// The count of the lines left out, once their second is over at
+    /// `millis`.
+    pub(crate) fn second_passed(&mut self, millis: u64) -> Vec<String> {
+        if millis / 1000 == self.second {
+            return Vec::new();
+        }
+        self.flush().into_iter().collect()
+    }
+
+    /// The count of the lines left out so far, if any.
+    pub(crate) fn flush(&mut self) -> Option<String> {
+        if self.left_out == 0 {
+            return None;
+        }
+        let line = format!(
+            "pd2-launcher: network: {} more lines in the second from {} were left out",
+            self.left_out,
+            crate::report::utc_time_millis(self.second * 1000)
+        );
+        self.left_out = 0;
+        Some(line)
+    }
+
+    fn left_out(&self) -> bool {
+        self.left_out > 0
+    }
+}
+
+static NETWORK_LINES: std::sync::Mutex<NetworkLines> = std::sync::Mutex::new(NetworkLines {
+    second: 0,
+    lines: 0,
+    left_out: 0,
+});
+/// Whether [`NETWORK_LINES`] has a count to write: each output line then
+/// looks whether its second is over.
+static NETWORK_LEFT_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `step` on the network lines at the time now; its lines go to standard
+/// error.
+fn network_lines(step: impl FnOnce(&mut NetworkLines, u64) -> Vec<String>) {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    let Ok(mut lines) = NETWORK_LINES.lock() else {
+        return;
+    };
+    for line in step(&mut lines, millis) {
+        eprintln!("{line}");
+    }
+    NETWORK_LEFT_OUT.store(lines.left_out(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A program's output ended (it stopped): the count of network lines left
+/// out so far.
+pub(crate) fn output_ended() {
+    if NETWORK_LEFT_OUT.load(std::sync::atomic::Ordering::Relaxed) {
+        network_lines(|lines, _| lines.flush().into_iter().collect());
+    }
+}
+
+/// What the capture that a program's result keeps ([`crate::host_execution`])
+/// does with a line of its output.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CaptureLine {
+    Keep,
+    /// Wine's `+loaddll` lines and the Winsock lines that [`winsock_line`]
+    /// drops: the capture of a failed program then holds its error.
+    Drop,
+    /// A Winsock line that [`winsock_line`] keeps: at most
+    /// [`NETWORK_LINES_PER_SECOND`] a second ([`CaptureNetworkLines`]).
+    Network,
+}
+
+/// The capture's [`CaptureLine`] for `line`. `engine.log` has every line
+/// but the dropped Winsock lines.
+pub(crate) fn capture_line(line: &[u8]) -> CaptureLine {
+    let line = String::from_utf8_lossy(line);
+    if line.contains(":trace:loaddll:") {
+        return CaptureLine::Drop;
+    }
+    match winsock_line(&line) {
+        WinsockLine::Other => CaptureLine::Keep,
+        WinsockLine::Dropped => CaptureLine::Drop,
+        WinsockLine::Kept(_) => CaptureLine::Network,
+    }
+}
+
+/// The network lines one capture takes in a second of the wall clock.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureNetworkLines {
+    second: u64,
+    lines: u32,
+}
+
+impl CaptureNetworkLines {
+    /// Whether the capture takes a network line at `second` (seconds since
+    /// 1970).
+    pub(crate) fn take(&mut self, second: u64) -> bool {
+        if second != self.second {
+            self.second = second;
+            self.lines = 0;
+        }
+        self.lines += 1;
+        self.lines <= NETWORK_LINES_PER_SECOND
     }
 }
 
@@ -714,11 +956,136 @@ mod tests {
     }
 
     #[test]
+    fn winsock_lines_keep_connects_closes_lookups_and_errors_only() {
+        assert_eq!(
+            winsock_line(
+                "123.456:0020:0024:trace:winsock:connect socket 0x1a4, addr { family AF_INET, \
+                 address 35.225.107.249, port 6112 }, len 16"
+            ),
+            WinsockLine::Kept(
+                "0020:0024 connect socket 0x1a4, addr { family AF_INET, address 35.225.107.249, \
+                 port 6112 }, len 16"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            winsock_line("0024:trace:winsock:closesocket 0x1a4"),
+            WinsockLine::Kept("0024 closesocket 0x1a4".to_owned())
+        );
+        assert_eq!(
+            winsock_line("0020:0024:warn:winsock:WS2_recv_base unsupported flags 0x10"),
+            WinsockLine::Kept("0020:0024 warn WS2_recv_base unsupported flags 0x10".to_owned())
+        );
+        assert_eq!(
+            winsock_line(
+                "123.456:0020:0024:trace:winsock:WS2_recv_base socket 0x1a4, buffers 0x22f000, \
+                 buffer_count 1, flags 0"
+            ),
+            WinsockLine::Dropped
+        );
+        assert_eq!(
+            winsock_line("0020:0024:trace:winsock:select read 0x22f100, timeout 0x0"),
+            WinsockLine::Dropped
+        );
+        assert_eq!(
+            winsock_line("0020:0024:trace:seh:dispatch_exception code=c0000005"),
+            WinsockLine::Other
+        );
+        assert_eq!(winsock_line("[BOX64] Using Box64"), WinsockLine::Other);
+    }
+
+    #[test]
+    fn network_lines_are_limited_each_second_and_the_count_names_its_second() {
+        let start = 1_792_886_400_000;
+        let mut lines = NetworkLines::default();
+        let written = (0..25)
+            .flat_map(|index| lines.event(start + index, "connect x"))
+            .collect::<Vec<_>>();
+        assert_eq!(written.len(), 20, "{written:?}");
+        // A minute later, the count of that second comes first, with its time.
+        let later = lines.event(start + 61_000, "closesocket 0x1a4");
+        assert_eq!(
+            later,
+            [
+                format!(
+                    "pd2-launcher: network: 5 more lines in the second from {} were left out",
+                    crate::report::utc_time_millis(start)
+                ),
+                format!(
+                    "pd2-launcher: network {} closesocket 0x1a4",
+                    crate::report::utc_time_millis(start + 61_000)
+                ),
+            ]
+        );
+        // A count with no network line after it: when its second is over (at
+        // another program line), or when a program's output ends.
+        for index in 1..22 {
+            lines.event(start + 61_000 + index, "connect y");
+        }
+        assert!(lines.second_passed(start + 61_900).is_empty());
+        let over = lines.second_passed(start + 62_000);
+        assert_eq!(over.len(), 1);
+        assert!(
+            over[0].contains(": 2 more lines in the second from"),
+            "{over:?}"
+        );
+        assert_eq!(lines.flush(), None);
+        lines.event(start + 63_000, "connect z");
+        for index in 1..21 {
+            lines.event(start + 63_000 + index, "connect z");
+        }
+        assert!(
+            lines
+                .flush()
+                .is_some_and(|line| line.contains(": 1 more lines"))
+        );
+    }
+
+    #[test]
+    fn the_capture_keeps_all_but_wine_noise_and_network_lines_twenty_a_second() {
+        assert_eq!(
+            capture_line(b"0020:0024:trace:loaddll:build_module Loaded L\"ntdll.dll\": builtin"),
+            CaptureLine::Drop
+        );
+        assert_eq!(
+            capture_line(b"0020:0024:trace:winsock:select read 0x22f100"),
+            CaptureLine::Drop
+        );
+        assert_eq!(
+            capture_line(b"0020:0024:trace:winsock:connect socket 0x1a4"),
+            CaptureLine::Network
+        );
+        assert_eq!(
+            capture_line(b"0020:0024:warn:winsock:WS2_recv_base unsupported flags"),
+            CaptureLine::Network
+        );
+        assert_eq!(
+            capture_line(b"err:module:import_dll Library X.dll not found"),
+            CaptureLine::Keep
+        );
+        assert_eq!(capture_line(b""), CaptureLine::Keep);
+        let mut network = CaptureNetworkLines::default();
+        let taken = (0..25).filter(|_| network.take(1_792_886_400)).count();
+        assert_eq!(taken, 20);
+        assert!(network.take(1_792_886_401));
+    }
+
+    #[test]
+    fn detailed_logging_shows_longer_output_lines() {
+        assert_eq!(output_line_limit(false), 300);
+        assert_eq!(output_line_limit(true), 1000);
+        let line = "y".repeat(900);
+        assert_eq!(bounded(&line, output_line_limit(true)), line);
+        assert!(bounded(&line, output_line_limit(false)).len() < line.len());
+    }
+
+    #[test]
     fn live_output_masks_keys_and_the_home_folder() {
         let home = std::env::var("HOME").unwrap_or_default();
-        live_output(&format!(
-            "installer --key1=ABCDEFGHJKLMNPQRSTVWXYZ234 at {home}/.pd2launcher/game"
-        ));
+        live_output(
+            &format!("installer --key1=ABCDEFGHJKLMNPQRSTVWXYZ234 at {home}/.pd2launcher/game"),
+            false,
+        );
         let shown = recent_lines(RECENT_LINES)
             .into_iter()
             .rfind(|line| line.contains("installer"))

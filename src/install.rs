@@ -1114,6 +1114,25 @@ pub(crate) trait ClientSynchronizer {
         paths: &ManagedPaths,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure>;
+
+    /// Record the client installed in the game folder as the accepted one,
+    /// as it is: no client file is downloaded or changed. Each file of the
+    /// current manifest that is there is recorded with its own MD5.
+    fn accept_installed(
+        &self,
+        paths: &ManagedPaths,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure>;
+
+    /// Record the client that an import copied as the accepted one, from
+    /// the copied files alone ([`crate::update::CopiedClientPd2Source`]):
+    /// no file list from PD2's server, no download, no file changed. A
+    /// record the folder brought (another PD2 Launcher's) is replaced.
+    fn record_copied(
+        &self,
+        paths: &ManagedPaths,
+        control: &OperationControl,
+    ) -> Result<(), AdapterFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1329,6 +1348,10 @@ impl InstallOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InstallError {
     ManagedRootInvalid,
+    /// With the update checks off, the Project Diablo 2 in the game folder
+    /// cannot be kept as it is (no Game.exe or ProjectDiablo.dll, a file of
+    /// its record gone, or its file list unreadable). Nothing replaces it.
+    ClientNotKept,
     /// The recorded game folder used in place is unavailable.
     GameFolderUnavailable,
     InstallationBusy,
@@ -1410,6 +1433,9 @@ pub(crate) struct ManagedInstaller<'a> {
     /// The Download job runs: acquisitions are downloads. In the install
     /// jobs they only reverify the cache ahead of installing.
     downloading: std::cell::Cell<bool>,
+    /// The player turned Project Diablo 2's update checks off: a Project
+    /// Diablo 2 already in the game folder is kept as it is.
+    client_as_installed: bool,
 }
 
 /// What the Download job verified.
@@ -1434,7 +1460,16 @@ impl<'a> ManagedInstaller<'a> {
             client,
             catalog,
             downloading: std::cell::Cell::new(false),
+            client_as_installed: false,
         }
+    }
+
+    /// With Project Diablo 2's update checks off, a Project Diablo 2 already
+    /// in the game folder (an import's) is accepted as it is installed, of
+    /// any version or modded, instead of brought up to date.
+    pub(crate) fn with_client_as_installed(mut self, as_installed: bool) -> Self {
+        self.client_as_installed = as_installed;
+        self
     }
 
     #[cfg(test)]
@@ -1549,7 +1584,11 @@ impl<'a> ManagedInstaller<'a> {
             InstallationStatus::NeedsExpansion if installers => &[VendorProduct::Expansion],
             _ => &[],
         };
-        let client = status != InstallationStatus::NeedsRuntime;
+        // On the Android host an import brings its own Project Diablo 2
+        // (the folder check asks for it) and records it as it is: neither
+        // the PD2 installer nor the client is downloaded for it.
+        let client = status != InstallationStatus::NeedsRuntime
+            && !(report.android_host && plan == DownloadPlan::ExistingInstall);
         let needs = report.prefix_needs;
         let prefix_needed = report.prefix != CheckStatus::Satisfied;
         // What these downloads reach, so a later need beyond it (after Start
@@ -1862,9 +1901,51 @@ impl<'a> ManagedInstaller<'a> {
         }
         check_cancelled(control)?;
         completed_stages.push(InstallStage::Import);
-        let report = self.audit(&paths)?;
+        // The game folder is read again: a folder used in place is the game
+        // folder from now on (the driver wrote its record), and its
+        // ProjectD2 is the one to record.
+        let paths = ManagedPaths::prepare(managed_root)?;
+        let mut report = self.audit(&paths)?;
         check_host(report.host)?;
         check_recovery_status(report.status)?;
+        // On the Android host the import records the Project Diablo 2 it
+        // copied, as it is, from the copied files alone: no update, no
+        // download, no PD2 installer and no file list from PD2's server,
+        // whatever the update checks (the owner's rule of 2026-10-26). The
+        // folder check asked for its Game.exe, ProjectDiablo.dll and
+        // PD2Launcher.exe. Play's update check then offers the update.
+        let recorded = report.android_host
+            && matches!(
+                report.status,
+                InstallationStatus::NeedsClient | InstallationStatus::Ready
+            )
+            && has_project_diablo(&paths);
+        if recorded {
+            {
+                let _lease = MutationLease::acquire(&paths)?;
+                self.client
+                    .record_copied(&paths, control)
+                    .map_err(|_| stage_failure(control, InstallStage::Import))?;
+                // Without the mark the first Play only asks a question that
+                // an Update with nothing to download answers.
+                if mark_copied_client(&paths).is_err() {
+                    eprintln!(
+                        "pd2-launcher: the mark of the copied client's record could not be written: the first Play asks for the update"
+                    );
+                }
+            }
+            check_cancelled(control)?;
+            report = self.audit(&paths)?;
+            check_host(report.host)?;
+            check_recovery_status(report.status)?;
+            if report.status != InstallationStatus::Ready {
+                return Err(InstallError::EvidenceDidNotAdvance {
+                    stage: InstallStage::Import,
+                    expected: InstallationStatus::Ready,
+                    observed: report.status,
+                });
+            }
+        }
         // A folder used in place may bring the Project Diablo 2 this
         // Launcher installed elsewhere (its ProjectD2 with the update
         // namespace), and so may a copy on the desktop, which brings
@@ -1873,7 +1954,7 @@ impl<'a> ManagedInstaller<'a> {
         // there leaves ProjectD2 out.
         let accepted = report.status == InstallationStatus::NeedsClient
             || (report.status == InstallationStatus::Ready
-                && (mode == ImportMode::InPlace || !report.android_host));
+                && (mode == ImportMode::InPlace || !report.android_host || recorded));
         if !accepted {
             return Err(InstallError::EvidenceDidNotAdvance {
                 stage: InstallStage::Import,
@@ -1894,7 +1975,10 @@ impl<'a> ManagedInstaller<'a> {
     /// that component first. A ProjectD2 already in the game folder (one
     /// the official PD2 launcher or the PD2 installer put there, brought by
     /// an imported Diablo II) is adopted instead: brought up to date like an
-    /// update, with no PD2 installer. Ends at `Ready`.
+    /// update, with no PD2 installer; with the update checks off, accepted
+    /// as it is ([`Self::with_client_as_installed`]). On the Android host an
+    /// import records its Project Diablo 2 itself ([`Self::import_existing`]),
+    /// so this step does not run after it. Ends at `Ready`.
     pub(crate) fn install_project_diablo(
         &mut self,
         managed_root: &Path,
@@ -1920,6 +2004,19 @@ impl<'a> ManagedInstaller<'a> {
         if report.runtime != CheckStatus::Satisfied || report.prefix != CheckStatus::Satisfied {
             report = self.ensure_runtime(&paths, report, control)?;
             completed_stages.push(InstallStage::ManagedRuntime);
+        }
+        // With the update checks off, a Project Diablo 2 already there is
+        // kept as it is, or the step stops: the PD2 installer would replace
+        // the version the player keeps.
+        if report.status == InstallationStatus::NeedsClient
+            && self.client_as_installed
+            && has_project_folder(&paths)
+            && !has_project_diablo(&paths)
+        {
+            eprintln!(
+                "pd2-launcher: the Project Diablo 2 in the game folder has no Game.exe or ProjectDiablo.dll, and the update checks are off: it is not replaced"
+            );
+            return Err(InstallError::ClientNotKept);
         }
         if report.status == InstallationStatus::NeedsClient
             && has_project_diablo(&paths)
@@ -2196,12 +2293,21 @@ impl<'a> ManagedInstaller<'a> {
     ) -> Result<Option<InstallAudit>, InstallError> {
         check_cancelled(control)?;
         eprintln!(
-            "pd2-launcher: Project Diablo 2 found in the game folder: updating it in place, the PD2 installer is not run"
+            "pd2-launcher: Project Diablo 2 found in the game folder: {}, the PD2 installer is not run",
+            if self.client_as_installed {
+                "the update checks are off, so it is kept as it is"
+            } else {
+                "updating it in place"
+            }
         );
         control.report(WorkProgress::for_phase(WorkPhase::ClientManifest));
         let synchronized = {
             let _lease = MutationLease::acquire(paths)?;
-            self.client.synchronize(paths, control)
+            if self.client_as_installed {
+                self.client.accept_installed(paths, control)
+            } else {
+                self.client.synchronize(paths, control)
+            }
         };
         check_cancelled(control)?;
         if synchronized.is_ok() {
@@ -2211,6 +2317,20 @@ impl<'a> ManagedInstaller<'a> {
             if report.status == InstallationStatus::Ready {
                 return Ok(Some(report));
             }
+        }
+        // The PD2 installer would replace the version the player keeps: the
+        // step fails instead, and the files stay as they are.
+        if self.client_as_installed {
+            eprintln!(
+                "pd2-launcher: the Project Diablo 2 found in the game folder could not be accepted as it is ({}): it is not replaced",
+                match synchronized {
+                    Ok(()) => "the audit after it was not Ready",
+                    Err(_) => {
+                        "a file of its record is gone, a file changed or was unreadable, or the manifest could not be read"
+                    }
+                }
+            );
+            return Err(InstallError::ClientNotKept);
         }
         eprintln!(
             "pd2-launcher: the Project Diablo 2 found in the game folder could not be updated in place: running the PD2 installer"
@@ -2301,6 +2421,59 @@ impl<'a> ManagedInstaller<'a> {
 /// Whether the game folder holds a Project Diablo 2 to adopt: a ProjectD2
 /// with the client's launch files (`Game.exe`, `ProjectDiablo.dll`) present
 /// and not empty. Anything less is installed by the PD2 installer.
+/// The game folder has a ProjectD2 with something in it besides the
+/// Launcher's own records.
+fn has_project_folder(paths: &ManagedPaths) -> bool {
+    paths
+        .open_game()
+        .and_then(|game| game.open_directory(Path::new("ProjectD2")))
+        .and_then(|project| project.names())
+        .is_ok_and(|names| names.iter().any(|name| name != ".pd2launcher"))
+}
+
+/// The mark, in the Managed prefix, of the record that an import wrote
+/// from the copied files: the SHA-256 of that record. Play's update check
+/// then compares PD2's manifest with the files themselves, once
+/// ([`is_copied_client_record`]): a client that already is the current
+/// release gets PD2's record with no question. A later record (an update's)
+/// has another SHA-256, so the mark no longer counts; Start over removes it
+/// with the prefix.
+pub(crate) const COPIED_CLIENT_MARK: &str = ".pd2launcher-copied-client";
+
+/// Write [`COPIED_CLIENT_MARK`] for the record in the game folder. The
+/// caller holds the installation lease.
+fn mark_copied_client(paths: &ManagedPaths) -> std::io::Result<()> {
+    let mut record = Vec::new();
+    paths
+        .open_game()?
+        .open_file(Path::new("ProjectD2/.pd2launcher/accepted-manifest.json"))?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut record)?;
+    paths
+        .directory()
+        .open_directory(Path::new("prefix"))?
+        .atomic_write(
+            OsStr::new(COPIED_CLIENT_MARK),
+            sha256_hex(&record).as_bytes(),
+        )
+}
+
+/// Whether `accepted`, the client's record, is the one that an import wrote
+/// from the copied files (its mark in the Managed prefix below `root`).
+pub(crate) fn is_copied_client_record(root: &Directory, accepted: &[u8]) -> bool {
+    let mut mark = String::new();
+    root.open_file(&Path::new("prefix").join(COPIED_CLIENT_MARK))
+        .and_then(|file| file.take(128).read_to_string(&mut mark))
+        .is_ok_and(|_| mark.trim() == sha256_hex(accepted))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn has_project_diablo(paths: &ManagedPaths) -> bool {
     let Ok(game) = paths.open_game() else {
         return false;
@@ -4587,6 +4760,9 @@ mod tests {
         wrapper_download_failure: std::cell::Cell<Option<VendorFailure>>,
         wrapper_download_stalls: std::cell::Cell<usize>,
         fail_import: bool,
+        /// The import writes the records the real driver writes (a folder
+        /// used in place, and the import record).
+        writes_records: bool,
     }
 
     impl InstallDriver for RecordingDriver {
@@ -4678,7 +4854,7 @@ mod tests {
         fn import_existing(
             &self,
             paths: &ManagedPaths,
-            _existing: &ExistingInstall,
+            existing: &ExistingInstall,
             mode: ImportMode,
             _control: &OperationControl,
         ) -> Result<(), AdapterFailure> {
@@ -4691,6 +4867,18 @@ mod tests {
             self.operations
                 .borrow_mut()
                 .push(RecordedOperation::Import(mode));
+            if self.writes_records {
+                let prefix = paths
+                    .directory()
+                    .ensure_directory(Path::new("prefix"))
+                    .map_err(|_| AdapterFailure::here())?;
+                if mode == ImportMode::InPlace {
+                    crate::game_folder::write_pointer(&prefix, existing.folder())
+                        .map_err(|_| AdapterFailure::here())?;
+                }
+                crate::game_folder::write_import_record(&prefix, mode, r"G:\Diablo II")
+                    .map_err(|_| AdapterFailure::here())?;
+            }
             Ok(())
         }
 
@@ -4740,10 +4928,326 @@ mod tests {
         }
     }
 
+    /// With the update checks off, a Project Diablo 2 in the game folder (an
+    /// import's, of any version) is accepted as it is: no update, no PD2
+    /// installer. When it cannot be, the step fails and the PD2 installer
+    /// does not replace the version the player keeps.
+    #[test]
+    fn with_the_update_checks_off_an_imported_project_diablo_is_kept_as_it_is() {
+        let source = FixtureArtifactSource::default();
+        let fixture = TempDir::new().unwrap();
+        let project_d2 = fixture
+            .path()
+            .join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2");
+        fs::create_dir_all(&project_d2).unwrap();
+        for file in ["Game.exe", "ProjectDiablo.dll"] {
+            fs::write(project_d2.join(file), b"an older pd2").unwrap();
+        }
+        let run = |accept_fails: bool, audits: Vec<InstallationStatus>| {
+            let driver = RecordingDriver::default();
+            let client = RecordingClientSynchronizer::default();
+            *client.accept_fails.borrow_mut() = accept_fails;
+            let auditor = ScriptedAuditor::new(
+                audits
+                    .into_iter()
+                    .map(|status| audit(status, CheckStatus::Satisfied).with_android_host()),
+            );
+            let outcome =
+                ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+                    .with_client_as_installed(true)
+                    .install_project_diablo(fixture.path(), &OperationControl::default());
+            let bootstrap = driver
+                .operations
+                .borrow()
+                .contains(&RecordedOperation::ClientBootstrap);
+            let accepted = *client.accepted.borrow();
+            let synchronized = *client.calls.borrow();
+            (outcome, bootstrap, accepted, synchronized)
+        };
+
+        let (outcome, bootstrap, accepted, synchronized) = run(
+            false,
+            vec![InstallationStatus::NeedsClient, InstallationStatus::Ready],
+        );
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.final_status(), InstallationStatus::Ready);
+        assert_eq!(
+            outcome.completed_stages(),
+            &[InstallStage::ClientSynchronization]
+        );
+        assert_eq!((bootstrap, accepted, synchronized), (false, 1, 0));
+
+        let (outcome, bootstrap, accepted, synchronized) =
+            run(true, vec![InstallationStatus::NeedsClient]);
+        assert!(matches!(outcome, Err(InstallError::ClientNotKept)));
+        assert_eq!((bootstrap, accepted, synchronized), (false, 1, 0));
+
+        // A ProjectD2 without its launch files is not replaced either.
+        fs::remove_file(project_d2.join("ProjectDiablo.dll")).unwrap();
+        let (outcome, bootstrap, accepted, synchronized) =
+            run(false, vec![InstallationStatus::NeedsClient]);
+        assert!(matches!(outcome, Err(InstallError::ClientNotKept)));
+        assert_eq!((bootstrap, accepted, synchronized), (false, 0, 0));
+    }
+
+    /// What the recording synchronizer writes as an import's record.
+    const COPIED_RECORD: &[u8] = b"{\"checksum\":[\"00000000000000000000000000000000  Game.exe\"]}";
+
+    /// On the Android host an import records the Project Diablo 2 it copied,
+    /// as it is, from the copied files (a record another PD2 Launcher left
+    /// is replaced), and ends at Ready: no update, no download, no PD2
+    /// installer and no file list from PD2's server, with the update checks
+    /// on. The desktop leaves Project Diablo 2 to its own step.
+    #[test]
+    fn on_android_an_import_records_its_copied_project_diablo_and_never_updates() {
+        let source = FixtureArtifactSource::default();
+        // (final status, copied records, synchronized, accepted, prefetched,
+        // PD2 installer, downloads)
+        let import = |recorded_before: bool, android: bool| {
+            let fixture = TempDir::new().unwrap();
+            let existing = existing_install(&fixture);
+            let root_path = fixture.path().join("managed");
+            let project_d2 =
+                root_path.join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2");
+            fs::create_dir_all(project_d2.join(".pd2launcher")).unwrap();
+            for file in ["Game.exe", "ProjectDiablo.dll", "PD2Launcher.exe"] {
+                fs::write(project_d2.join(file), b"an older pd2").unwrap();
+            }
+            if recorded_before {
+                fs::write(
+                    project_d2.join(".pd2launcher/accepted-manifest.json"),
+                    b"{}",
+                )
+                .unwrap();
+            }
+            let after_import = if recorded_before {
+                InstallationStatus::Ready
+            } else {
+                InstallationStatus::NeedsClient
+            };
+            let driver = RecordingDriver::default();
+            let client = RecordingClientSynchronizer::default();
+            let auditor = ScriptedAuditor::new(
+                [
+                    InstallationStatus::NeedsBaseGame,
+                    after_import,
+                    InstallationStatus::Ready,
+                ]
+                .map(|status| {
+                    let report = audit(status, CheckStatus::Satisfied);
+                    if android {
+                        report.with_android_host()
+                    } else {
+                        report
+                    }
+                }),
+            );
+            let status =
+                ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+                    .with_client_as_installed(false)
+                    .import_existing(
+                        &root_path,
+                        &existing,
+                        ImportMode::InPlace,
+                        &OperationControl::default(),
+                    )
+                    .map(|outcome| outcome.final_status())
+                    .unwrap();
+            let bootstrap = driver
+                .operations
+                .borrow()
+                .contains(&RecordedOperation::ClientBootstrap);
+            // The mark names this record, once; another record does not count.
+            let root = Directory::open(&root_path).unwrap();
+            assert_eq!(is_copied_client_record(&root, COPIED_RECORD), android);
+            assert!(!is_copied_client_record(&root, b"{}"));
+            (
+                status,
+                *client.copied_records.borrow(),
+                *client.calls.borrow(),
+                *client.accepted.borrow(),
+                *client.prefetches.borrow(),
+                bootstrap,
+                source.acquisitions.borrow().len(),
+            )
+        };
+
+        assert_eq!(
+            import(false, true),
+            (InstallationStatus::Ready, 1, 0, 0, 0, false, 0)
+        );
+        assert_eq!(
+            import(true, true),
+            (InstallationStatus::Ready, 1, 0, 0, 0, false, 0)
+        );
+        assert_eq!(
+            import(false, false),
+            (InstallationStatus::NeedsClient, 0, 0, 0, 0, false, 0)
+        );
+    }
+
+    /// The app's way: the folder copied into the app is used in place
+    /// (ImportExistingInstall with IN_PLACE after SelectExistingInstall).
+    /// The driver writes the in-place record, and the import then records
+    /// the ProjectD2 of that folder, not of the Managed one, and ends at
+    /// Ready: no Install Project Diablo 2, no synchronize, no download.
+    #[test]
+    fn on_android_an_import_in_place_records_the_project_diablo_of_the_folder_it_uses() {
+        let fixture = TempDir::new().unwrap();
+        let existing = existing_install(&fixture);
+        let folder = fixture.path().join("My Games/Diablo II");
+        fs::create_dir_all(folder.join("ProjectD2")).unwrap();
+        for file in ["Game.exe", "ProjectDiablo.dll", "PD2Launcher.exe"] {
+            fs::write(folder.join("ProjectD2").join(file), b"an older pd2").unwrap();
+        }
+        let root_path = fixture.path().join("managed");
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver {
+            writes_records: true,
+            ..RecordingDriver::default()
+        };
+        let client = RecordingClientSynchronizer::default();
+        let auditor = ScriptedAuditor::new(
+            [
+                InstallationStatus::NeedsBaseGame,
+                InstallationStatus::NeedsClient,
+                InstallationStatus::Ready,
+            ]
+            .map(|status| audit(status, CheckStatus::Satisfied).with_android_host()),
+        );
+        let outcome = ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+            .import_existing(
+                &root_path,
+                &existing,
+                ImportMode::InPlace,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.final_status(), InstallationStatus::Ready);
+        assert_eq!(*client.copied_records.borrow(), 1);
+        assert_eq!(*client.calls.borrow(), 0);
+        assert_eq!(*client.prefetches.borrow(), 0);
+        assert!(source.acquisitions.borrow().is_empty());
+        // The record went to the folder used in place, and the mark names it.
+        assert!(
+            folder
+                .join("ProjectD2/.pd2launcher/accepted-manifest.json")
+                .is_file()
+        );
+        assert!(
+            !root_path
+                .join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2")
+                .exists()
+        );
+        let root = Directory::open(&root_path).unwrap();
+        assert!(is_copied_client_record(&root, COPIED_RECORD));
+    }
+
+    /// On the Android host the Download step of an import fetches nothing of
+    /// Project Diablo 2: neither its installer nor its client.
+    #[test]
+    fn on_android_the_download_for_an_import_fetches_nothing_of_project_diablo() {
+        let fixture = TempDir::new().unwrap();
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver::default();
+        let client = RecordingClientSynchronizer::default();
+        let auditor = ScriptedAuditor::new([android_audit(
+            InstallationStatus::NeedsBaseGame,
+            CheckStatus::Satisfied,
+        )]);
+        ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+            .download_all(
+                fixture.path(),
+                DownloadPlan::ExistingInstall,
+                &OperationControl::default(),
+            )
+            .expect("downloads verified");
+        assert!(
+            !source
+                .acquisitions
+                .borrow()
+                .contains(&ArtifactKind::ClientBootstrap)
+        );
+        assert_eq!(*client.prefetches.borrow(), 0);
+        assert!(driver.operations.borrow().is_empty());
+    }
+
+    /// A fresh app (no game, no earlier download): the import's Download
+    /// fetches nothing and is complete, so the import follows and ends at
+    /// Ready, with no network and no download.
+    #[test]
+    fn on_android_a_fresh_import_goes_from_its_download_to_ready_with_no_download() {
+        use crate::downloads::{DownloadNeed, DownloadReadiness, readiness_on};
+        let fixture = TempDir::new().unwrap();
+        let existing = existing_install(&fixture);
+        let folder = fixture.path().join("My Games/Diablo II");
+        fs::create_dir_all(folder.join("ProjectD2")).unwrap();
+        for file in ["Game.exe", "ProjectDiablo.dll", "PD2Launcher.exe"] {
+            fs::write(folder.join("ProjectD2").join(file), b"an older pd2").unwrap();
+        }
+        let root_path = fixture.path().join("managed");
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver {
+            writes_records: true,
+            ..RecordingDriver::default()
+        };
+        let client = RecordingClientSynchronizer::default();
+        let auditor = ScriptedAuditor::new(
+            [
+                // Download.
+                InstallationStatus::NeedsBaseGame,
+                // The import, after the copy, after the record.
+                InstallationStatus::NeedsBaseGame,
+                InstallationStatus::NeedsClient,
+                InstallationStatus::Ready,
+            ]
+            .map(|status| audit(status, CheckStatus::Satisfied).with_android_host()),
+        );
+        let mut installer =
+            ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog());
+        installer
+            .download_all(
+                &root_path,
+                DownloadPlan::ExistingInstall,
+                &OperationControl::default(),
+            )
+            .expect("nothing to download");
+        let readiness = readiness_on(&Directory::open(&root_path).unwrap(), true);
+        assert!(matches!(
+            readiness,
+            DownloadReadiness::Complete {
+                plan: DownloadPlan::ExistingInstall,
+                total_bytes: 0,
+                ..
+            }
+        ));
+        assert!(readiness.serves(
+            DownloadPlan::ExistingInstall,
+            DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, false)
+        ));
+        let outcome = installer
+            .import_existing(
+                &root_path,
+                &existing,
+                ImportMode::InPlace,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.final_status(), InstallationStatus::Ready);
+        assert!(source.acquisitions.borrow().is_empty());
+        assert_eq!(*client.prefetches.borrow(), 0);
+        assert_eq!(*client.calls.borrow(), 0);
+        assert_eq!(*client.copied_records.borrow(), 1);
+    }
+
     #[derive(Default)]
     struct RecordingClientSynchronizer {
         calls: RefCell<usize>,
         prefetches: RefCell<usize>,
+        accepted: RefCell<usize>,
+        accept_fails: RefCell<bool>,
+        /// Records of an import's copied client.
+        copied_records: RefCell<usize>,
     }
 
     impl ClientSynchronizer for RecordingClientSynchronizer {
@@ -4765,6 +5269,31 @@ mod tests {
         ) -> Result<(), AdapterFailure> {
             *self.calls.borrow_mut() += 1;
             Ok(())
+        }
+
+        fn accept_installed(
+            &self,
+            _paths: &ManagedPaths,
+            _control: &OperationControl,
+        ) -> Result<(), AdapterFailure> {
+            *self.accepted.borrow_mut() += 1;
+            if *self.accept_fails.borrow() {
+                Err(AdapterFailure::here())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record_copied(
+            &self,
+            paths: &ManagedPaths,
+            _control: &OperationControl,
+        ) -> Result<(), AdapterFailure> {
+            *self.copied_records.borrow_mut() += 1;
+            let record = paths.game().join("ProjectD2/.pd2launcher");
+            fs::create_dir_all(&record).map_err(|_| AdapterFailure::here())?;
+            fs::write(record.join("accepted-manifest.json"), COPIED_RECORD)
+                .map_err(|_| AdapterFailure::here())
         }
     }
 

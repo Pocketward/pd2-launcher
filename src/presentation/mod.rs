@@ -293,6 +293,9 @@ pub(crate) struct LaunchSettingsView {
     sound_in_background: bool,
     official_launcher_software_rendering: bool,
     app_menu_entry: bool,
+    /// Project Diablo 2's update checks: off, none runs and the client is
+    /// accepted as installed.
+    update_checks: bool,
     persistence: SettingsPersistenceView,
 }
 
@@ -305,6 +308,7 @@ impl Default for LaunchSettingsView {
             sound_in_background: false,
             official_launcher_software_rendering: true,
             app_menu_entry: true,
+            update_checks: true,
             persistence: SettingsPersistenceView::Loading,
         }
     }
@@ -323,6 +327,7 @@ impl LaunchSettingsView {
             sound_in_background,
             official_launcher_software_rendering: true,
             app_menu_entry: true,
+            update_checks: true,
             persistence: SettingsPersistenceView::Saved,
         }
     }
@@ -351,6 +356,15 @@ impl LaunchSettingsView {
 
     pub(crate) const fn app_menu_entry(self) -> bool {
         self.app_menu_entry
+    }
+
+    pub(crate) const fn with_update_checks(mut self, enabled: bool) -> Self {
+        self.update_checks = enabled;
+        self
+    }
+
+    pub(crate) const fn update_checks(self) -> bool {
+        self.update_checks
     }
 
     pub(crate) const fn failed(mut self, code: &'static str) -> Self {
@@ -410,6 +424,7 @@ pub(crate) enum SettingsChange {
     OfficialLauncherSoftwareRendering(bool),
     DirectDrawRenderer(DirectDrawRendererView),
     AppMenuEntry(bool),
+    UpdateChecks(bool),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2449,6 +2464,11 @@ pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
             "A step stopped part way, so it has to start over. Your downloads are kept.",
             Some(StartOver),
         ),
+        "official-launcher-missing" => card(
+            "The official launcher isn't in your game folder",
+            "ProjectD2\\PD2Launcher.exe is missing. If you chose an existing Diablo II folder, check that it is complete, with the ProjectD2 folder, then choose it again.",
+            None,
+        ),
         "official-launcher-confirmation-required" => card(
             "The official launcher wasn't opened",
             "PD2Launcher.exe isn't verified, so running it needs your confirmation. Nothing was changed.",
@@ -4483,11 +4503,20 @@ pub(crate) enum Intent {
     UseDefaultInstallerSource,
     RequestSafeStop,
     ApplyUpdate,
-    LaunchGame(GraphicsDriver, Option<GraphicsProfile>),
+    /// Play: the graphics driver, the D2GL graphics profile (the Android
+    /// app's; none from the desktop), whether the game gets Box64's strict
+    /// x86 memory order (the Android app's Strict CPU emulation), and the
+    /// Android app's Detailed logging for its Wine (neither from the
+    /// desktop).
+    LaunchGame(GraphicsDriver, Option<GraphicsProfile>, bool, bool),
     /// Open the official PD2 launcher as a fallback.
     OpenOfficialLauncher,
-    /// Open it after the user confirmed an unverified binary.
-    OpenOfficialLauncherConfirmed,
+    /// Open it after the user confirmed an unverified binary (the Android
+    /// app's button is the confirmation), whether a game that it starts gets
+    /// Box64's strict x86 memory order (the Android app's Strict CPU
+    /// emulation), and the Android app's Detailed logging for its Wine and
+    /// the game it starts (neither from the desktop).
+    OpenOfficialLauncherConfirmed(bool, bool),
     /// A confirmed Start over.
     StartOver,
     /// Resolve an unavailable install location again ("Check again").
@@ -4544,7 +4573,7 @@ impl Intent {
             Self::ApplyUpdate => "Apply Available update",
             Self::LaunchGame(..) => "Launch Game client",
             Self::OpenOfficialLauncher => "Open official PD2 launcher",
-            Self::OpenOfficialLauncherConfirmed => "Open the unverified official PD2 launcher",
+            Self::OpenOfficialLauncherConfirmed(..) => "Open the unverified official PD2 launcher",
             Self::StartOver => "Start over",
             Self::RetryLocation => "Check the install location again",
             Self::ChooseInstallLocation(_) => "Choose the install location",
@@ -4564,6 +4593,9 @@ impl Intent {
                 "Change official launcher software rendering"
             }
             Self::ChangeSettings(SettingsChange::AppMenuEntry(_)) => "Change the app menu entry",
+            Self::ChangeSettings(SettingsChange::UpdateChecks(_)) => {
+                "Change Project Diablo 2's update checks"
+            }
             Self::ExportDiagnostics => "Save a redacted report",
             Self::RevealReport => "Open the report's folder",
             Self::OpenGameFolder => "Open the game folder",
@@ -6033,7 +6065,12 @@ impl LauncherView {
         }
 
         let intent = match after_ready_step(self.unattended_after_ready, self.state.snapshot()) {
-            AfterReadyStep::LaunchGame => Some(Intent::LaunchGame(GraphicsDriver::Standard, None)),
+            AfterReadyStep::LaunchGame => Some(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            )),
             AfterReadyStep::OpenOfficialLauncher => Some(Intent::OpenOfficialLauncher),
             AfterReadyStep::Wait | AfterReadyStep::RefuseUnverifiedOfficialLauncher => None,
         };
@@ -6368,7 +6405,12 @@ impl LauncherView {
                 None
             }
             ActionId::ContinueInstallation => Some(Intent::ContinueInstallation),
-            ActionId::Play => Some(Intent::LaunchGame(GraphicsDriver::Standard, None)),
+            ActionId::Play => Some(Intent::LaunchGame(
+                GraphicsDriver::Standard,
+                None,
+                false,
+                false,
+            )),
             ActionId::Update => Some(Intent::ApplyUpdate),
             ActionId::SafeStop => Some(Intent::RequestSafeStop),
             ActionId::OpenDiagnostics => {
@@ -7433,7 +7475,7 @@ mod tests {
     #[test]
     fn play_is_labelled_in_the_history() {
         assert_eq!(
-            Intent::LaunchGame(GraphicsDriver::Standard, None).history_label(),
+            Intent::LaunchGame(GraphicsDriver::Standard, None, false, false).history_label(),
             "Launch Game client"
         );
     }
@@ -7609,6 +7651,24 @@ mod tests {
         let card = result_card(&failed(ActiveJobView::Reset, "saves-not-kept")).expect("a card");
         assert_eq!(card.title, "Start over didn't run");
         assert!(card.message.contains("nothing was removed"));
+    }
+
+    #[test]
+    fn a_missing_official_launcher_says_which_file_and_what_to_check() {
+        let card = result_card(&failed(
+            ActiveJobView::OfficialLauncher,
+            "official-launcher-missing",
+        ))
+        .expect("a card");
+        assert_eq!(
+            card.title,
+            "The official launcher isn't in your game folder"
+        );
+        assert!(
+            card.message
+                .starts_with("ProjectD2\\PD2Launcher.exe is missing.")
+        );
+        assert_eq!(card.next, None);
     }
 
     #[test]

@@ -4160,7 +4160,7 @@ impl LauncherView {
                                         .warning()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_official_launcher = false;
-                                            this.emit(super::Intent::OpenOfficialLauncherConfirmed);
+                                            this.emit(super::Intent::OpenOfficialLauncherConfirmed(false, false));
                                             cx.notify();
                                         })),
                                 )
@@ -6545,7 +6545,7 @@ mod tests {
         cx.simulate_click(run.center(), gpui_kit::Modifiers::none());
         assert!(matches!(
             service.intent_receiver.try_recv(),
-            Ok(Intent::OpenOfficialLauncherConfirmed)
+            Ok(Intent::OpenOfficialLauncherConfirmed(false, false))
         ));
         // While it is open the same button closes it.
         show(

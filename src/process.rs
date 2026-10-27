@@ -113,6 +113,41 @@ pub(crate) fn game_wine_settings(
     settings
 }
 
+/// Box64's strict x86 memory order for the game, on the Android host when
+/// the Play asks for it (the app's Strict CPU emulation). Only `Game.exe`
+/// gets it (our Box64 patch 0006): a program the game starts keeps Box64's
+/// defaults.
+///
+/// Every `BOX64_DYNAREC_PROGRAMS` list ends with `;`. wowbox64's
+/// `GetEnvironmentVariableA` (Box64's `wine/common/wrt.c`) does not end the
+/// value with a NUL, and Box64's Windows `GetEnv` (`src/os/os_wine.c`) reads
+/// every variable into one static 1024-byte buffer, which first held
+/// `USERPROFILE` (`InitializeEnvFiles` in `src/tools/env.c`). So the last
+/// name of a list that is shorter than an earlier value gets that value's
+/// leftover bytes; the trailing `;` puts them into a separate name, which
+/// matches no program.
+pub(crate) const BOX64_STRICT_GAME_ENVIRONMENT: [(&str, &str); 2] = [
+    ("BOX64_DYNAREC_PROGRAMS", "Game.exe;"),
+    ("BOX64_DYNAREC_STRONGMEM", "1"),
+];
+
+/// What the game's Wine gets for `strict_memory_order` on the Android host
+/// (`android`); nothing on the desktop or without it.
+fn game_box64_settings(
+    android: bool,
+    strict_memory_order: bool,
+) -> Vec<crate::wine_environment::Setting> {
+    use crate::wine_environment::{Kind, Setting};
+    if android && strict_memory_order {
+        BOX64_STRICT_GAME_ENVIRONMENT
+            .iter()
+            .map(|(name, value)| Setting::new(*name, *value, Kind::Preference))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 mod d2gl;
 mod ddraw;
 
@@ -186,6 +221,12 @@ pub(crate) struct GameLaunchOptions {
     /// The Android app's D2GL graphics profile for this Play; none on the
     /// desktop.
     graphics_profile: Option<GraphicsProfile>,
+    /// Box64's strict x86 memory order for the game on the Android host
+    /// ([`game_box64_settings`]).
+    strict_memory_order: bool,
+    /// The Android app's Detailed logging for the game's Wine
+    /// ([`crate::wine_environment::detailed_settings`]).
+    detailed_logging: bool,
 }
 
 impl Default for GameLaunchOptions {
@@ -196,6 +237,8 @@ impl Default for GameLaunchOptions {
             skip_to_bnet: true,
             sound_in_background: false,
             graphics_profile: None,
+            strict_memory_order: false,
+            detailed_logging: false,
         }
     }
 }
@@ -208,6 +251,8 @@ impl GameLaunchOptions {
             skip_to_bnet,
             sound_in_background: false,
             graphics_profile: None,
+            strict_memory_order: false,
+            detailed_logging: false,
         }
     }
 
@@ -226,6 +271,20 @@ impl GameLaunchOptions {
     /// the Android host when it is not the one last applied.
     pub(crate) fn with_graphics_profile(mut self, profile: GraphicsProfile) -> Self {
         self.graphics_profile = Some(profile);
+        self
+    }
+
+    /// Whether the game gets Box64's strict x86 memory order on the Android
+    /// host (the app's Strict CPU emulation); the desktop ignores it.
+    pub(crate) fn with_strict_memory_order(mut self, enabled: bool) -> Self {
+        self.strict_memory_order = enabled;
+        self
+    }
+
+    /// Whether the game's Wine logs in detail (the Android app's Detailed
+    /// logging).
+    pub(crate) fn with_detailed_logging(mut self, enabled: bool) -> Self {
+        self.detailed_logging = enabled;
         self
     }
 }
@@ -536,6 +595,8 @@ impl GameSupervisor {
             runtime,
             &program,
             (&paths.root, working_directory),
+            Vec::new(),
+            false,
         )?
         .with_inherited_file(probe, CHILD_GL_PROBE_FD)
         .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?;
@@ -775,6 +836,8 @@ fn build_game_request(
         runtime,
         WINDOWS_GAME_EXECUTABLE,
         (&paths.project_d2, project),
+        game_box64_settings(crate::android_host(), options.strict_memory_order),
+        options.detailed_logging,
     )?
     .with_argument(options.renderer.argument());
     if options.skip_to_bnet {
@@ -789,13 +852,16 @@ fn build_game_request(
 }
 
 /// `program` run through the managed runtime exactly as the game is: the
-/// same prefix, Wine cache, DLL overrides, session variables, and leases.
+/// same prefix, Wine cache, DLL overrides, session variables, and leases,
+/// with `extra` settings on top and, with `detailed`, Detailed logging's.
 fn game_profile_request(
     root: &Directory,
     leases: &GameLeases,
     runtime: RuntimeHandles,
     program: &str,
     (working_directory, working_directory_handle): (&Path, Directory),
+    extra: Vec<crate::wine_environment::Setting>,
+    detailed: bool,
 ) -> Result<ProcessRequest, GameLaunchError> {
     let home = required_directory_environment("HOME")?;
     // The pinned preloader descriptor is the guest ELF; Host execution's
@@ -814,9 +880,19 @@ fn game_profile_request(
                 .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
         )
         .with_cleared_environment()
-        .with_output_limit(PROCESS_OUTPUT_LIMIT);
-    for (name, value) in crate::wine_environment::compose(env::vars_os(), &game_wine_settings(home))
-    {
+        .with_output_limit(PROCESS_OUTPUT_LIMIT)
+        .with_detailed_output(detailed);
+    let mut settings = game_wine_settings(home);
+    settings.extend(extra);
+    settings.extend(crate::wine_environment::detailed_settings(
+        detailed,
+        crate::dev_build::GAME_WINEDEBUG,
+    ));
+    let environment = crate::wine_environment::compose(env::vars_os(), &settings);
+    if let Some(line) = crate::wine_environment::box64_line(program, &environment) {
+        eprintln!("{line}");
+    }
+    for (name, value) in environment {
         request = request.with_environment(name, value);
     }
 
@@ -1044,7 +1120,7 @@ impl GameLogs {
                 .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
             for line in String::from_utf8_lossy(&bytes[..=end]).lines() {
                 if !line.trim().is_empty() {
-                    eprintln!("pd2-launcher: [{name}] {}", crate::activity::redacted(line));
+                    eprintln!("pd2-launcher: [{name}] {}", game_log_line(line));
                 }
             }
             self.printed.insert(log, from + end as u64 + 1);
@@ -1052,59 +1128,100 @@ impl GameLogs {
     }
 }
 
+/// A line of the game's own logs as the Launcher's stderr prints it: masked
+/// like the report's copy (CD keys, the home folder, the user name, and
+/// account, character and game names; a crash report's memory dump keeps its
+/// hex words).
+fn game_log_line(line: &str) -> String {
+    crate::redact::mask_game_identities(&crate::activity::redacted_game_log(line))
+}
+
 fn render_diagnostics(
     output: ProcessOutput,
     managed_root: &Path,
     home: Option<&Path>,
 ) -> GameDiagnostics {
-    let mut text = String::new();
-    let stdout_limited = append_stream(&mut text, "stdout", output.stdout());
-    let stderr_limited = append_stream(&mut text, "stderr", output.stderr());
-    text = redact_path(text, managed_root, "[MANAGED_ROOT]");
-    if let Some(home) = home.filter(|home| *home != Path::new("/")) {
-        text = redact_path(text, home, "[HOME]");
-    }
-    text = text
-        .chars()
-        .map(|character| {
-            if character == '\n' || character == '\t' || !character.is_control() {
-                character
-            } else {
-                '\u{fffd}'
-            }
-        })
-        .collect();
-
-    let was_too_long = text.len() > DIAGNOSTIC_LIMIT;
-    if was_too_long {
-        let mut boundary = DIAGNOSTIC_LIMIT;
-        while !text.is_char_boundary(boundary) {
-            boundary -= 1;
+    let clean = |bytes: &[u8]| {
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        text = redact_path(text, managed_root, "[MANAGED_ROOT]");
+        if let Some(home) = home.filter(|home| *home != Path::new("/")) {
+            text = redact_path(text, home, "[HOME]");
         }
-        text.truncate(boundary);
-    }
+        text.chars()
+            .map(|character| {
+                if character == '\n' || character == '\t' || !character.is_control() {
+                    character
+                } else {
+                    '\u{fffd}'
+                }
+            })
+            .collect::<String>()
+    };
+    let stdout = clean(output.stdout());
+    let stderr = clean(output.stderr());
+    // The headers and the line between the two streams.
+    let heading = |stream: &str, name: &str| {
+        if stream.is_empty() { 0 } else { name.len() + 2 }
+    };
+    let overhead = heading(&stdout, "stdout")
+        + heading(&stderr, "stderr")
+        + usize::from(!stdout.is_empty() && !stderr.is_empty());
+    let room = DIAGNOSTIC_LIMIT.saturating_sub(overhead);
+    let was_too_long = stdout.len() + stderr.len() > room;
+    // When both do not fit, stderr comes first (its end is where a failed
+    // game says what happened), and each stream loses its middle, never its
+    // end.
+    let stderr_room = if was_too_long {
+        stderr
+            .len()
+            .min(room.saturating_sub(stdout.len().min(DIAGNOSTIC_STDOUT_KEPT)))
+    } else {
+        stderr.len()
+    };
+    let stdout_room = room.saturating_sub(stderr_room);
+    let mut text = String::new();
+    append_stream(&mut text, "stdout", &cut_middle(&stdout, stdout_room));
+    append_stream(&mut text, "stderr", &cut_middle(&stderr, stderr_room));
     GameDiagnostics {
         text,
-        truncated: was_too_long
-            || stdout_limited
-            || stderr_limited
-            || output.stdout_truncated()
-            || output.stderr_truncated(),
+        truncated: was_too_long || output.stdout_truncated() || output.stderr_truncated(),
     }
 }
 
-fn append_stream(output: &mut String, name: &str, bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
+/// The diagnostics keep at least this much of stdout when stderr is long.
+const DIAGNOSTIC_STDOUT_KEPT: usize = 1024;
+
+/// `text` in at most `limit` bytes: all of it when it fits, else its start
+/// and its end with a line between them that says how much is left out.
+fn cut_middle(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let marker = |left_out: usize| format!("\n[{left_out} bytes left out]\n");
+    // The marker's own length, with the longest count it can name.
+    let room = limit.saturating_sub(marker(text.len()).len());
+    let mut head = room / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - (room - room / 2);
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{}{}", &text[..head], marker(tail - head), &text[tail..])
+}
+
+/// The whole of one stream's text (already bounded: [`cut_middle`]).
+fn append_stream(output: &mut String, name: &str, text: &str) {
+    if text.is_empty() {
+        return;
     }
     if !output.is_empty() {
         output.push('\n');
     }
     output.push_str(name);
     output.push_str(":\n");
-    let accepted = bytes.len().min(PROCESS_OUTPUT_LIMIT);
-    output.push_str(&String::from_utf8_lossy(&bytes[..accepted]));
-    accepted != bytes.len()
+    output.push_str(text);
 }
 
 fn redact_path(text: String, path: &Path, replacement: &str) -> String {
@@ -1766,6 +1883,82 @@ mod tests {
     }
 
     #[test]
+    fn only_an_android_play_that_asks_for_it_gets_box64s_strict_memory_order_for_the_game() {
+        let names = |settings: Vec<crate::wine_environment::Setting>| {
+            crate::wine_environment::compose_on(Vec::new(), &settings, true)
+                .into_iter()
+                .filter(|(name, _)| name.to_string_lossy().starts_with("BOX64_"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(game_box64_settings(true, true)),
+            vec![
+                (
+                    OsString::from("BOX64_DYNAREC_PROGRAMS"),
+                    OsString::from("Game.exe;")
+                ),
+                (
+                    OsString::from("BOX64_DYNAREC_STRONGMEM"),
+                    OsString::from("1")
+                ),
+            ]
+        );
+        assert!(game_box64_settings(true, false).is_empty());
+        assert!(game_box64_settings(false, true).is_empty());
+        assert!(game_box64_settings(false, false).is_empty());
+    }
+
+    #[test]
+    fn the_desktop_game_never_gets_box64_settings() {
+        let fixture = Fixture::new();
+        let host = Arc::new(FakeHost::new());
+        let mut supervisor = game_supervisor(Arc::new(FakeAuditor::ready()), Arc::clone(&host));
+
+        supervisor
+            .start(
+                fixture.root(),
+                GameLaunchOptions::default().with_strict_memory_order(true),
+            )
+            .expect("Ready game starts");
+
+        let snapshots = host
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = snapshots.as_ref().expect("typed request was captured");
+        assert_eq!(environment_value(request, "BOX64_DYNAREC_STRONGMEM"), None);
+        assert_eq!(environment_value(request, "BOX64_DYNAREC_PROGRAMS"), None);
+    }
+
+    #[test]
+    fn a_play_with_detailed_logging_gets_its_wine_channels_and_box64s_log() {
+        for detailed in [false, true] {
+            let fixture = Fixture::new();
+            let host = Arc::new(FakeHost::new());
+            let mut supervisor = game_supervisor(Arc::new(FakeAuditor::ready()), Arc::clone(&host));
+            supervisor
+                .start(
+                    fixture.root(),
+                    GameLaunchOptions::default().with_detailed_logging(detailed),
+                )
+                .expect("Ready game starts");
+            let snapshots = host
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let request = snapshots.as_ref().expect("typed request was captured");
+            let winedebug = environment_value(request, "WINEDEBUG")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            assert_eq!(winedebug.contains("+winsock"), detailed, "{winedebug}");
+            assert_eq!(
+                environment_value(request, "BOX64_LOG").is_some_and(|value| value == "1"),
+                detailed
+            );
+        }
+    }
+
+    #[test]
     fn only_the_android_game_loads_pd2s_own_ddraw() {
         // PD2's own ddraw.dll, never Wine's.
         assert_eq!(
@@ -1974,6 +2167,37 @@ mod tests {
     }
 
     #[test]
+    fn full_streams_keep_the_end_of_stderr_and_the_start_and_end_of_stdout() {
+        let full = |name: &str, filler: &str| {
+            let mut text = format!("{name}-start\n");
+            while text.len() < PROCESS_OUTPUT_LIMIT + 40 {
+                text.push_str(filler);
+            }
+            text.push_str(&format!("{name}-end"));
+            text.into_bytes()
+        };
+        // A carriage return becomes U+FFFD: three bytes for one.
+        let output = ProcessOutput::new(full("out", "x\r"), full("err", "y\r"), true, true);
+        let diagnostics = render_diagnostics(output, Path::new("/nowhere"), None);
+        let text = diagnostics.text();
+        assert!(text.len() <= DIAGNOSTIC_LIMIT, "{}", text.len());
+        assert!(text.ends_with("err-end"), "{}", &text[text.len() - 40..]);
+        assert!(
+            text.contains("err-start") && text.contains("out-start") && text.contains("out-end")
+        );
+        assert!(text.contains("bytes left out]"));
+        assert!(diagnostics.truncated());
+        // What fits stays whole.
+        let small = render_diagnostics(
+            ProcessOutput::new(b"a".to_vec(), b"b".to_vec(), false, false),
+            Path::new("/nowhere"),
+            None,
+        );
+        assert_eq!(small.text(), "stdout:\na\nstderr:\nb");
+        assert!(!small.truncated());
+    }
+
+    #[test]
     fn exit_is_bounded_redacted_and_releases_both_leases() {
         let fixture = Fixture::new();
         let auditor = Arc::new(FakeAuditor::ready());
@@ -2134,5 +2358,25 @@ mod tests {
         );
         let installation = fixture.installation_lock();
         File::try_lock(&installation).expect("spawn failure releases shared lease");
+    }
+
+    #[test]
+    fn the_game_logs_copy_hides_account_character_and_game_names() {
+        let line =
+            game_log_line("12:28:06 Joined game Baal-Run-07 with character: Sorceress account=Foo");
+        assert!(!line.contains("Baal-Run-07"), "{line}");
+        assert!(!line.contains("Sorceress"), "{line}");
+        assert!(!line.contains("Foo"), "{line}");
+        assert!(line.starts_with("12:28:06 Joined game"), "{line}");
+    }
+
+    #[test]
+    fn the_game_logs_copy_keeps_a_dump_rows_hex_and_hides_a_key_in_it() {
+        let row = "21:13:04.951  0201FF18: FFFFFFFF D87E244C AD144BBF F293C16F  TM.x..%.l......o";
+        assert_eq!(game_log_line(row), row);
+        assert_eq!(
+            game_log_line("              0201FF28: 2468BCDE  GHJKMNPR"),
+            format!("              0201FF28: {}", crate::redact::KEY_MASK)
+        );
     }
 }

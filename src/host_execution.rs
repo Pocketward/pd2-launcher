@@ -19,7 +19,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use command_fds::{CommandFdExt, FdMapping};
@@ -565,6 +565,9 @@ pub struct ProcessRequest {
     clear_environment: bool,
     environment: Vec<(OsString, OsString)>,
     output_limit: Option<usize>,
+    /// Detailed logging for this program: its output lines go to standard
+    /// error longer ([`crate::activity::live_output`]).
+    detailed_output: bool,
     inherited_files: Vec<InheritedFile>,
 }
 
@@ -579,6 +582,7 @@ impl fmt::Debug for ProcessRequest {
             .field("clear_environment", &self.clear_environment)
             .field("environment_name_count", &self.environment.len())
             .field("output_limit", &self.output_limit)
+            .field("detailed_output", &self.detailed_output)
             .field(
                 "inherited_file_descriptors",
                 &self.inherited_file_descriptors().collect::<Vec<_>>(),
@@ -598,6 +602,7 @@ impl ProcessRequest {
             clear_environment: false,
             environment: Vec::new(),
             output_limit: None,
+            detailed_output: false,
             inherited_files: Vec::new(),
         }
     }
@@ -657,9 +662,19 @@ impl ProcessRequest {
         self
     }
 
-    /// Capture and continuously drain at most this many bytes from each stream.
+    /// Capture each stream and drain it continuously, keeping at most this
+    /// many bytes of it: all of it when it fits, else its first and its last
+    /// half with a line between them that says how much is left out
+    /// ([`ProcessOutput::stdout`] is then a little longer than the bound).
     pub fn with_output_limit(mut self, bytes_per_stream: usize) -> Self {
         self.output_limit = Some(bytes_per_stream);
+        self
+    }
+
+    /// With Detailed logging, the program's output lines go to standard error
+    /// up to 1000 characters, not 300 ([`crate::activity::live_output`]).
+    pub fn with_detailed_output(mut self, detailed: bool) -> Self {
+        self.detailed_output = detailed;
         self
     }
 
@@ -984,8 +999,19 @@ impl HostExecution for SystemHostExecution {
             let completion = drain_completion
                 .as_ref()
                 .expect("capture completion is created with captures");
-            drain_stream(stdout, Arc::clone(stdout_capture), Arc::clone(completion));
-            drain_stream(stderr, Arc::clone(stderr_capture), Arc::clone(completion));
+            let detailed = request.detailed_output;
+            drain_stream(
+                stdout,
+                Arc::clone(stdout_capture),
+                Arc::clone(completion),
+                detailed,
+            );
+            drain_stream(
+                stderr,
+                Arc::clone(stderr_capture),
+                Arc::clone(completion),
+                detailed,
+            );
         }
 
         Ok(Box::new(SystemSupervisedProcess {
@@ -1188,8 +1214,8 @@ impl SupervisedProcess for SystemSupervisedProcess {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         ProcessOutput::new(
-            stdout.bytes.clone(),
-            stderr.bytes.clone(),
+            stdout.contents(),
+            stderr.contents(),
             stdout.truncated,
             stderr.truncated,
         )
@@ -1224,27 +1250,54 @@ impl DrainCompletion {
     }
 }
 
+/// A program's output, at most `limit` bytes of it: all of it when it fits,
+/// else its first half and its last half with a line between them that
+/// says how much is left out, so that the record of a long run that failed
+/// (the last bytes, [`crate::activity::OUTPUT_TAIL`]) shows how it ended.
 #[derive(Debug)]
 struct BoundedCapture {
-    bytes: Vec<u8>,
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
     limit: usize,
+    left_out: usize,
     truncated: bool,
 }
 
 impl BoundedCapture {
     fn new(limit: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(limit.min(4096)),
+            head: Vec::with_capacity((limit / 2).min(4096)),
+            tail: std::collections::VecDeque::new(),
             limit,
+            left_out: 0,
             truncated: false,
         }
     }
 
     fn append(&mut self, bytes: &[u8]) {
-        let remaining = self.limit.saturating_sub(self.bytes.len());
-        let accepted = remaining.min(bytes.len());
-        self.bytes.extend_from_slice(&bytes[..accepted]);
-        self.truncated |= accepted != bytes.len();
+        let head_room = (self.limit / 2).saturating_sub(self.head.len());
+        let (to_head, rest) = bytes.split_at(head_room.min(bytes.len()));
+        self.head.extend_from_slice(to_head);
+        let tail_limit = self.limit - self.limit / 2;
+        self.tail.extend(rest);
+        if self.tail.len() > tail_limit {
+            let over = self.tail.len() - tail_limit;
+            self.tail.drain(..over);
+            self.left_out += over;
+            self.truncated = true;
+        }
+    }
+
+    /// What it holds, in order, with the line about the bytes left out.
+    fn contents(&self) -> Vec<u8> {
+        let mut contents = self.head.clone();
+        if self.left_out > 0 {
+            contents.extend_from_slice(
+                format!("\n[{} bytes of output left out]\n", self.left_out).as_bytes(),
+            );
+        }
+        contents.extend(&self.tail);
+        contents
     }
 }
 
@@ -1252,25 +1305,66 @@ fn drain_stream(
     mut stream: impl Read + Send + 'static,
     capture: Arc<Mutex<BoundedCapture>>,
     completion: Arc<DrainCompletion>,
+    detailed: bool,
 ) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 4096];
         // Complete lines also go to the progress log as they are written.
         let mut line = Vec::new();
+        // The capture takes each line with its end, but not Wine's debug
+        // lines that the progress log leaves out, and network lines at most
+        // as many a second as the progress log has (a failed program's
+        // capture then holds its error, not those); a line longer than
+        // CAPTURE_LINE goes in as it comes.
+        let mut pending = Vec::new();
+        let mut passing = false;
+        // The `\n` of a `\r\n` whose line was left out.
+        let mut dropped_cr = false;
+        let mut network = crate::activity::CaptureNetworkLines::default();
+        let mut kept_in_capture = |line: &[u8]| match crate::activity::capture_line(line) {
+            crate::activity::CaptureLine::Keep => true,
+            crate::activity::CaptureLine::Drop => false,
+            crate::activity::CaptureLine::Network => network.take(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs()),
+            ),
+        };
+        let keep = |bytes: &[u8]| {
+            capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .append(bytes);
+        };
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    capture
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .append(&buffer[..count]);
                     for &byte in &buffer[..count] {
+                        pending.push(byte);
                         if byte == b'\n' || byte == b'\r' {
-                            crate::activity::live_output(&String::from_utf8_lossy(&line));
+                            let kept = if dropped_cr && pending == b"\n" {
+                                false
+                            } else {
+                                passing || kept_in_capture(&pending[..pending.len() - 1])
+                            };
+                            if kept {
+                                keep(&pending);
+                            }
+                            dropped_cr = !kept && byte == b'\r';
+                            pending.clear();
+                            passing = false;
+                            crate::activity::live_output(&String::from_utf8_lossy(&line), detailed);
                             line.clear();
-                        } else if line.len() < 1024 {
-                            line.push(byte);
+                        } else {
+                            if pending.len() >= CAPTURE_LINE {
+                                keep(&pending);
+                                pending.clear();
+                                passing = true;
+                            }
+                            if line.len() < 1024 {
+                                line.push(byte);
+                            }
                         }
                     }
                 }
@@ -1278,9 +1372,17 @@ fn drain_stream(
                 Err(_) => break,
             }
         }
+        if !pending.is_empty() && (passing || kept_in_capture(&pending)) {
+            keep(&pending);
+        }
+        crate::activity::output_ended();
         completion.complete_stream();
     });
 }
+
+/// The longest line the capture holds back until its end, to see whether it
+/// keeps it ([`drain_stream`]).
+const CAPTURE_LINE: usize = 8 * 1024;
 
 fn read_bounded(path: &Path, limit: u64) -> io::Result<String> {
     String::from_utf8(read_bounded_bytes(path, limit)?)
@@ -2261,6 +2363,109 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     use super::*;
+
+    #[test]
+    fn the_capture_leaves_out_wine_debug_noise_and_keeps_the_error() {
+        let output = "0020:0024:trace:loaddll:build_module Loaded L\"ntdll.dll\" at 6FFFFF5A0000: builtin\n\
+                      0020:0024:trace:winsock:select read 0x22f100, timeout 0x0\r\n\
+                      0020:0024:trace:winsock:connect socket 0x1a4, len 16\r\n\
+                      err:module:import_dll Library X.dll not found\n\
+                      partial";
+        let capture = Arc::new(Mutex::new(BoundedCapture::new(4096)));
+        let completion = Arc::new(DrainCompletion::default());
+        // The other stream of a program, done.
+        completion.complete_stream();
+        drain_stream(
+            io::Cursor::new(output.as_bytes().to_vec()),
+            Arc::clone(&capture),
+            Arc::clone(&completion),
+            false,
+        );
+        completion.wait_for_streams(Duration::from_secs(10));
+        let captured = String::from_utf8(capture.lock().unwrap().contents()).unwrap();
+        assert_eq!(
+            captured,
+            "0020:0024:trace:winsock:connect socket 0x1a4, len 16\r\n\
+             err:module:import_dll Library X.dll not found\npartial"
+        );
+    }
+
+    #[test]
+    fn a_long_line_goes_into_the_capture_whole() {
+        let line = format!("{}\n", "x".repeat(CAPTURE_LINE * 2 + 5));
+        let capture = Arc::new(Mutex::new(BoundedCapture::new(CAPTURE_LINE * 4)));
+        let completion = Arc::new(DrainCompletion::default());
+        completion.complete_stream();
+        drain_stream(
+            io::Cursor::new(line.clone().into_bytes()),
+            Arc::clone(&capture),
+            Arc::clone(&completion),
+            false,
+        );
+        completion.wait_for_streams(Duration::from_secs(10));
+        assert_eq!(capture.lock().unwrap().contents(), line.into_bytes());
+    }
+
+    #[test]
+    fn a_long_output_keeps_its_start_and_its_end() {
+        let mut capture = BoundedCapture::new(16);
+        capture.append(b"0123456789");
+        assert_eq!(capture.contents(), b"0123456789");
+        assert!(!capture.truncated);
+        capture.append(b"abcdef");
+        // All of it while it fits.
+        assert_eq!(capture.contents(), b"0123456789abcdef");
+        capture.append(b"ERROR!");
+        assert!(capture.truncated);
+        assert_eq!(
+            String::from_utf8(capture.contents()).unwrap(),
+            "01234567\n[6 bytes of output left out]\nefERROR!"
+        );
+    }
+
+    /// `output` through [`drain_stream`] into a capture of `limit` bytes.
+    fn drained(output: String, limit: usize) -> String {
+        let capture = Arc::new(Mutex::new(BoundedCapture::new(limit)));
+        let completion = Arc::new(DrainCompletion::default());
+        completion.complete_stream();
+        drain_stream(
+            io::Cursor::new(output.into_bytes()),
+            Arc::clone(&capture),
+            Arc::clone(&completion),
+            false,
+        );
+        completion.wait_for_streams(Duration::from_secs(10));
+        String::from_utf8(capture.lock().unwrap().contents()).unwrap()
+    }
+
+    #[test]
+    fn the_capture_takes_network_lines_twenty_a_second() {
+        let output = (0..100)
+            .map(|index| format!("0020:0024:trace:winsock:connect socket {index}\n"))
+            .collect::<String>();
+        // The 100 come in one second, or in two when the second changes
+        // while they are read.
+        let network = drained(output, 64 * 1024)
+            .matches(":winsock:connect")
+            .count();
+        assert!((20..=40).contains(&network), "{network}");
+    }
+
+    #[test]
+    fn a_long_runs_capture_ends_with_its_error() {
+        let mut output = "starting\n".to_owned();
+        for _ in 0..200 {
+            output.push_str("fixme:ole:noise\n");
+        }
+        output.push_str("err:module:import_dll Library X.dll not found\n");
+        let captured = drained(output, 1024);
+        assert!(captured.starts_with("starting\n"), "{captured}");
+        assert!(captured.contains("bytes of output left out"), "{captured}");
+        assert!(
+            captured.ends_with("err:module:import_dll Library X.dll not found\n"),
+            "{captured}"
+        );
+    }
 
     #[test]
     fn bounded_host_output_rejects_overflow() {

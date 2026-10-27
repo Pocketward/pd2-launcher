@@ -140,6 +140,56 @@ impl<'a> VerifiedUpdater<'a> {
         inventory: ProtectedInventoryEvidence,
         control: &OperationControl,
     ) -> Result<ApplyOutcome, UpdateError> {
+        match self.apply_planned(transaction_id, game, inventory, control, None)? {
+            Planned::Applied(outcome) => Ok(outcome),
+            Planned::Differs | Planned::Busy => Err(UpdateError::UnsafePlan),
+        }
+    }
+
+    /// Records the current manifest as the accepted one only when the
+    /// installed client already is that manifest's: every file it names is
+    /// there with its digest (a protected file as an update takes it). The
+    /// digest of a file that the client's record lists is the record's (the
+    /// audit before a check proves the files that record names), so only
+    /// the files it does not list are read. No file is downloaded or
+    /// changed. `hold` is
+    /// called only then, right before the record is written, and the write
+    /// happens only while what it returns is held (the installation's lease,
+    /// so that no game starts meanwhile): [`CurrentClient::Busy`] when it
+    /// returns `None`. [`CurrentClient::Differs`], and nothing changes, when a
+    /// file differs or is missing.
+    pub(crate) fn accept_if_current(
+        &mut self,
+        transaction_id: &str,
+        control: &OperationControl,
+        hold: &dyn Fn() -> Option<Box<dyn std::any::Any>>,
+    ) -> Result<CurrentClient, UpdateError> {
+        Ok(
+            match self.apply_planned(
+                transaction_id,
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+                control,
+                Some(hold),
+            )? {
+                Planned::Applied(_) => CurrentClient::Recorded,
+                Planned::Differs => CurrentClient::Differs,
+                Planned::Busy => CurrentClient::Busy,
+            },
+        )
+    }
+
+    /// [`Self::apply_controlled`]; with `only_if_current`, no download:
+    /// [`Planned::Differs`] when a file must change, and the record is
+    /// written only while what it returns is held.
+    fn apply_planned(
+        &mut self,
+        transaction_id: &str,
+        game: GameActivity,
+        inventory: ProtectedInventoryEvidence,
+        control: &OperationControl,
+        only_if_current: Option<&dyn Fn() -> Option<Box<dyn std::any::Any>>>,
+    ) -> Result<Planned, UpdateError> {
         if game == GameActivity::Running {
             return Err(UpdateError::GameRunning);
         }
@@ -153,10 +203,28 @@ impl<'a> VerifiedUpdater<'a> {
         reject_cancelled(control)?;
         manifest.accepted()?;
         let lease = self.layout.acquire_exclusive()?;
-        let local = inspect_local_client(lease.project_directory(), &manifest)?;
+        let local = if only_if_current.is_some() {
+            inspect_local_client_by_record(
+                lease.project_directory(),
+                lease.metadata_directory(),
+                &manifest,
+            )?
+        } else {
+            inspect_local_client(lease.project_directory(), &manifest)?
+        };
         let plan = plan(&manifest, &local)?;
+        let mut _held = None;
+        if let Some(hold) = only_if_current {
+            if !plan.promotions.is_empty() {
+                return Ok(Planned::Differs);
+            }
+            match hold() {
+                Some(held) => _held = Some(held),
+                None => return Ok(Planned::Busy),
+            }
+        }
         if plan.promotions.is_empty() && accepted_is(lease.metadata_directory(), &manifest)? {
-            return Ok(ApplyOutcome::NoOp);
+            return Ok(Planned::Applied(ApplyOutcome::NoOp));
         }
         self.layout
             .prepare_staging_with_lease(transaction_id, &manifest, &lease)?;
@@ -237,12 +305,30 @@ impl<'a> VerifiedUpdater<'a> {
             control,
         )?;
 
-        Ok(ApplyOutcome::Applied {
+        Ok(Planned::Applied(ApplyOutcome::Applied {
             downloaded,
             promoted: promotions.len(),
             preserved: plan.preserved,
-        })
+        }))
     }
+}
+
+/// What [`VerifiedUpdater::accept_if_current`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CurrentClient {
+    /// The installed client is the manifest's own: its record is written.
+    Recorded,
+    /// The installed client is the manifest's own, but the record was not
+    /// written: the installation was busy (a game starting, a job).
+    Busy,
+    /// A file differs or is missing: nothing changed.
+    Differs,
+}
+
+enum Planned {
+    Applied(ApplyOutcome),
+    Differs,
+    Busy,
 }
 
 fn default_retry_policy() -> RetryPolicy {
@@ -358,6 +444,63 @@ fn inspect_local_client(
         files.insert(entry.path().clone(), evidence);
     }
     Ok(LocalClientEvidence(files))
+}
+
+/// [`inspect_local_client`] with the digest that the client's record (in
+/// `metadata`) names for each file it lists: only a file it does not list is
+/// read. A listed file must still be there.
+fn inspect_local_client_by_record(
+    project: &Directory,
+    metadata: &Directory,
+    manifest: &Pd2Manifest,
+) -> Result<LocalClientEvidence, UpdateError> {
+    let recorded = recorded_digests(metadata)?;
+    let mut files = BTreeMap::new();
+    for entry in manifest.entries() {
+        let path = entry.path().as_str();
+        let name = std::ffi::OsStr::new(path);
+        let evidence = if is_protected(path) && open_optional(project, name)?.is_some() {
+            LocalFileEvidence::ProtectedPresent
+        } else {
+            let digest = match recorded.get(path) {
+                Some(digest) => open_optional(project, name)?.map(|_| *digest),
+                None => local_digest_at(project, name)?,
+            };
+            if digest == Some(entry.digest().bytes()) {
+                LocalFileEvidence::Matching
+            } else {
+                LocalFileEvidence::MissingOrChanged
+            }
+        };
+        files.insert(entry.path().clone(), evidence);
+    }
+    Ok(LocalClientEvidence(files))
+}
+
+/// Each file of the client's record (`accepted-manifest.json` in
+/// `metadata`) and its digest; none without a record.
+fn recorded_digests(metadata: &Directory) -> Result<BTreeMap<String, [u8; 16]>, UpdateError> {
+    let Some(file) = open_optional(metadata, std::ffi::OsStr::new("accepted-manifest.json"))?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut raw = Vec::new();
+    file.take(MAX_ACCEPTED_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_ACCEPTED_MANIFEST_BYTES {
+        return Err(UpdateError::UnsafePath);
+    }
+    let record = Pd2Manifest::parse(crate::manifest::ManifestResponse {
+        requested_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+        final_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+        declared_length: Some(raw.len() as u64),
+        body: raw,
+    })?;
+    Ok(record
+        .entries()
+        .iter()
+        .map(|entry| (entry.path().as_str().to_owned(), entry.digest().bytes()))
+        .collect())
 }
 
 fn plan(manifest: &Pd2Manifest, local: &LocalClientEvidence) -> Result<UpdatePlan, UpdateError> {
@@ -617,6 +760,117 @@ struct PrefetchedManifestSource {
 
 fn md5_hex(bytes: [u8; 16]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A PD2 source that serves a manifest already fetched (its `raw` bytes,
+/// from `base`) and no client file: an update through it writes the record
+/// only when nothing must be downloaded.
+pub(crate) struct FetchedManifestSource {
+    base: crate::manifest::Pd2ClientBase,
+    raw: Vec<u8>,
+}
+
+impl FetchedManifestSource {
+    pub(crate) fn new(base: crate::manifest::Pd2ClientBase, manifest: &Pd2Manifest) -> Self {
+        Self {
+            base,
+            raw: manifest.raw().to_vec(),
+        }
+    }
+}
+
+impl Pd2Source for FetchedManifestSource {
+    fn client_base(&self) -> crate::manifest::Pd2ClientBase {
+        self.base.clone()
+    }
+
+    fn fetch_manifest(&mut self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        let url = self.base.manifest_url();
+        Ok(crate::manifest::ManifestResponse {
+            requested_url: url.clone(),
+            final_url: url,
+            declared_length: Some(self.raw.len() as u64),
+            body: self.raw.clone(),
+        })
+    }
+
+    fn open_object(&mut self, _request: &ObjectRequest) -> Result<ObjectResponse, NetworkError> {
+        Err(NetworkError::permanent("client files are not downloaded"))
+    }
+}
+
+/// A PD2 source that serves, as the manifest, the client copied into
+/// `project` by an import, with no file list from PD2's server and no client
+/// file: each regular file at the top of ProjectD2 that is a program, a
+/// library or a game archive (`.exe`, `.dll`, `.mpq`, in any case), with the
+/// MD5 of the copied file. The player's own files, the official launcher's
+/// and any other file are left out ([`is_protected`]), so their changes never
+/// ask for Check files. An update through it changes no file and records
+/// the copied client as the accepted one, offline. This record is never the
+/// server's manifest, so Play's update check then offers the update (the
+/// owner's import rule of 2026-10-26).
+pub(crate) struct CopiedClientPd2Source<'a> {
+    project: &'a Directory,
+}
+
+impl<'a> CopiedClientPd2Source<'a> {
+    pub(crate) fn new(project: &'a Directory) -> Self {
+        Self { project }
+    }
+
+    fn copied_manifest(&self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        let unreadable = |_| NetworkError::permanent("a copied client file was unreadable");
+        let mut names: Vec<String> = Vec::new();
+        for name in self.project.names().map_err(unreadable)? {
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            let client = [".exe", ".dll", ".mpq"]
+                .iter()
+                .any(|extension| lower.ends_with(extension));
+            if !client || is_protected(name) || name.starts_with('.') {
+                continue;
+            }
+            let regular = self
+                .project
+                .open_file(Path::new(name))
+                .and_then(|file| file.metadata())
+                .is_ok_and(|metadata| metadata.is_file());
+            if regular {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        let mut lines = Vec::with_capacity(names.len());
+        for name in names {
+            let digest = local_digest_at(self.project, std::ffi::OsStr::new(&name))
+                .map_err(|_| NetworkError::permanent("a copied client file was unreadable"))?
+                .ok_or_else(|| NetworkError::permanent("a copied client file went away"))?;
+            lines.push(serde_json::Value::String(format!(
+                "{}  {name}",
+                md5_hex(digest)
+            )));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "checksum": lines }))
+            .map_err(|_| NetworkError::permanent("the copied client's manifest was not written"))?;
+        Ok(crate::manifest::ManifestResponse {
+            requested_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+            final_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+            declared_length: Some(body.len() as u64),
+            body,
+        })
+    }
+}
+
+impl Pd2Source for CopiedClientPd2Source<'_> {
+    fn fetch_manifest(&mut self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        self.copied_manifest()
+    }
+
+    fn open_object(&mut self, _request: &ObjectRequest) -> Result<ObjectResponse, NetworkError> {
+        Err(NetworkError::permanent("client files are not downloaded"))
+    }
 }
 
 /// Download every object of the current manifest into `cache` and verify
@@ -942,6 +1196,158 @@ impl Pd2Source for ManifestOnlyPd2Source<'_> {
 
     fn open_object(&mut self, _request: &ObjectRequest) -> Result<ObjectResponse, NetworkError> {
         self.refused = true;
+        Err(NetworkError::permanent("client files are not downloaded"))
+    }
+}
+
+/// A PD2 source that serves the manifest of the client as it is installed in
+/// `project`, and no client file: the entries of `inner`'s manifest whose file
+/// is there, each with the MD5 of the installed file. A protected file (the
+/// player's own, or the official launcher's) keeps the manifest's MD5: it is
+/// only checked as present, and the official launcher's is trusted only as
+/// the manifest names it. An entry whose file is not there is left out, but
+/// not one the client's record so far names (a file the client had is gone:
+/// the manifest is refused, as only an update brings it back). An update
+/// through it changes no file and records the installed client as the
+/// accepted one: Game.exe and ProjectDiablo.dll must be there, or the manifest
+/// it serves is rejected and nothing changes. A client that is the manifest's
+/// own (every file there, each with the manifest's MD5) gets the manifest as
+/// it is, so the update check finds it up to date. This is how an imported
+/// Project Diablo 2 of any version, or a modded one, is kept as it is while
+/// the update checks are off.
+pub(crate) struct InstalledClientPd2Source<'a> {
+    inner: &'a mut dyn Pd2Source,
+    project: &'a Directory,
+}
+
+impl<'a> InstalledClientPd2Source<'a> {
+    pub(crate) fn new(inner: &'a mut dyn Pd2Source, project: &'a Directory) -> Self {
+        Self { inner, project }
+    }
+
+    /// The names of the client's record so far, when it has a readable one.
+    fn recorded(&self) -> BTreeMap<String, ()> {
+        let Ok(file) = self
+            .project
+            .open_file(Path::new(".pd2launcher/accepted-manifest.json"))
+        else {
+            return BTreeMap::new();
+        };
+        let mut raw = Vec::new();
+        if file
+            .take(MAX_ACCEPTED_MANIFEST_BYTES + 1)
+            .read_to_end(&mut raw)
+            .is_err()
+        {
+            return BTreeMap::new();
+        }
+        Pd2Manifest::parse(crate::manifest::ManifestResponse {
+            requested_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+            final_url: crate::manifest::PD2_MANIFEST_URL.to_owned(),
+            declared_length: Some(raw.len() as u64),
+            body: raw,
+        })
+        .map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .map(|entry| (entry.path().as_str().to_owned(), ()))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn as_installed(
+        &self,
+        response: crate::manifest::ManifestResponse,
+        control: Option<&OperationControl>,
+    ) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        let manifest = Pd2Manifest::parse_from(response.clone(), &self.inner.client_base())
+            .map_err(|_| NetworkError::permanent("the PD2 manifest was rejected"))?;
+        let unreadable = |_| NetworkError::permanent("an installed client file was unreadable");
+        let recorded = self.recorded();
+        let mut lines = Vec::with_capacity(manifest.entries().len());
+        let mut left_out = Vec::new();
+        let mut as_manifest = true;
+        for entry in manifest.entries() {
+            if control.is_some_and(OperationControl::is_cancelled) {
+                return Err(NetworkError::transient("the client's check was cancelled"));
+            }
+            let path = entry.path().as_str();
+            let name = std::ffi::OsStr::new(path);
+            let digest = if is_protected(path) {
+                if open_optional(self.project, name)
+                    .map_err(unreadable)?
+                    .is_none()
+                {
+                    as_manifest = false;
+                    continue;
+                }
+                entry.digest().bytes()
+            } else {
+                match local_digest_at(self.project, name).map_err(unreadable)? {
+                    Some(digest) => digest,
+                    None if recorded.contains_key(path) => {
+                        eprintln!(
+                            "pd2-launcher: {path} of the accepted client is missing: it is not accepted as installed"
+                        );
+                        return Err(NetworkError::permanent(
+                            "a file of the accepted client is missing",
+                        ));
+                    }
+                    None => {
+                        as_manifest = false;
+                        left_out.push(path.to_owned());
+                        continue;
+                    }
+                }
+            };
+            as_manifest &= digest == entry.digest().bytes();
+            lines.push(serde_json::Value::String(format!(
+                "{}  {path}",
+                md5_hex(digest)
+            )));
+        }
+        if as_manifest {
+            return Ok(response);
+        }
+        if !left_out.is_empty() {
+            eprintln!(
+                "pd2-launcher: the installed client has no {}: recorded without them",
+                left_out.join(", ")
+            );
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "checksum": lines })).map_err(|_| {
+            NetworkError::permanent("the installed client's manifest was not written")
+        })?;
+        Ok(crate::manifest::ManifestResponse {
+            requested_url: response.requested_url,
+            final_url: response.final_url,
+            declared_length: Some(body.len() as u64),
+            body,
+        })
+    }
+}
+
+impl Pd2Source for InstalledClientPd2Source<'_> {
+    fn client_base(&self) -> crate::manifest::Pd2ClientBase {
+        self.inner.client_base()
+    }
+
+    fn fetch_manifest(&mut self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        let response = self.inner.fetch_manifest()?;
+        self.as_installed(response, None)
+    }
+
+    fn fetch_manifest_controlled(
+        &mut self,
+        control: &OperationControl,
+    ) -> Result<crate::manifest::ManifestResponse, NetworkError> {
+        let response = self.inner.fetch_manifest_controlled(control)?;
+        self.as_installed(response, Some(control))
+    }
+
+    fn open_object(&mut self, _request: &ObjectRequest) -> Result<ObjectResponse, NetworkError> {
         Err(NetworkError::permanent("client files are not downloaded"))
     }
 }
@@ -3013,6 +3419,352 @@ mod tests {
         let objects = cache_objects(cache_path.path());
         assert_eq!(objects[&md5_hex(b"new game")].0, b"new game");
         assert_eq!(objects[&md5_hex(b"new dll")].0, b"new dll");
+    }
+
+    /// With the update checks off, an imported client of another version (or
+    /// a modded one) is recorded as it is installed: no file is downloaded or
+    /// changed, each installed file of the manifest is recorded with its own
+    /// MD5, a protected one with the manifest's, and a file the installed
+    /// version does not have is left out.
+    #[test]
+    fn a_client_accepted_as_installed_is_recorded_as_it_is() {
+        let server: &[(&str, &[u8])] = &[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("pd2data.mpq", b"current data"),
+            ("loot.filter", b"vendor default"),
+            ("PD2Launcher.exe", b"current launcher"),
+        ];
+        let older: &[(&str, &[u8])] = &[
+            ("Game.exe", b"older game"),
+            ("ProjectDiablo.dll", b"older dll"),
+            ("loot.filter", b"my filter"),
+            ("PD2Launcher.exe", b"older launcher"),
+        ];
+        let project = TempDir::new().unwrap();
+        for (name, bytes) in older {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        let installed = Directory::open(project.path()).unwrap();
+        let mut source = FakeSource::new(server);
+        let applied = {
+            let mut kept = InstalledClientPd2Source::new(&mut source, &installed);
+            VerifiedUpdater::new(project.path(), &mut kept)
+                .with_retry_policy(RetryPolicy::once())
+                .apply(
+                    "txn-as-installed",
+                    GameActivity::Idle,
+                    ProtectedInventoryEvidence::Complete,
+                )
+        };
+        assert_eq!(
+            applied.unwrap(),
+            ApplyOutcome::Applied {
+                downloaded: 0,
+                promoted: 0,
+                preserved: 2,
+            }
+        );
+        assert!(source.requests.is_empty(), "no client file is fetched");
+        for (name, bytes) in older {
+            assert_eq!(
+                fs::read(project.path().join(name)).unwrap(),
+                *bytes,
+                "{name}"
+            );
+        }
+        let record = fs::read(project.path().join(".pd2launcher/accepted-manifest.json")).unwrap();
+        assert_eq!(
+            record,
+            manifest_body(&[
+                ("Game.exe", b"older game"),
+                ("ProjectDiablo.dll", b"older dll"),
+                ("loot.filter", b"vendor default"),
+                ("PD2Launcher.exe", b"current launcher"),
+            ])
+        );
+
+        // Recorded once: the same client again changes nothing.
+        let mut kept = InstalledClientPd2Source::new(&mut source, &installed);
+        let again = VerifiedUpdater::new(project.path(), &mut kept)
+            .with_retry_policy(RetryPolicy::once())
+            .apply(
+                "txn-as-installed-again",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            );
+        assert_eq!(again.unwrap(), ApplyOutcome::NoOp);
+    }
+
+    /// A client that is the current release is recorded as the manifest
+    /// itself, so the update check finds it up to date.
+    #[test]
+    fn a_current_client_accepted_as_installed_is_recorded_as_the_manifest() {
+        let server: &[(&str, &[u8])] = &[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("loot.filter", b"vendor default"),
+        ];
+        let project = TempDir::new().unwrap();
+        for (name, bytes) in [
+            ("Game.exe", &b"current game"[..]),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("loot.filter", b"my filter"),
+        ] {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        let installed = Directory::open(project.path()).unwrap();
+        let mut source = FakeSource::new(server);
+        let mut kept = InstalledClientPd2Source::new(&mut source, &installed);
+        VerifiedUpdater::new(project.path(), &mut kept)
+            .with_retry_policy(RetryPolicy::once())
+            .apply(
+                "txn-as-installed",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(project.path().join(".pd2launcher/accepted-manifest.json")).unwrap(),
+            source.manifest
+        );
+        assert!(source.requests.is_empty());
+    }
+
+    /// A file the client's record names is not left out: it is gone, and
+    /// only an update brings it back. Nothing is recorded or changed.
+    #[test]
+    fn a_recorded_file_that_is_gone_is_not_accepted_as_installed() {
+        let server: &[(&str, &[u8])] = &[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("pd2data.mpq", b"current data"),
+        ];
+        let older: &[(&str, &[u8])] = &[
+            ("Game.exe", b"older game"),
+            ("ProjectDiablo.dll", b"older dll"),
+            ("pd2data.mpq", b"older data"),
+        ];
+        let project = TempDir::new().unwrap();
+        for (name, bytes) in older {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+        let record = project.path().join(".pd2launcher/accepted-manifest.json");
+        fs::write(&record, manifest_body(older)).unwrap();
+        fs::remove_file(project.path().join("pd2data.mpq")).unwrap();
+        let installed = Directory::open(project.path()).unwrap();
+        let mut source = FakeSource::new(server);
+        let mut kept = InstalledClientPd2Source::new(&mut source, &installed);
+        let applied = VerifiedUpdater::new(project.path(), &mut kept)
+            .with_retry_policy(RetryPolicy::once())
+            .apply(
+                "txn-as-installed",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            );
+        assert!(applied.is_err());
+        assert_eq!(fs::read(&record).unwrap(), manifest_body(older));
+        assert!(source.requests.is_empty());
+    }
+
+    /// A client without its launch files is not a Project Diablo 2 the
+    /// launch can run: nothing is recorded, and nothing changes.
+    #[test]
+    fn a_client_without_its_launch_files_is_not_accepted_as_installed() {
+        let server: &[(&str, &[u8])] = &[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+        ];
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("Game.exe"), b"older game").unwrap();
+        let installed = Directory::open(project.path()).unwrap();
+        let mut source = FakeSource::new(server);
+        let mut kept = InstalledClientPd2Source::new(&mut source, &installed);
+        let applied = VerifiedUpdater::new(project.path(), &mut kept)
+            .with_retry_policy(RetryPolicy::once())
+            .apply(
+                "txn-as-installed",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            );
+        assert!(applied.is_err());
+        assert!(
+            !project
+                .path()
+                .join(".pd2launcher/accepted-manifest.json")
+                .exists()
+        );
+        assert_eq!(
+            fs::read(project.path().join("Game.exe")).unwrap(),
+            b"older game"
+        );
+    }
+
+    /// An import's copied client is recorded from its own files, offline:
+    /// its programs, libraries and archives at the top of ProjectD2, each
+    /// with its own MD5; the player's files, the official launcher's and
+    /// anything else are left out, and nothing is fetched or changed. The
+    /// record is not the server's manifest, so Play's check offers the
+    /// update.
+    #[test]
+    fn a_copied_client_is_recorded_from_its_own_files_with_no_network() {
+        let project = TempDir::new().unwrap();
+        let copied: &[(&str, &[u8])] = &[
+            ("Game.exe", b"older game"),
+            ("ProjectDiablo.dll", b"older dll"),
+            ("pd2data.MPQ", b"older data"),
+        ];
+        for (name, bytes) in copied {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        for (name, bytes) in [
+            ("PD2Launcher.exe", &b"official launcher"[..]),
+            ("PD2Shared.dll", b"shared"),
+            ("loot.filter", b"mine"),
+            ("d2gl.json", b"{}"),
+            ("BnetLog.txt", b"log"),
+        ] {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        fs::create_dir_all(project.path().join("Live")).unwrap();
+        fs::write(project.path().join("Live/inner.dll"), b"inner").unwrap();
+        fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+        let record = project.path().join(".pd2launcher/accepted-manifest.json");
+        fs::write(&record, b"{\"checksum\":[]}").unwrap();
+        let installed = Directory::open(project.path()).unwrap();
+        let mut source = CopiedClientPd2Source::new(&installed);
+        VerifiedUpdater::new(project.path(), &mut source)
+            .with_retry_policy(RetryPolicy::once())
+            .apply(
+                "txn-copied",
+                GameActivity::Idle,
+                ProtectedInventoryEvidence::Complete,
+            )
+            .unwrap();
+        let mut sorted = copied.to_vec();
+        sorted.sort_by_key(|(name, _)| *name);
+        assert_eq!(fs::read(&record).unwrap(), manifest_body(&sorted));
+        assert_eq!(
+            fs::read(project.path().join("Game.exe")).unwrap(),
+            b"older game"
+        );
+        // The server's manifest of the current release differs.
+        let server = manifest_body(&[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("pd2data.mpq", b"current data"),
+        ]);
+        assert_ne!(fs::read(&record).unwrap(), server);
+    }
+
+    /// The first Play after an import: a copied client that already is the
+    /// current release gets PD2's record, with no download; an older one
+    /// keeps its record, and nothing is fetched or changed.
+    #[test]
+    fn only_a_client_that_already_is_the_manifests_own_gets_its_record_with_no_download() {
+        let server: &[(&str, &[u8])] = &[
+            ("Game.exe", b"current game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("D2.LNG", b"lang"),
+        ];
+        // As the import records them: the programs, libraries and archives.
+        let copied = |files: &[(&str, &[u8])]| {
+            let listed: Vec<_> = files
+                .iter()
+                .copied()
+                .filter(|(name, _)| name.ends_with(".exe") || name.ends_with(".dll"))
+                .collect();
+            manifest_body(&listed)
+        };
+        let run = |files: &[(&str, &[u8])]| {
+            let project = TempDir::new().unwrap();
+            for (name, bytes) in files {
+                fs::write(project.path().join(name), bytes).unwrap();
+            }
+            fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+            let record = project.path().join(".pd2launcher/accepted-manifest.json");
+            fs::write(&record, copied(files)).unwrap();
+            let mut fake = FakeSource::new(server);
+            let manifest = VerifiedUpdater::new(project.path(), &mut fake)
+                .check()
+                .unwrap();
+            let mut fetched =
+                FetchedManifestSource::new(crate::manifest::Pd2ClientBase::BuiltIn, &manifest);
+            let current = VerifiedUpdater::new(project.path(), &mut fetched)
+                .accept_if_current("txn-first-play", &OperationControl::default(), &|| {
+                    Some(Box::new(()))
+                })
+                .unwrap();
+            assert!(fake.requests.is_empty(), "nothing downloaded");
+            (
+                current,
+                fs::read(&record).unwrap(),
+                fs::read(project.path().join("Game.exe")).unwrap(),
+            )
+        };
+
+        let (current, record, game) = run(server);
+        assert_eq!(current, CurrentClient::Recorded);
+        assert_eq!(record, manifest_body(server));
+        assert_eq!(game, b"current game");
+
+        let older: &[(&str, &[u8])] = &[
+            ("Game.exe", b"older game"),
+            ("ProjectDiablo.dll", b"current dll"),
+            ("D2.LNG", b"lang"),
+        ];
+        let (current, record, game) = run(older);
+        assert_eq!(current, CurrentClient::Differs);
+        assert_eq!(record, copied(older));
+        assert_eq!(game, b"older game");
+        // A file of the release that the copy lacks is a difference too.
+        let (current, record, _) = run(&server[..2]);
+        assert_eq!(current, CurrentClient::Differs);
+        assert_eq!(record, copied(&server[..2]));
+
+        // A busy installation: the files are current, but nothing is written.
+        let project = TempDir::new().unwrap();
+        for (name, bytes) in server {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+        let record = project.path().join(".pd2launcher/accepted-manifest.json");
+        fs::write(&record, copied(server)).unwrap();
+        let mut fake = FakeSource::new(server);
+        let manifest = VerifiedUpdater::new(project.path(), &mut fake)
+            .check()
+            .unwrap();
+        let mut fetched =
+            FetchedManifestSource::new(crate::manifest::Pd2ClientBase::BuiltIn, &manifest);
+        let busy = VerifiedUpdater::new(project.path(), &mut fetched)
+            .accept_if_current("txn-busy", &OperationControl::default(), &|| None)
+            .unwrap();
+        assert_eq!(busy, CurrentClient::Busy);
+        assert_eq!(fs::read(&record).unwrap(), copied(server));
+
+        // A file that the record lists is not read again: its recorded
+        // digest counts (the audit before the check proves it).
+        let project = TempDir::new().unwrap();
+        for (name, bytes) in server {
+            fs::write(project.path().join(name), bytes).unwrap();
+        }
+        fs::create_dir(project.path().join(".pd2launcher")).unwrap();
+        let record = project.path().join(".pd2launcher/accepted-manifest.json");
+        fs::write(&record, copied(server)).unwrap();
+        fs::write(project.path().join("Game.exe"), b"").unwrap();
+        let mut fake = FakeSource::new(server);
+        let manifest = VerifiedUpdater::new(project.path(), &mut fake)
+            .check()
+            .unwrap();
+        let mut fetched =
+            FetchedManifestSource::new(crate::manifest::Pd2ClientBase::BuiltIn, &manifest);
+        let current = VerifiedUpdater::new(project.path(), &mut fetched)
+            .accept_if_current("txn-by-record", &OperationControl::default(), &|| {
+                Some(Box::new(()))
+            })
+            .unwrap();
+        assert_eq!(current, CurrentClient::Recorded);
     }
 
     fn manifest_body(files: &[(&str, &[u8])]) -> Vec<u8> {

@@ -67,6 +67,27 @@ const BASE_FILES: [&str; 9] = [
     "d2video.mpq",
 ];
 const EXPANSION_FILES: [&str; 4] = ["d2exp.mpq", "d2xmusic.mpq", "d2xtalk.mpq", "d2xvideo.mpq"];
+/// What an import on the Android host checks instead, by canonical name (the
+/// owner's rule of 2026-10-26: a short check of the important files, no
+/// version check): Diablo II's and Lord of Destruction's programs and main
+/// archives, and Project Diablo 2's programs, each a file that is not empty. The import
+/// then records this Project Diablo 2 as it is; the desktop keeps
+/// `BASE_FILES` and `EXPANSION_FILES` and installs Project Diablo 2 itself.
+/// The audit of an imported game on the Android host proves Diablo II and
+/// Lord of Destruction by the same files.
+pub(crate) const IMPORT_BASE_FILES: [&str; 5] = [
+    "Game.exe",
+    "Diablo II.exe",
+    "d2data.mpq",
+    "d2char.mpq",
+    "d2sfx.mpq",
+];
+pub(crate) const IMPORT_EXPANSION_FILES: [&str; 1] = ["d2exp.mpq"];
+const IMPORT_PROJECT_DIABLO_FILES: [&str; 3] = [
+    "ProjectD2/Game.exe",
+    "ProjectD2/ProjectDiablo.dll",
+    "ProjectD2/PD2Launcher.exe",
+];
 /// Copied only on the desktop, where Install Project Diablo 2 adopts it;
 /// the Android app copies folders itself.
 const PROJECT_D2: &str = "projectd2";
@@ -381,6 +402,8 @@ impl ExistingInstall {
     /// it is imported: it must still be the same folder and still usable.
     pub(crate) fn revalidate(&self, managed_root: &Path) -> Result<Self, ExistingInstallProblem> {
         let fresh = validate_existing(&self.folder.path, managed_root)?;
+        // `validate_existing` checks as the host does (on Android the
+        // import's short list).
         if fresh.folder != self.folder {
             return Err(ExistingInstallProblem::NotFound);
         }
@@ -393,10 +416,22 @@ impl ExistingInstall {
 /// used as it is. Every file the game needs (`BASE_FILES` and
 /// `EXPANSION_FILES`) is a regular file in it, and no symbolic link or
 /// special file is part of it. Names are matched without regard to case, as
-/// Windows does. The folder is only read: it is never patched.
+/// Windows does. The folder is only read: it is never patched. On the
+/// Android host the files checked are the import's short list instead
+/// (`IMPORT_BASE_FILES`, `IMPORT_EXPANSION_FILES` and Project Diablo 2's).
 pub(crate) fn validate_existing(
     path: &Path,
     managed_root: &Path,
+) -> Result<ExistingInstall, ExistingInstallProblem> {
+    validate_existing_on(path, managed_root, crate::android_host())
+}
+
+/// [`validate_existing`] for the Android host's import (`android`) or the
+/// desktop's.
+fn validate_existing_on(
+    path: &Path,
+    managed_root: &Path,
+    android: bool,
 ) -> Result<ExistingInstall, ExistingInstallProblem> {
     if !path.is_absolute() {
         return Err(ExistingInstallProblem::NotFound);
@@ -415,23 +450,32 @@ pub(crate) fn validate_existing(
         })
         .map_err(|_| ExistingInstallProblem::Unreadable)?;
     let names = case_insensitive_names(&directory)?;
-    let has = |name: &str| names.contains_key(&name.to_ascii_lowercase());
-    if !has("game.exe") && !has("d2data.mpq") {
-        return Err(ExistingInstallProblem::NotDiablo);
-    }
-    // No version check: what `Game.exe` and `Patch_D2.mpq` hold is the
-    // player's choice. Project Diablo 2 runs its own game files from
-    // `ProjectD2`. A missing `Game.exe` is named before a missing Lord of
-    // Destruction, as the list below would not.
-    if open_named(&directory, &names, "Game.exe")?.is_none() {
-        return Err(ExistingInstallProblem::MissingFile("Game.exe"));
-    }
-    if open_named(&directory, &names, "d2exp.mpq")?.is_none() {
-        return Err(ExistingInstallProblem::NoExpansion);
-    }
-    for name in BASE_FILES.into_iter().chain(EXPANSION_FILES) {
-        if open_named(&directory, &names, name)?.is_none() {
-            return Err(ExistingInstallProblem::MissingFile(name));
+    if android {
+        // The app checked the picked folder with the same list before its
+        // copy, and named every missing file; this is the check that the
+        // copy is complete.
+        if let Some(missing) = missing_import_files(&directory, &names)?.first() {
+            return Err(ExistingInstallProblem::MissingFile(missing));
+        }
+    } else {
+        let has = |name: &str| names.contains_key(&name.to_ascii_lowercase());
+        if !has("game.exe") && !has("d2data.mpq") {
+            return Err(ExistingInstallProblem::NotDiablo);
+        }
+        // No version check: what `Game.exe` and `Patch_D2.mpq` hold is the
+        // player's choice. Project Diablo 2 runs its own game files from
+        // `ProjectD2`. A missing `Game.exe` is named before a missing Lord
+        // of Destruction, as the list below would not.
+        if open_named(&directory, &names, "Game.exe")?.is_none() {
+            return Err(ExistingInstallProblem::MissingFile("Game.exe"));
+        }
+        if open_named(&directory, &names, "d2exp.mpq")?.is_none() {
+            return Err(ExistingInstallProblem::NoExpansion);
+        }
+        for name in BASE_FILES.into_iter().chain(EXPANSION_FILES) {
+            if open_named(&directory, &names, name)?.is_none() {
+                return Err(ExistingInstallProblem::MissingFile(name));
+            }
         }
     }
     // Every part must be a real file or folder: a copy never follows a
@@ -470,6 +514,47 @@ pub(crate) fn validate_existing(
         project_diablo,
         project_d2_canonical,
     })
+}
+
+/// The files of the import's list (`IMPORT_BASE_FILES`,
+/// `IMPORT_EXPANSION_FILES`, then Project Diablo 2's) that `directory`
+/// (with its `names`) does not have as a file that is not empty, in that
+/// order.
+fn missing_import_files(
+    directory: &Directory,
+    names: &BTreeMap<String, OsString>,
+) -> Result<Vec<&'static str>, ExistingInstallProblem> {
+    let project = match names.get(PROJECT_D2) {
+        Some(name) => {
+            let project = directory
+                .open_directory(Path::new(name))
+                .map_err(open_problem)?;
+            let inside = case_insensitive_names(&project)?;
+            Some((project, inside))
+        }
+        None => None,
+    };
+    let mut missing = Vec::new();
+    for file in IMPORT_BASE_FILES
+        .into_iter()
+        .chain(IMPORT_EXPANSION_FILES)
+        .chain(IMPORT_PROJECT_DIABLO_FILES)
+    {
+        let opened = match file.split_once('/') {
+            Some((_, inner)) => match &project {
+                Some((project, inside)) => open_named(project, inside, inner)?,
+                None => None,
+            },
+            None => open_named(directory, names, file)?,
+        };
+        let present = opened
+            .and_then(|file| file.metadata().ok())
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0);
+        if !present {
+            missing.push(file);
+        }
+    }
+    Ok(missing)
 }
 
 /// Whether the folder can be used where it is: Windows programs can name
@@ -1247,6 +1332,66 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(GameFolder::read(&root), Err(GameFolderError::RecordInvalid));
+    }
+
+    /// On the Android host the import checks only its short list (Diablo
+    /// II's and Lord of Destruction's programs and main archives, Project
+    /// Diablo 2's programs), each a file that is not empty, with no version
+    /// check; every missing one is named, in the list's order.
+    #[test]
+    fn on_android_the_import_checks_its_short_list_and_names_every_missing_file() {
+        let fixture = tempfile::tempdir().unwrap();
+        let folder = fixture.path().join("Diablo II");
+        fs::create_dir_all(folder.join("projectd2")).unwrap();
+        for name in [
+            "game.exe",
+            "DIABLO II.EXE",
+            "d2data.mpq",
+            "d2char.mpq",
+            "d2sfx.mpq",
+            "d2exp.mpq",
+        ] {
+            fs::write(folder.join(name), b"x").unwrap();
+        }
+        for name in ["GAME.EXE", "projectdiablo.dll", "pd2launcher.exe"] {
+            fs::write(folder.join("projectd2").join(name), b"x").unwrap();
+        }
+        let root = Path::new("/nonexistent/pd2-launcher");
+        // No Patch_D2.mpq, no music, speech or video archives: not checked.
+        assert!(validate_existing_on(&folder, root, true).is_ok());
+        assert!(matches!(
+            validate_existing_on(&folder, root, false),
+            Err(ExistingInstallProblem::MissingFile(_))
+        ));
+
+        fs::remove_file(folder.join("d2char.mpq")).unwrap();
+        fs::write(folder.join("projectd2/pd2launcher.exe"), b"").unwrap();
+        fs::remove_file(folder.join("projectd2/projectdiablo.dll")).unwrap();
+        let directory = Directory::open(&folder).unwrap();
+        let names = case_insensitive_names(&directory).unwrap();
+        assert_eq!(
+            missing_import_files(&directory, &names).unwrap(),
+            [
+                "d2char.mpq",
+                "ProjectD2/ProjectDiablo.dll",
+                "ProjectD2/PD2Launcher.exe"
+            ]
+        );
+        assert!(matches!(
+            validate_existing_on(&folder, root, true),
+            Err(ExistingInstallProblem::MissingFile("d2char.mpq"))
+        ));
+        fs::remove_dir_all(folder.join("projectd2")).unwrap();
+        let names = case_insensitive_names(&directory).unwrap();
+        assert_eq!(
+            missing_import_files(&directory, &names).unwrap(),
+            [
+                "d2char.mpq",
+                "ProjectD2/Game.exe",
+                "ProjectD2/ProjectDiablo.dll",
+                "ProjectD2/PD2Launcher.exe"
+            ]
+        );
     }
 
     #[test]

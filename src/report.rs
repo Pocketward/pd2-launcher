@@ -189,18 +189,22 @@ impl ReportArchive {
     }
 
     /// Add the tail of a log file. Names and quoted strings in Battle.net
-    /// and game logs are masked when `identities`.
+    /// and game logs are masked when `identities`, and a crash report's
+    /// memory dump there keeps its hex words ([`Redactor::game_log_text`]).
     fn add_log(&mut self, name: &str, path: &Path, identities: bool) -> bool {
         let Ok(bytes) = read_tail(path, FILE_CAP as u64) else {
             return false;
         };
         let text = decode_log(&bytes);
-        let text = if identities {
-            mask_game_identities(&text)
+        if identities {
+            // Keys before names, as the engine's own copy does: a name rule
+            // would else take a key's first group for a name.
+            let redacted = mask_game_identities(&self.redactor.game_log_text(&text));
+            let bytes = tail_bytes(redacted.as_bytes(), FILE_CAP);
+            self.add_raw(name, bytes);
         } else {
-            text
-        };
-        self.add_text(name, &text);
+            self.add_text(name, &text);
+        }
         true
     }
 
@@ -324,6 +328,15 @@ pub(crate) fn utc_stamp(seconds: u64) -> String {
 pub(crate) fn utc_time(seconds: u64) -> String {
     let (year, month, day, hour, minute, second) = civil(seconds);
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// `2026-09-28 10:15:00.250 UTC` for `millis` since the epoch.
+pub(crate) fn utc_time_millis(millis: u64) -> String {
+    let (year, month, day, hour, minute, second) = civil(millis / 1000);
+    format!(
+        "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{:03} UTC",
+        millis % 1000
+    )
 }
 
 fn civil(seconds: u64) -> (i64, u32, u32, u64, u64, u64) {
@@ -1384,22 +1397,28 @@ fn summary_text(
         ),
     );
     line("Created", utc_time(inputs.now));
+    // The desktop's system, session, window GPU and Vulkan loader: on the
+    // Android host the app runs no desktop session, and its own facts
+    // (device.txt) and the Android line say what these would.
+    let android = inputs.android.is_some();
     let release = os_release();
     let (kernel_release, _) = kernel();
-    line(
-        "System",
-        format!(
-            "{} (ID={} ID_LIKE={} VERSION_ID={}{}) kernel {kernel_release} {}",
-            release.get("PRETTY_NAME").map_or("unknown", String::as_str),
-            release.get("ID").map_or("-", String::as_str),
-            release.get("ID_LIKE").map_or("-", String::as_str),
-            release.get("VERSION_ID").map_or("-", String::as_str),
-            release
-                .get("BUILD_ID")
-                .map_or_else(String::new, |id| format!(" BUILD_ID={id}")),
-            std::env::consts::ARCH,
-        ),
-    );
+    if !android {
+        line(
+            "System",
+            format!(
+                "{} (ID={} ID_LIKE={} VERSION_ID={}{}) kernel {kernel_release} {}",
+                release.get("PRETTY_NAME").map_or("unknown", String::as_str),
+                release.get("ID").map_or("-", String::as_str),
+                release.get("ID_LIKE").map_or("-", String::as_str),
+                release.get("VERSION_ID").map_or("-", String::as_str),
+                release
+                    .get("BUILD_ID")
+                    .map_or_else(String::new, |id| format!(" BUILD_ID={id}")),
+                std::env::consts::ARCH,
+            ),
+        );
+    }
     if let Some(android) = &inputs.android {
         line("Android", android.summary());
     }
@@ -1411,16 +1430,18 @@ fn summary_text(
         Value::String(value) => value,
         _ => "no".to_owned(),
     };
-    line(
-        "Session",
-        format!(
-            "{} on {} (DISPLAY {}, WAYLAND_DISPLAY {})",
-            session("XDG_SESSION_TYPE"),
-            session("XDG_CURRENT_DESKTOP"),
-            presence("DISPLAY"),
-            presence("WAYLAND_DISPLAY"),
-        ),
-    );
+    if !android {
+        line(
+            "Session",
+            format!(
+                "{} on {} (DISPLAY {}, WAYLAND_DISPLAY {})",
+                session("XDG_SESSION_TYPE"),
+                session("XDG_CURRENT_DESKTOP"),
+                presence("DISPLAY"),
+                presence("WAYLAND_DISPLAY"),
+            ),
+        );
+    }
     let graphics = inputs
         .host
         .as_ref()
@@ -1441,7 +1462,9 @@ fn summary_text(
                 )
             },
         );
-    line("GPU", graphics);
+    if !android {
+        line("GPU", graphics);
+    }
     line(
         "Game renderer",
         match &inputs.renderer_probe {
@@ -1458,11 +1481,14 @@ fn summary_text(
         },
     );
     if let Some(host) = &inputs.host {
-        let mut notes = vec![format!(
-            "Vulkan loader {}, driver {}",
-            yes(host.vulkan_loader),
-            yes(host.vulkan_driver)
-        )];
+        let mut notes = Vec::new();
+        if !android {
+            notes.push(format!(
+                "Vulkan loader {}, driver {}",
+                yes(host.vulkan_loader),
+                yes(host.vulkan_driver)
+            ));
+        }
         notes.push(format!(
             "Wine preflight {:?}",
             host.runtime_execution_preflight
@@ -1738,6 +1764,35 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn a_game_logs_copy_keeps_a_dump_rows_hex_and_masks_keys_before_names() {
+        let fixture = TempDir::new().unwrap();
+        let path = fixture.path().join("D226102.txt");
+        std::fs::write(
+            &path,
+            "21:13:04.951  0201FF18: FFFFFFFF D87E244C AD144BBF F293C16F  TM.x..%.l......o\n\
+             \x20             0201FF28: 2468BCDE  GHJKMNPR\n\
+             name: 2468 BCDE 9F7E 6D4B\n",
+        )
+        .unwrap();
+        let mut archive = ReportArchive::new(Redactor::default());
+        assert!(archive.add_log("logs/ProjectD2/D226102.txt", &path, true));
+        let text = String::from_utf8(archive.entries()[0].1.clone()).unwrap();
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines[0],
+            "21:13:04.951  0201FF18: FFFFFFFF D87E244C AD144BBF F293C16F  TM.x..%.l......o"
+        );
+        assert_eq!(
+            lines[1],
+            format!("              0201FF28: {}", crate::redact::KEY_MASK)
+        );
+        // The key goes whole before the name rule takes its first group.
+        for group in ["BCDE", "9F7E", "6D4B"] {
+            assert!(!lines[2].contains(group), "{}", lines[2]);
+        }
+    }
+
+    #[test]
     fn each_helper_s_exit_codes_are_read_by_its_own_meaning() {
         assert_eq!(
             helper_verdict("installer UI helper", Some(23)),
@@ -1762,6 +1817,10 @@ mod tests {
         assert_eq!(utc_stamp(0), "19700101T000000Z");
         assert_eq!(utc_stamp(1_790_590_141), "20260928T100901Z");
         assert_eq!(utc_time(951_782_400), "2000-02-29 00:00:00 UTC");
+        assert_eq!(
+            utc_time_millis(951_782_400_250),
+            "2000-02-29 00:00:00.250 UTC"
+        );
     }
 
     #[test]
@@ -1840,10 +1899,20 @@ mod tests {
             summary.contains("Android         Android 13 (SDK 33), Retroid Pocket Nova"),
             "{summary}"
         );
+        for desktop in ["System ", "Session ", "GPU "] {
+            assert!(
+                !summary.lines().any(|line| line.starts_with(desktop)),
+                "{desktop}in {summary}"
+            );
+        }
 
         let (summary, report) = saved(&inputs(None));
         assert!(report.get("android").is_none(), "{report}");
         assert!(!summary.contains("Android"), "{summary}");
+        assert!(
+            summary.lines().any(|line| line.starts_with("System ")),
+            "{summary}"
+        );
     }
 
     #[test]
