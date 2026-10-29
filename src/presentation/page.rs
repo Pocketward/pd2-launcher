@@ -46,7 +46,7 @@ use super::{
     TaskState, UiSnapshot, about_built_with, about_version, blizzard_windows_notice,
     check_again_available, close_warning, copied_folder_note, download_rows, existing_found_line,
     flow_failed, flow_progress, game_files_folder, guide_applies, guided_actions, human_bytes,
-    install_command, install_percent, install_tasks, install_title, key_length_problem,
+    install_command, install_percent, install_tasks, install_title, key_problem,
     official_launcher_available, official_launcher_offered, opening_step, repair_rows, result_card,
     running_step, service_failure, standing_step, start_over_available, step_affordance, step_mark,
     theme::palette,
@@ -3374,15 +3374,21 @@ impl LauncherView {
         let muted = theme.muted_foreground;
         let danger = theme.danger;
         let fields = [
-            ("Diablo II CD key", "Diablo II", self.base_key.clone()),
+            (
+                "Diablo II CD key",
+                "Diablo II",
+                crate::blizzard::KeyField::BaseGame,
+                self.base_key.clone(),
+            ),
             (
                 "Lord of Destruction CD key",
                 "Lord of Destruction",
+                crate::blizzard::KeyField::Expansion,
                 self.expansion_key.clone(),
             ),
         ]
-        .map(|(label, game, input)| {
-            let problem = key_length_problem(game, input.read(cx).len());
+        .map(|(label, game, field, input)| {
+            let problem = key_problem(game, field, &input.read(cx).content);
             form_row(
                 label,
                 LABEL_OFFSET,
@@ -5366,27 +5372,27 @@ mod tests {
                 input.restore("abcd-efgh-ijkl-mno".to_owned(), cx)
             });
             view.expansion_key.update(cx, |input, cx| {
-                input.restore("QRST UVWX YZ01 2345 6789 ABCD EF".to_owned(), cx)
+                input.restore("CDFG HJKM NPRT VWXY Z246 789B CD".to_owned(), cx)
             });
             view.consent = true;
             assert_eq!(view.base_key.read(cx).len(), 15);
             assert_eq!(
                 view.expansion_key.read(cx).copy_value(),
-                "QRSTUVWXYZ0123456789ABCDEF"
+                "CDFGHJKMNPRTVWXYZ246789BCD"
             );
             assert!(
                 !view.authorization_complete(cx),
                 "15 characters is not a key"
             );
             view.base_key.update(cx, |input, cx| {
-                input.restore("ABCDEFGHIJKLMNOP".to_owned(), cx)
+                input.restore("BCDFGHJKMNPRTVWX".to_owned(), cx)
             });
             assert!(
                 !view.authorization_complete(cx),
                 "an old 16-character key is not accepted"
             );
             view.base_key.update(cx, |input, cx| {
-                input.restore("ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned(), cx);
+                input.restore("BCDFGHJKMNPRTVWXYZ24678922".to_owned(), cx);
                 input.toggle_revealed(cx);
             });
             assert!(view.authorization_complete(cx));
@@ -5418,7 +5424,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 for input in [view.base_key.clone(), view.expansion_key.clone()] {
                     input.update(cx, |input, cx| {
-                        input.restore("ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned(), cx)
+                        input.restore("BCDFGHJKMNPRTVWXYZ24678922".to_owned(), cx)
                     });
                 }
             });
@@ -5963,10 +5969,10 @@ mod tests {
         assert!(shown(cx, "guided-install-d2").is_some());
         view.update(cx, |view, cx| {
             view.base_key.update(cx, |input, cx| {
-                input.restore("ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned(), cx)
+                input.restore("BCDFGHJKMNPRTVWXYZ24678922".to_owned(), cx)
             });
             view.expansion_key.update(cx, |input, cx| {
-                input.restore("QRSTUVWXYZ0123456789ABCDEF".to_owned(), cx)
+                input.restore("CDFGHJKMNPRTVWXYZ246789BCD".to_owned(), cx)
             });
             view.consent = true;
             view.prefers_folder = true;
@@ -6012,10 +6018,10 @@ mod tests {
         view.update(cx, |view, cx| {
             view.guide = Some(GuidedCursor::at(SetupStep::InstallD2));
             view.base_key.update(cx, |input, cx| {
-                input.restore("ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned(), cx)
+                input.restore("BCDFGHJKMNPRTVWXYZ24678922".to_owned(), cx)
             });
             view.expansion_key.update(cx, |input, cx| {
-                input.restore("QRSTUVWXYZ0123456789ABCDEF".to_owned(), cx)
+                input.restore("CDFGHJKMNPRTVWXYZ246789BCD".to_owned(), cx)
             });
             view.consent = true;
         });
@@ -6919,8 +6925,8 @@ mod tests {
         });
         let (endpoint, service) = service_bridge(UiSnapshot::initial());
         let authorization = super::super::AuthorizationInput::new(
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_owned(),
-            "QRSTUVWXYZ0123456789ABCDEF".to_owned(),
+            "BCDFGHJKMNPRTVWXYZ24678922".to_owned(),
+            "CDFGHJKMNPRTVWXYZ246789BCD".to_owned(),
             true,
         )
         .expect("placeholder keys");

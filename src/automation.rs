@@ -428,6 +428,13 @@ fn parse_arguments_with(
         expansion_key.zeroize();
         None
     } else {
+        // Each key as the installers check it, before anything is downloaded.
+        if let Some(message) = key_problem(&base_key, &expansion_key) {
+            let (mut base_key, mut expansion_key) = (base_key, expansion_key);
+            base_key.zeroize();
+            expansion_key.zeroize();
+            return Err(ArgumentError::new(message));
+        }
         Some(
             AuthorizationInput::new(base_key, expansion_key, vendor_terms_accepted).map_err(
                 |_| ArgumentError::new("unattended installation requires two valid product keys"),
@@ -452,9 +459,39 @@ fn parse_arguments_with(
     }))
 }
 
+/// Why the installers would refuse a given key, in words without the key;
+/// a missing key is left to the authorization's own error.
+fn key_problem(base_key: &str, expansion_key: &str) -> Option<&'static str> {
+    use crate::blizzard::{KeyField, KeyProblem, check_key};
+    if base_key.is_empty() || expansion_key.is_empty() {
+        return None;
+    }
+    match check_key(KeyField::BaseGame, base_key.as_bytes()) {
+        Ok(_) => {}
+        Err(KeyProblem::ExpansionKeyInBaseField) => {
+            return Some("the Diablo II CD key (--d2-key or D2_KEY) is a Lord of Destruction key");
+        }
+        Err(_) => {
+            return Some(
+                "the Diablo II CD key (--d2-key or D2_KEY) is not one the Diablo II installer takes: 26 letters and numbers, as the Blizzard account shows it",
+            );
+        }
+    }
+    match check_key(KeyField::Expansion, expansion_key.as_bytes()) {
+        Ok(_) => None,
+        Err(KeyProblem::BaseKeyInExpansionField) => {
+            Some("the Lord of Destruction CD key (--lod-key or D2_LOD_KEY) is a Diablo II key")
+        }
+        Err(_) => Some(
+            "the Lord of Destruction CD key (--lod-key or D2_LOD_KEY) is not one the Lord of Destruction installer takes: 26 letters and numbers, as the Blizzard account shows it",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blizzard::{TEST_BASE_KEY, TEST_EXPANSION_KEY};
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -467,9 +504,9 @@ mod tests {
             "--installer-dir",
             "/home/test/Downloads",
             "--d2-key",
-            "AAAA-BBBB",
+            TEST_BASE_KEY,
             "--lod-key",
-            "CCCC-DDDD",
+            TEST_EXPANSION_KEY,
             "--accept-vendor-terms",
             "--launch-after-ready",
         ]))
@@ -554,7 +591,7 @@ mod tests {
             "--unattended-install",
             "--accept-vendor-terms",
             "--d2-key",
-            "AAAA-BBBB",
+            TEST_BASE_KEY,
             "--existing-install",
             "/home/test/Games/Diablo II",
         ]) else {
@@ -611,7 +648,7 @@ mod tests {
     }
 
     fn keys() -> [&'static str; 4] {
-        ["--d2-key", "AAAA-BBBB", "--lod-key", "CCCC-DDDD"]
+        ["--d2-key", TEST_BASE_KEY, "--lod-key", TEST_EXPANSION_KEY]
     }
 
     fn unattended_with(
@@ -704,7 +741,7 @@ mod tests {
                 "--accept-vendor-terms",
                 "--download-installers",
             ]),
-            || StartupInputs::for_tests(Some(("AAAA-BBBB", "CCCC-DDDD")), None, false),
+            || StartupInputs::for_tests(Some((TEST_BASE_KEY, TEST_EXPANSION_KEY)), None, false),
         );
         assert!(matches!(fallback_keys, Ok(ArgumentMode::Unattended(_))));
     }
@@ -811,9 +848,9 @@ mod tests {
                 "--installer-dir",
                 "/home/test/Downloads",
                 "--d2-key",
-                "AAAA-BBBB",
+                TEST_BASE_KEY,
                 "--lod-key",
-                "CCCC-DDDD",
+                TEST_EXPANSION_KEY,
             ]))
             .err()
             .expect("automation without consent must fail")
@@ -826,13 +863,50 @@ mod tests {
                 "--installer-dir",
                 "relative",
                 "--d2-key",
-                "AAAA-BBBB",
+                TEST_BASE_KEY,
                 "--lod-key",
-                "CCCC-DDDD",
+                TEST_EXPANSION_KEY,
                 "--accept-vendor-terms",
             ]))
             .is_err()
         );
         assert!(parse_arguments(args(&["--unknown"])).is_err());
+    }
+
+    #[test]
+    fn a_key_the_installers_refuse_fails_before_any_download() {
+        // Of the right form, but no key of the product: refused while the
+        // arguments are read, so no job (and no download) starts.
+        for (base, expansion, message) in [
+            (
+                "ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZ",
+                TEST_EXPANSION_KEY,
+                "the Diablo II CD key (--d2-key or D2_KEY) is not one the Diablo II installer takes: 26 letters and numbers, as the Blizzard account shows it",
+            ),
+            (
+                TEST_BASE_KEY,
+                "2222-2222-2222-2222-2222-2222-22",
+                "the Lord of Destruction CD key (--lod-key or D2_LOD_KEY) is not one the Lord of Destruction installer takes: 26 letters and numbers, as the Blizzard account shows it",
+            ),
+            (
+                "BCDF-GHJK-MNPR-TVWX",
+                TEST_EXPANSION_KEY,
+                "the Diablo II CD key (--d2-key or D2_KEY) is not one the Diablo II installer takes: 26 letters and numbers, as the Blizzard account shows it",
+            ),
+        ] {
+            let error = parse_arguments(args(&[
+                "--unattended-install",
+                "--accept-vendor-terms",
+                "--download-installers",
+                "--d2-key",
+                base,
+                "--lod-key",
+                expansion,
+            ]))
+            .err()
+            .expect("a refused key stops unattended mode");
+            assert_eq!(error.to_string(), message);
+            assert!(!error.to_string().contains("ZZZZ") && !error.to_string().contains("2222"));
+        }
     }
 }

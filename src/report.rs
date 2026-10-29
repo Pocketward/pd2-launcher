@@ -467,6 +467,21 @@ pub(crate) fn plain_reason(code: &str) -> &'static str {
     match code {
         "base-game-key-rejected" => "Diablo II's installer rejected the CD key",
         "expansion-key-rejected" => "Lord of Destruction's installer rejected the CD key",
+        "base-game-key-wrong-length" | "expansion-key-wrong-length" => {
+            "A CD key does not have 26 characters"
+        }
+        "base-game-key-16-characters" | "expansion-key-16-characters" => {
+            "A 16-character CD key: Blizzard's installers take only 26-character keys"
+        }
+        "base-game-key-invalid-character" | "expansion-key-invalid-character" => {
+            "A CD key has a character that keys do not use"
+        }
+        "base-game-key-is-expansion-key" => "The Lord of Destruction key is in the Diablo II field",
+        "expansion-key-is-base-game-key" => "The Diablo II key is in the Lord of Destruction field",
+        "base-game-key-not-valid" => "The Diablo II CD key failed the installer's own check",
+        "expansion-key-not-valid" => {
+            "The Lord of Destruction CD key failed the installer's own check"
+        }
         "base-game-installer-error" => "Diablo II's installer showed an error dialog",
         "expansion-installer-error" => "Lord of Destruction's installer showed an error dialog",
         "base-game-installer-menu" | "expansion-installer-menu" => {
@@ -494,6 +509,18 @@ pub(crate) fn plain_reason(code: &str) -> &'static str {
         }
         "installer-payload-store-failed" => {
             "Blizzard's downloader finished, but its files could not be stored (for example no free space)"
+        }
+        "direct-download-refused" => {
+            "Blizzard's piece host refused the direct download's access, also with a fresh downloader program"
+        }
+        "direct-download-incomplete" => {
+            "The direct download still missed pieces after its retries (a lost or blocked connection)"
+        }
+        "direct-download-mismatch" => {
+            "Blizzard's torrent or the direct download's files differ from their pins (see payload-rejected)"
+        }
+        "discard-downloads-failed" => {
+            "The Launcher's own downloads could not all be removed for the import"
         }
         "installer-downloader-failed" => {
             "Blizzard's downloader did not run to the end (no window, could not be stopped, or exited)"

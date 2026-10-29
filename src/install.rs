@@ -127,6 +127,13 @@ impl ProductKey {
     fn expose(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// The key as the installers get it, from the key check.
+    fn from_checked(key: &crate::blizzard::NormalizedKey) -> Self {
+        Self {
+            bytes: key.as_bytes().to_vec().into_boxed_slice(),
+        }
+    }
 }
 
 impl Drop for ProductKey {
@@ -1069,12 +1076,47 @@ pub(crate) trait InstallDriver {
         control: &OperationControl,
     ) -> Result<(), VendorFailure>;
 
+    /// The direct download: fetch the complete installers of `wrappers`'
+    /// products at the same time, from the torrent and access cookie each
+    /// verified wrapper carries, without Blizzard's downloader or Wine.
+    /// Each verified payload is kept as its product's complete installer in
+    /// the artifact cache; an unfinished one is kept for the next attempt.
+    /// The failures, by product; none when every payload is kept.
+    fn download_vendor_payloads_direct(
+        &self,
+        _paths: &ManagedPaths,
+        wrappers: &[&VerifiedArtifact],
+        _control: &OperationControl,
+    ) -> Vec<(ArtifactKind, VendorFailure)> {
+        wrappers
+            .iter()
+            .map(|wrapper| (wrapper.kind(), VendorFailure::Install))
+            .collect()
+    }
+
     fn install_vendor(
         &self,
         request: VendorInstallRequest<'_>,
         mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), VendorFailure>;
+
+    /// Remove what this Launcher's own downloads made, for an import
+    /// (`discard_downloads`). The caller holds the installation lease.
+    fn discard_downloads(&self, _paths: &ManagedPaths) -> Result<(), VendorFailure> {
+        Err(VendorFailure::Install)
+    }
+
+    /// The native install of the direct download: the product's install
+    /// script run from its verified complete installer into the game folder,
+    /// without Blizzard's installer or Wine.
+    fn install_vendor_native(
+        &self,
+        _request: VendorInstallRequest<'_>,
+        _control: &OperationControl,
+    ) -> Result<(), VendorFailure> {
+        Err(VendorFailure::Install)
+    }
 
     /// Make a validated Diablo II installation the game: copy it into
     /// the Managed game folder, or record it for use in place. Nothing
@@ -1258,13 +1300,16 @@ pub(crate) enum VendorFailure {
     ErrorDialog,
     /// The installer stayed at its main menu instead of installing.
     InstallerMenu,
+    /// The direct download delivered no verified payload.
+    DirectDownload(DirectFailure),
     /// Anything else, including a failure after the installer started.
     Install,
 }
 
 impl VendorFailure {
     /// Whether a freshly downloaded wrapper may succeed where this failed:
-    /// every downloader failure but a stall, which is the connection's.
+    /// every downloader failure but a stall, which is the connection's, and
+    /// a direct download whose access cookie the piece host refused.
     fn may_need_fresh_wrapper(self) -> bool {
         matches!(
             self,
@@ -1272,6 +1317,7 @@ impl VendorFailure {
                 | Self::DownloaderErrorDialog
                 | Self::PayloadIncomplete
                 | Self::PayloadRejected
+                | Self::DirectDownload(DirectFailure::Refused)
         )
     }
 
@@ -1283,8 +1329,48 @@ impl VendorFailure {
             Self::PayloadIncomplete => Some(DownloaderFailure::Incomplete),
             Self::PayloadRejected => Some(DownloaderFailure::Rejected),
             Self::DownloadStalled => Some(DownloaderFailure::Stalled),
-            Self::KeyRejected | Self::ErrorDialog | Self::InstallerMenu | Self::Install => None,
+            Self::KeyRejected
+            | Self::ErrorDialog
+            | Self::InstallerMenu
+            | Self::DirectDownload(_)
+            | Self::Install => None,
         }
+    }
+}
+
+/// How the direct download failed to deliver a verified payload, each with
+/// its own failure code (`install_failure_code`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectFailure {
+    /// The piece host refused the wrapper's access cookie (403) before any
+    /// piece arrived, or once it expired during the download, or it expires
+    /// too soon to start: retried once with a freshly downloaded wrapper,
+    /// which continues from the pieces kept.
+    Refused,
+    /// Pieces were still missing after every retry and round: the
+    /// connection.
+    Incomplete,
+    /// The wrapper's torrent, or a finished file, differs from its pins:
+    /// nothing is installed from it.
+    Mismatch,
+}
+
+/// The error of a failed download stage: how Blizzard's downloader or the
+/// direct download failed, when it was theirs.
+fn vendor_download_error(
+    control: &OperationControl,
+    stage: InstallStage,
+    failure: VendorFailure,
+) -> InstallError {
+    match (stage_failure(control, stage), failure) {
+        (InstallError::StageFailed { stage }, VendorFailure::DirectDownload(failure)) => {
+            InstallError::DirectDownloadFailed { stage, failure }
+        }
+        (InstallError::StageFailed { stage }, failure) => match failure.downloader_failure() {
+            Some(failure) => InstallError::DownloaderFailed { stage, failure },
+            None => InstallError::StageFailed { stage },
+        },
+        (error, _) => error,
     }
 }
 
@@ -1388,10 +1474,22 @@ pub(crate) enum InstallError {
         stage: InstallStage,
         failure: DownloaderFailure,
     },
+    /// The direct download for `stage` (a download stage) delivered no
+    /// verified payload, as `failure` says.
+    DirectDownloadFailed {
+        stage: InstallStage,
+        failure: DirectFailure,
+    },
     /// The Vendor installer showed its error dialog about the product key
     /// for `stage`: that key was rejected.
     KeyRejected {
         stage: InstallStage,
+    },
+    /// The key for `stage` failed the installers' own check before any
+    /// installer ran.
+    KeyInvalid {
+        stage: InstallStage,
+        problem: crate::blizzard::KeyProblem,
     },
     /// The Vendor installer for `stage` showed another error dialog.
     InstallerError {
@@ -1433,6 +1531,9 @@ pub(crate) struct ManagedInstaller<'a> {
     /// The Download job runs: acquisitions are downloads. In the install
     /// jobs they only reverify the cache ahead of installing.
     downloading: std::cell::Cell<bool>,
+    /// Blizzard's installers come from the direct download, not from
+    /// Blizzard's downloader under Wine.
+    direct_download: bool,
     /// The player turned Project Diablo 2's update checks off: a Project
     /// Diablo 2 already in the game folder is kept as it is.
     client_as_installed: bool,
@@ -1460,8 +1561,15 @@ impl<'a> ManagedInstaller<'a> {
             client,
             catalog,
             downloading: std::cell::Cell::new(false),
+            direct_download: false,
             client_as_installed: false,
         }
+    }
+
+    /// Fetch Blizzard's installers with the direct download.
+    pub(crate) fn with_direct_download(mut self, direct_download: bool) -> Self {
+        self.direct_download = direct_download;
+        self
     }
 
     /// With Project Diablo 2's update checks off, a Project Diablo 2 already
@@ -1619,6 +1727,7 @@ impl<'a> ManagedInstaller<'a> {
         let steps = kinds.len() as u64 + u64::from(client);
         let mut recorded = Vec::new();
         let mut step = 0_u64;
+        let mut direct_done = false;
         for kind in kinds {
             control.set_step(step, steps);
             step += 1;
@@ -1629,12 +1738,20 @@ impl<'a> ManagedInstaller<'a> {
                 ArtifactKind::BaseGameWrapper | ArtifactKind::ExpansionWrapper
             ) && !report.android_host
             {
-                let product = if kind == ArtifactKind::BaseGameWrapper {
-                    VendorProduct::BaseGame
+                if self.direct_download {
+                    // Every product at the same time, at the first of them.
+                    if !direct_done {
+                        self.download_vendor_payloads_direct(&paths, vendor, control)?;
+                        direct_done = true;
+                    }
                 } else {
-                    VendorProduct::Expansion
-                };
-                report = self.download_vendor_payload(&paths, report, product, control)?;
+                    let product = if kind == ArtifactKind::BaseGameWrapper {
+                        VendorProduct::BaseGame
+                    } else {
+                        VendorProduct::Expansion
+                    };
+                    report = self.download_vendor_payload(&paths, report, product, control)?;
+                }
                 recorded.push(payload_record_path(kind));
                 continue;
             }
@@ -1754,20 +1871,98 @@ impl<'a> ManagedInstaller<'a> {
                     artifact = self.acquire(paths, kind, control)?;
                     check_cancelled(control)?;
                 }
-                Err(failure) => {
-                    return Err(
-                        match (stage_failure(control, stage), failure.downloader_failure()) {
-                            (InstallError::StageFailed { stage }, Some(failure)) => {
-                                InstallError::DownloaderFailed { stage, failure }
-                            }
-                            (error, _) => error,
-                        },
-                    );
-                }
+                Err(failure) => return Err(vendor_download_error(control, stage, failure)),
             }
         }
         check_cancelled(control)?;
         Ok(report)
+    }
+
+    /// Fetch the complete installers of `products` with the direct
+    /// download, all at the same time. A payload already in the cache is
+    /// used as it is. No Wine runs, so the runtime is not set up for it. A
+    /// cached wrapper whose access cookie the piece host refuses is
+    /// discarded and downloaded again once per product, as for Blizzard's
+    /// downloader.
+    fn download_vendor_payloads_direct(
+        &self,
+        paths: &ManagedPaths,
+        products: &[VendorProduct],
+        control: &OperationControl,
+    ) -> Result<(), InstallError> {
+        check_cancelled(control)?;
+        let mut wanted = Vec::new();
+        for &product in products {
+            let artifact = {
+                let _lease = MutationLease::acquire(paths)?;
+                self.acquire(paths, product.artifact_kind(), control)?
+            };
+            if !is_complete_payload(paths, &artifact) {
+                wanted.push((product, artifact, false));
+            }
+        }
+        let Some((first, ..)) = wanted.first() else {
+            return Ok(());
+        };
+        control.report(WorkProgress::for_phase(match first {
+            VendorProduct::BaseGame => WorkPhase::BaseGameDownload,
+            VendorProduct::Expansion => WorkPhase::ExpansionDownload,
+        }));
+        let _lease = MutationLease::acquire(paths)?;
+        while !wanted.is_empty() {
+            let failures = {
+                let wrappers = wanted
+                    .iter()
+                    .map(|(_, artifact, _)| artifact)
+                    .collect::<Vec<_>>();
+                self.driver
+                    .download_vendor_payloads_direct(paths, &wrappers, control)
+            };
+            let mut again = Vec::new();
+            for (product, artifact, refetched) in wanted {
+                let kind = product.artifact_kind();
+                let Some(&(_, failure)) = failures.iter().find(|(failed, _)| *failed == kind)
+                else {
+                    continue;
+                };
+                if failure.may_need_fresh_wrapper()
+                    && !refetched
+                    && !control.is_cancelled()
+                    && artifact.origin == ArtifactOrigin::ApprovedNetwork
+                    && artifact.custom_source().is_none()
+                    && !self.catalog.spec(kind).is_custom()
+                {
+                    self.discard_cached_wrapper(paths, kind)?;
+                    again.push((product, self.acquire(paths, kind, control)?, true));
+                    continue;
+                }
+                return Err(vendor_download_error(
+                    control,
+                    product.download_stage(),
+                    failure,
+                ));
+            }
+            check_cancelled(control)?;
+            wanted = again;
+        }
+        Ok(())
+    }
+
+    /// Remove what this Launcher's own downloads made, under the
+    /// installation lease, for a player who imports the game instead.
+    pub(crate) fn discard_downloads(
+        &self,
+        managed_root: &Path,
+        control: &OperationControl,
+    ) -> Result<(), InstallError> {
+        let paths = ManagedPaths::prepare(managed_root)?;
+        let _lease = MutationLease::acquire(&paths)?;
+        check_cancelled(control)?;
+        self.driver
+            .discard_downloads(&paths)
+            .map_err(|_| InstallError::StageFailed {
+                stage: InstallStage::Download,
+            })
     }
 
     /// Step 4, Install Diablo II: Blizzard's installers for Diablo II and
@@ -1810,7 +2005,15 @@ impl<'a> ManagedInstaller<'a> {
         // installed, then Lord of Destruction.
         if report.status == InstallationStatus::NeedsBaseGame {
             let authorization = authorization.ok_or(InstallError::AuthorizationRequired)?;
-            if report.android_host {
+            if report.android_host && self.direct_download {
+                // Both at the same time; Lord of Destruction's is then kept
+                // for its own step.
+                self.download_vendor_payloads_direct(
+                    &paths,
+                    &[VendorProduct::BaseGame, VendorProduct::Expansion],
+                    control,
+                )?;
+            } else if report.android_host {
                 self.download_vendor_payload(&paths, report, VendorProduct::BaseGame, control)?;
             }
             self.install_vendor(&paths, authorization, VendorProduct::BaseGame, control)?;
@@ -1825,7 +2028,9 @@ impl<'a> ManagedInstaller<'a> {
 
         if report.status == InstallationStatus::NeedsExpansion {
             let authorization = authorization.ok_or(InstallError::AuthorizationRequired)?;
-            if report.android_host {
+            if report.android_host && self.direct_download {
+                self.download_vendor_payloads_direct(&paths, &[VendorProduct::Expansion], control)?;
+            } else if report.android_host {
                 self.download_vendor_payload(&paths, report, VendorProduct::Expansion, control)?;
             }
             self.install_vendor(&paths, authorization, VendorProduct::Expansion, control)?;
@@ -2193,6 +2398,10 @@ impl<'a> ManagedInstaller<'a> {
         let lease = MutationLease::acquire(paths)?;
         let artifact = self.acquire(paths, artifact_kind, control)?;
         check_cancelled(control)?;
+        // A guard: the Control channel and the key page checked the keys
+        // already, the same way.
+        let product_key = checked_key(product, authorization.key_for(product))
+            .map_err(|problem| InstallError::KeyInvalid { stage, problem })?;
         mark_stage(
             paths,
             match product {
@@ -2201,39 +2410,37 @@ impl<'a> ManagedInstaller<'a> {
             },
             stage,
         )?;
-        self.driver
-            .install_vendor(
-                VendorInstallRequest {
-                    product,
-                    artifact: &artifact,
-                    paths,
-                    product_key: authorization.key_for(product),
+        let request = VendorInstallRequest {
+            product,
+            artifact: &artifact,
+            paths,
+            product_key: &product_key,
+        };
+        if self.direct_download {
+            self.driver.install_vendor_native(request, control)
+        } else {
+            self.driver.install_vendor(request, &lease.0, control)
+        }
+        .map_err(|failure| match (stage_failure(control, stage), failure) {
+            (InstallError::StageFailed { stage }, VendorFailure::KeyRejected) => {
+                InstallError::KeyRejected { stage }
+            }
+            (InstallError::StageFailed { stage }, VendorFailure::ErrorDialog) => {
+                InstallError::InstallerError { stage }
+            }
+            (InstallError::StageFailed { stage }, VendorFailure::InstallerMenu) => {
+                InstallError::InstallerMenu { stage }
+            }
+            // Its download, not its installer, failed.
+            (InstallError::StageFailed { stage }, failure) => match failure.downloader_failure() {
+                Some(failure) => InstallError::DownloaderFailed {
+                    stage: product.download_stage(),
+                    failure,
                 },
-                &lease.0,
-                control,
-            )
-            .map_err(|failure| match (stage_failure(control, stage), failure) {
-                (InstallError::StageFailed { stage }, VendorFailure::KeyRejected) => {
-                    InstallError::KeyRejected { stage }
-                }
-                (InstallError::StageFailed { stage }, VendorFailure::ErrorDialog) => {
-                    InstallError::InstallerError { stage }
-                }
-                (InstallError::StageFailed { stage }, VendorFailure::InstallerMenu) => {
-                    InstallError::InstallerMenu { stage }
-                }
-                // Its download, not its installer, failed.
-                (InstallError::StageFailed { stage }, failure) => {
-                    match failure.downloader_failure() {
-                        Some(failure) => InstallError::DownloaderFailed {
-                            stage: product.download_stage(),
-                            failure,
-                        },
-                        None => InstallError::StageFailed { stage },
-                    }
-                }
-                (error, _) => error,
-            })?;
+                None => InstallError::StageFailed { stage },
+            },
+            (error, _) => error,
+        })?;
         finish_stage(
             paths,
             match product {
@@ -2510,6 +2717,20 @@ fn finish_stage(
     })
 }
 
+/// `key` as the installers check it, for `product`: its form and its
+/// decoded product.
+fn checked_key(
+    product: VendorProduct,
+    key: &ProductKey,
+) -> Result<ProductKey, crate::blizzard::KeyProblem> {
+    let field = match product {
+        VendorProduct::BaseGame => crate::blizzard::KeyField::BaseGame,
+        VendorProduct::Expansion => crate::blizzard::KeyField::Expansion,
+    };
+    crate::blizzard::check_key(field, key.expose())
+        .map(|checked| ProductKey::from_checked(&checked))
+}
+
 /// Clear the marker once a fresh audit proved the stage's evidence.
 fn clear_stage(paths: &ManagedPaths, install_stage: InstallStage) -> Result<(), InstallError> {
     let _lease = MutationLease::acquire(paths)?;
@@ -2684,9 +2905,17 @@ fn validate_artifact_inventory(cache: &Directory) -> Result<(), ArtifactRejectio
         "custom-patch.download",
         "custom-patch.download.provenance.json",
         "prepatch.log",
+        // Which complete installers the direct download made.
+        "d2-payload.direct",
+        "lod-payload.direct",
     ];
     for name in cache.names().map_err(|_| ArtifactRejection::UnsafePath)? {
-        if matches!(name.to_str(), Some("d2-payload" | "lod-payload")) {
+        // A product's complete installer, and the one the direct download
+        // is still filling (kept between attempts), hold the same files.
+        if matches!(
+            name.to_str(),
+            Some("d2-payload" | "lod-payload" | "d2-payload.partial" | "lod-payload.partial")
+        ) {
             let payload = cache
                 .open_directory(Path::new(&name))
                 .map_err(|_| ArtifactRejection::UnsafePath)?;
@@ -2835,7 +3064,34 @@ mod tests {
             Ok(())
         );
     }
+
+    /// A direct download kept between attempts leaves the cache usable;
+    /// anything else in its folder does not.
+    #[test]
+    fn the_cache_inventory_accepts_an_unfinished_direct_download() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cache = fixture.path().join("cache/artifacts");
+        for product in ["d2-payload.partial", "lod-payload.partial"] {
+            std::fs::create_dir_all(cache.join(product).join("DirectX")).unwrap();
+            std::fs::write(cache.join(product).join("Installer Tome.mpq"), b"part").unwrap();
+            std::fs::write(cache.join(product).join("DirectX/dxnt.cab"), b"part").unwrap();
+        }
+        assert_eq!(
+            validate_artifact_inventory(&Directory::open(&cache).unwrap()),
+            Ok(())
+        );
+        std::fs::create_dir_all(cache.join("d2-payload.partial/Installer.app")).unwrap();
+        assert_eq!(
+            validate_artifact_inventory(&Directory::open(&cache).unwrap()),
+            Err(ArtifactRejection::UnsafePath)
+        );
+    }
     use crate::audit::{CheckStatus, HostSupport};
+
+    /// Clearly fake keys: the test builds' `blizzard::TEST_BASE_KEY` and
+    /// `TEST_EXPANSION_KEY`, typed with dashes. Tests never hold real keys.
+    const FAKE_BASE_KEY: &str = "BCDF-GHJK-MNPR-TVWX-YZ24-6789-22";
+    const FAKE_EXPANSION_KEY: &str = "CDFG-HJKM-NPRT-VWXY-Z246-789B-CD";
 
     const FIXTURE_SHA256: &str = "f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d";
 
@@ -2861,8 +3117,8 @@ mod tests {
         let driver = RecordingDriver::default();
         let client = RecordingClientSynchronizer::default();
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .expect("valid authorization");
@@ -2927,6 +3183,59 @@ mod tests {
     }
 
     #[test]
+    fn a_key_not_of_the_installers_form_stops_before_the_installer_starts() {
+        use crate::stage_marker::{MarkerState, read};
+        let fixture = TempDir::new().expect("fixture");
+        let auditor = ScriptedAuditor::new([
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+        ]);
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver::default();
+        let client = RecordingClientSynchronizer::default();
+        // An old 16-character key: the installers take only 26 characters.
+        let authorization = InstallationAuthorization::new(
+            FAKE_BASE_KEY.to_owned(),
+            "BCDF-GHJK-MNPR-TVWX".to_owned(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+                .run(fixture.path(), Some(&authorization)),
+            Err(InstallError::KeyInvalid {
+                stage: InstallStage::Expansion,
+                problem: crate::blizzard::KeyProblem::OldKeyLength,
+            })
+        );
+        assert!(driver.received_expansion_secret.borrow().is_none());
+        let root = Directory::open(fixture.path()).unwrap();
+        assert_eq!(read(&root), MarkerState::Absent);
+
+        // Of the right form, but not a key of the product.
+        let auditor = ScriptedAuditor::new([
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+            audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+        ]);
+        let authorization = InstallationAuthorization::new(
+            FAKE_BASE_KEY.to_owned(),
+            "ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZ".to_owned(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+                .run(fixture.path(), Some(&authorization)),
+            Err(InstallError::KeyInvalid {
+                stage: InstallStage::Expansion,
+                problem: crate::blizzard::KeyProblem::WrongProduct,
+            })
+        );
+        assert!(driver.received_expansion_secret.borrow().is_none());
+        assert_eq!(read(&root), MarkerState::Absent);
+    }
+
+    #[test]
     fn prefix_and_vendor_stages_are_marked_until_their_evidence_is_proven() {
         use crate::stage_marker::{MarkerState, read};
         let fixture = TempDir::new().expect("fixture");
@@ -2935,8 +3244,8 @@ mod tests {
         let driver = RecordingDriver::default();
         let client = RecordingClientSynchronizer::default();
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .unwrap();
@@ -3019,8 +3328,8 @@ mod tests {
     #[test]
     fn a_vendor_error_dialog_is_reported_as_its_own_stage_failure() {
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .unwrap();
@@ -3431,8 +3740,8 @@ mod tests {
         // Install Diablo II: Wine, then each of Blizzard's downloaders right
         // before its installer.
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .unwrap();
@@ -3458,6 +3767,209 @@ mod tests {
             .install_project_diablo(fixture.path(), &OperationControl::default())
             .unwrap();
         assert_eq!(ready.final_status(), InstallationStatus::Ready);
+        assert_eq!(auditor.remaining(), 0);
+    }
+
+    /// The fixture source, but a product's complete installer already in
+    /// the cache is acquired as it is, as the production source does.
+    struct PayloadAwareSource<'a> {
+        inner: &'a FixtureArtifactSource,
+    }
+
+    impl ArtifactSource for PayloadAwareSource<'_> {
+        fn acquire_at(
+            &self,
+            spec: &ArtifactSpec,
+            cache: &Path,
+            cache_directory: &Directory,
+            control: &OperationControl,
+        ) -> Result<AcquiredArtifact, AdapterFailure> {
+            let payload = match spec.kind {
+                ArtifactKind::BaseGameWrapper => "d2-payload",
+                ArtifactKind::ExpansionWrapper => "lod-payload",
+                _ => return self.inner.acquire_at(spec, cache, cache_directory, control),
+            };
+            let installer = cache.join(payload).join("Installer.exe");
+            if !installer.is_file() {
+                return self.inner.acquire_at(spec, cache, cache_directory, control);
+            }
+            self.inner.acquisitions.borrow_mut().push(spec.kind);
+            Ok(
+                AcquiredArtifact::user_selected(installer, spec.expected_filename.unwrap())
+                    .with_retained_receipt_sha256(hex(&Sha256::digest(minimal_pe()))),
+            )
+        }
+    }
+
+    #[test]
+    fn the_direct_download_fetches_both_installers_at_once_without_wine() {
+        let fixture = TempDir::new().unwrap();
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver::default();
+        let client = RecordingClientSynchronizer::default();
+        // One audit: no runtime is set up for it, though none is there.
+        let auditor = ScriptedAuditor::new([audit(
+            InstallationStatus::NeedsBaseGame,
+            CheckStatus::Missing,
+        )]);
+        ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+            .with_direct_download(true)
+            .download_all(
+                fixture.path(),
+                DownloadPlan::Installers,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            *driver.operations.borrow(),
+            [RecordedOperation::DirectDownload {
+                base_game: true,
+                expansion: true,
+            }]
+        );
+        assert_eq!(auditor.remaining(), 0);
+        let receipt = fs::read_to_string(fixture.path().join("cache/downloads.json")).unwrap();
+        assert!(receipt.contains("cache/artifacts/d2-payload"));
+        assert!(receipt.contains("cache/artifacts/lod-payload"));
+    }
+
+    #[test]
+    fn a_refused_direct_download_gets_one_fresh_wrapper_per_product() {
+        let client = RecordingClientSynchronizer::default();
+        let acquisitions = |source: &FixtureArtifactSource, kind| {
+            source
+                .acquisitions
+                .borrow()
+                .iter()
+                .filter(|acquired| **acquired == kind)
+                .count()
+        };
+        let download = |source: &FixtureArtifactSource, driver: &RecordingDriver| {
+            let fixture = TempDir::new().unwrap();
+            let auditor = ScriptedAuditor::new([audit(
+                InstallationStatus::NeedsBaseGame,
+                CheckStatus::Satisfied,
+            )]);
+            ManagedInstaller::new(&auditor, source, driver, &client, fixture_catalog())
+                .with_direct_download(true)
+                .download_all(
+                    fixture.path(),
+                    DownloadPlan::Installers,
+                    &OperationControl::default(),
+                )
+        };
+        let refused = VendorFailure::DirectDownload(DirectFailure::Refused);
+
+        // Diablo II's cookie refused: only its wrapper is fetched again, and
+        // only it is downloaded again.
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver {
+            direct_failures: RefCell::new([vec![(ArtifactKind::BaseGameWrapper, refused)]].into()),
+            ..RecordingDriver::default()
+        };
+        assert!(download(&source, &driver).is_ok());
+        assert_eq!(acquisitions(&source, ArtifactKind::BaseGameWrapper), 2);
+        assert_eq!(acquisitions(&source, ArtifactKind::ExpansionWrapper), 1);
+        assert_eq!(
+            *driver.operations.borrow(),
+            [
+                RecordedOperation::DirectDownload {
+                    base_game: true,
+                    expansion: true,
+                },
+                RecordedOperation::DirectDownload {
+                    base_game: true,
+                    expansion: false,
+                },
+            ]
+        );
+
+        // Refused again with the fresh wrapper: reported.
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver {
+            direct_failures: RefCell::new(
+                [
+                    vec![(ArtifactKind::ExpansionWrapper, refused)],
+                    vec![(ArtifactKind::ExpansionWrapper, refused)],
+                ]
+                .into(),
+            ),
+            ..RecordingDriver::default()
+        };
+        assert_eq!(
+            download(&source, &driver),
+            Err(InstallError::DirectDownloadFailed {
+                stage: InstallStage::ExpansionDownload,
+                failure: DirectFailure::Refused,
+            })
+        );
+        assert_eq!(acquisitions(&source, ArtifactKind::ExpansionWrapper), 2);
+
+        // Missing pieces or a pin mismatch: no fresh wrapper helps.
+        for failure in [DirectFailure::Incomplete, DirectFailure::Mismatch] {
+            let source = FixtureArtifactSource::default();
+            let driver = RecordingDriver {
+                direct_failures: RefCell::new(
+                    [vec![(
+                        ArtifactKind::BaseGameWrapper,
+                        VendorFailure::DirectDownload(failure),
+                    )]]
+                    .into(),
+                ),
+                ..RecordingDriver::default()
+            };
+            assert_eq!(
+                download(&source, &driver),
+                Err(InstallError::DirectDownloadFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure,
+                })
+            );
+            assert_eq!(acquisitions(&source, ArtifactKind::BaseGameWrapper), 1);
+        }
+    }
+
+    #[test]
+    fn on_android_the_direct_download_fetches_both_before_diablo_ii() {
+        let fixture = TempDir::new().unwrap();
+        let fixtures = FixtureArtifactSource::default();
+        let source = PayloadAwareSource { inner: &fixtures };
+        let driver = RecordingDriver::default();
+        let client = RecordingClientSynchronizer::default();
+        let auditor = ScriptedAuditor::new([
+            android_audit(InstallationStatus::NeedsBaseGame, CheckStatus::Missing),
+            android_audit(InstallationStatus::NeedsBaseGame, CheckStatus::Satisfied),
+            android_audit(InstallationStatus::NeedsExpansion, CheckStatus::Satisfied),
+            android_audit(InstallationStatus::NeedsClient, CheckStatus::Satisfied),
+        ]);
+        let authorization = InstallationAuthorization::new(
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
+            true,
+        )
+        .unwrap();
+        let outcome = ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+            .with_direct_download(true)
+            .install_base_game(
+                fixture.path(),
+                Some(&authorization),
+                &OperationControl::default(),
+            )
+            .unwrap();
+        assert_eq!(outcome.final_status(), InstallationStatus::NeedsClient);
+        // Lord of Destruction's installer was kept from the first download.
+        assert_eq!(
+            driver.operations.borrow().as_slice(),
+            [
+                RecordedOperation::ManagedRuntime,
+                RecordedOperation::DirectDownload {
+                    base_game: true,
+                    expansion: true,
+                },
+                RecordedOperation::BaseGame,
+                RecordedOperation::Expansion,
+            ]
+        );
         assert_eq!(auditor.remaining(), 0);
     }
 
@@ -3571,8 +4083,8 @@ mod tests {
         let client = RecordingClientSynchronizer::default();
         let auditor = ScriptedAuditor::new(fresh_journey());
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .unwrap();
@@ -4128,8 +4640,8 @@ mod tests {
         let driver = RecordingDriver::default();
         let client = RecordingClientSynchronizer::default();
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .expect("valid authorization");
@@ -4162,8 +4674,8 @@ mod tests {
         let driver = RecordingDriver::default();
         let client = RecordingClientSynchronizer::default();
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .expect("valid authorization");
@@ -4238,8 +4750,8 @@ mod tests {
     #[test]
     fn authorization_requires_consent_and_never_formats_product_keys() {
         let missing_consent = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             false,
         );
         assert!(matches!(
@@ -4248,13 +4760,14 @@ mod tests {
         ));
 
         let authorization = InstallationAuthorization::new(
-            "BASE-CANARY-1234".to_owned(),
-            "EXPANSION-CANARY-5678".to_owned(),
+            FAKE_BASE_KEY.to_owned(),
+            FAKE_EXPANSION_KEY.to_owned(),
             true,
         )
         .expect("valid authorization");
         let rendered = format!("{authorization:?}");
-        assert!(!rendered.contains("CANARY"));
+        assert!(!rendered.contains(&FAKE_BASE_KEY[..9]));
+        assert!(!rendered.contains(&FAKE_EXPANSION_KEY[..9]));
         assert_eq!(rendered.matches("[REDACTED]").count(), 2);
     }
 
@@ -4739,6 +5252,11 @@ mod tests {
         ManagedRuntime,
         BaseGameDownload,
         ExpansionDownload,
+        /// One direct download, of the products named.
+        DirectDownload {
+            base_game: bool,
+            expansion: bool,
+        },
         BaseGame,
         Expansion,
         Import(ImportMode),
@@ -4759,6 +5277,8 @@ mod tests {
         /// What those failures are; WrapperDownload when none is set.
         wrapper_download_failure: std::cell::Cell<Option<VendorFailure>>,
         wrapper_download_stalls: std::cell::Cell<usize>,
+        /// What each direct download in turn reports; none fail when empty.
+        direct_failures: RefCell<VecDeque<Vec<(ArtifactKind, VendorFailure)>>>,
         fail_import: bool,
         /// The import writes the records the real driver writes (a folder
         /// used in place, and the import record).
@@ -4851,6 +5371,40 @@ mod tests {
             Ok(())
         }
 
+        fn download_vendor_payloads_direct(
+            &self,
+            paths: &ManagedPaths,
+            wrappers: &[&VerifiedArtifact],
+            _control: &OperationControl,
+        ) -> Vec<(ArtifactKind, VendorFailure)> {
+            let failures = self
+                .direct_failures
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default();
+            let named = |kind| wrappers.iter().any(|wrapper| wrapper.kind() == kind);
+            self.operations
+                .borrow_mut()
+                .push(RecordedOperation::DirectDownload {
+                    base_game: named(ArtifactKind::BaseGameWrapper),
+                    expansion: named(ArtifactKind::ExpansionWrapper),
+                });
+            for wrapper in wrappers {
+                assert!(wrapper.path().is_file());
+                if failures.iter().any(|(kind, _)| *kind == wrapper.kind()) {
+                    continue;
+                }
+                let directory = match wrapper.kind() {
+                    ArtifactKind::BaseGameWrapper => "d2-payload",
+                    _ => "lod-payload",
+                };
+                let payload = paths.root().join("cache/artifacts").join(directory);
+                fs::create_dir_all(&payload).unwrap();
+                fs::write(payload.join("Installer.exe"), minimal_pe()).unwrap();
+            }
+            failures
+        }
+
         fn import_existing(
             &self,
             paths: &ManagedPaths,
@@ -4880,6 +5434,15 @@ mod tests {
                     .map_err(|_| AdapterFailure::here())?;
             }
             Ok(())
+        }
+
+        fn install_vendor_native(
+            &self,
+            request: VendorInstallRequest<'_>,
+            control: &OperationControl,
+        ) -> Result<(), VendorFailure> {
+            // The same record as Blizzard's installer: the stage, the key.
+            self.install_vendor(request, &tempfile::tempfile().unwrap(), control)
         }
 
         fn install_vendor(
@@ -5170,6 +5733,52 @@ mod tests {
         );
         assert_eq!(*client.prefetches.borrow(), 0);
         assert!(driver.operations.borrow().is_empty());
+    }
+
+    /// `discard_downloads` before an import on the Android host: the
+    /// import's Download then still fetches nothing (no Blizzard program, no
+    /// PD2 installer, no client) and is complete.
+    #[test]
+    fn on_android_an_import_after_discard_downloads_fetches_nothing() {
+        use crate::downloads::{DownloadNeed, readiness_on};
+        let fixture = TempDir::new().unwrap();
+        let paths = ManagedPaths::prepare(fixture.path()).unwrap();
+        let cache = fixture.path().join("cache/artifacts");
+        fs::create_dir_all(&cache).unwrap();
+        for ours in ["pd2-bootstrap.verified", "artifact-02.partial"] {
+            fs::write(cache.join(ours), b"ours").unwrap();
+        }
+        fs::create_dir_all(fixture.path().join("cache/client/objects")).unwrap();
+        fs::write(fixture.path().join("cache/client/objects/a"), b"pd2").unwrap();
+        adapters::discard_downloads(&paths).unwrap();
+        assert!(!cache.join("pd2-bootstrap.verified").exists());
+        assert!(!fixture.path().join("cache/client").exists());
+
+        let source = FixtureArtifactSource::default();
+        let driver = RecordingDriver::default();
+        let client = RecordingClientSynchronizer::default();
+        let auditor = ScriptedAuditor::new([android_audit(
+            InstallationStatus::NeedsBaseGame,
+            CheckStatus::Satisfied,
+        )]);
+        ManagedInstaller::new(&auditor, &source, &driver, &client, fixture_catalog())
+            .download_all(
+                fixture.path(),
+                DownloadPlan::ExistingInstall,
+                &OperationControl::default(),
+            )
+            .expect("nothing to download");
+        assert!(source.acquisitions.borrow().is_empty());
+        assert_eq!(*client.prefetches.borrow(), 0);
+        assert!(driver.operations.borrow().is_empty());
+        assert!(!cache.join("pd2-bootstrap.verified").exists());
+        assert!(!fixture.path().join("cache/client").exists());
+        assert!(
+            readiness_on(&Directory::open(fixture.path()).unwrap(), true).serves(
+                DownloadPlan::ExistingInstall,
+                DownloadNeed::for_status(InstallationStatus::NeedsBaseGame, false)
+            )
+        );
     }
 
     /// A fresh app (no game, no earlier download): the import's Download

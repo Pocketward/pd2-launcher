@@ -285,6 +285,15 @@ pub(crate) enum DirectDrawRendererView {
     Software,
 }
 
+/// Where Blizzard's installers are downloaded from: Blizzard's own
+/// downloader, or the direct download (`crate::blizzard`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum InstallSourceView {
+    #[default]
+    Official,
+    DirectDownload,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LaunchSettingsView {
     renderer: RendererPreferenceView,
@@ -296,6 +305,7 @@ pub(crate) struct LaunchSettingsView {
     /// Project Diablo 2's update checks: off, none runs and the client is
     /// accepted as installed.
     update_checks: bool,
+    install_source: InstallSourceView,
     persistence: SettingsPersistenceView,
 }
 
@@ -309,6 +319,7 @@ impl Default for LaunchSettingsView {
             official_launcher_software_rendering: true,
             app_menu_entry: true,
             update_checks: true,
+            install_source: InstallSourceView::Official,
             persistence: SettingsPersistenceView::Loading,
         }
     }
@@ -328,6 +339,7 @@ impl LaunchSettingsView {
             official_launcher_software_rendering: true,
             app_menu_entry: true,
             update_checks: true,
+            install_source: InstallSourceView::Official,
             persistence: SettingsPersistenceView::Saved,
         }
     }
@@ -365,6 +377,15 @@ impl LaunchSettingsView {
 
     pub(crate) const fn update_checks(self) -> bool {
         self.update_checks
+    }
+
+    pub(crate) const fn with_install_source(mut self, source: InstallSourceView) -> Self {
+        self.install_source = source;
+        self
+    }
+
+    pub(crate) const fn install_source(self) -> InstallSourceView {
+        self.install_source
     }
 
     pub(crate) const fn failed(mut self, code: &'static str) -> Self {
@@ -425,6 +446,9 @@ pub(crate) enum SettingsChange {
     DirectDrawRenderer(DirectDrawRendererView),
     AppMenuEntry(bool),
     UpdateChecks(bool),
+    /// Where Blizzard's installers are downloaded from (the Android app's
+    /// Control channel only, for now).
+    InstallSource(InstallSourceView),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -964,6 +988,8 @@ pub(crate) enum ActiveJobView {
     OfficialLauncher,
     Reset,
     Relocation,
+    /// Removing what this Launcher's own downloads made, for an import.
+    DiscardDownloads,
 }
 
 impl ActiveJobView {
@@ -2279,6 +2305,59 @@ pub(crate) struct ResultCardView {
     pub(crate) next: Option<ResultNextStep>,
 }
 
+/// The card for a CD key that failed the installers' own check before any
+/// installer ran.
+fn key_card(code: &str) -> Option<ResultCardView> {
+    let (title, message) = match code {
+        "base-game-key-wrong-length" => (
+            "The Diablo II CD key is not right",
+            "Diablo II CD keys have 26 letters and numbers. Check the Diablo II CD key and try again.",
+        ),
+        "expansion-key-wrong-length" => (
+            "The Lord of Destruction CD key is not right",
+            "Lord of Destruction CD keys have 26 letters and numbers. Check the Lord of Destruction CD key and try again.",
+        ),
+        "base-game-key-16-characters" => (
+            "The Diablo II CD key is not right",
+            "This is a 16-character Diablo II CD key. Blizzard's installers take only 26-character keys: your Blizzard account shows the 26-character key for it.",
+        ),
+        "expansion-key-16-characters" => (
+            "The Lord of Destruction CD key is not right",
+            "This is a 16-character Lord of Destruction CD key. Blizzard's installers take only 26-character keys: your Blizzard account shows the 26-character key for it.",
+        ),
+        "base-game-key-invalid-character" => (
+            "The Diablo II CD key is not right",
+            "The Diablo II CD key has a letter or number that CD keys do not use. Keys use 2 4 6 7 8 9 and B C D E F G H J K M N P R T V W X Y Z. Check it and try again.",
+        ),
+        "expansion-key-invalid-character" => (
+            "The Lord of Destruction CD key is not right",
+            "The Lord of Destruction CD key has a letter or number that CD keys do not use. Keys use 2 4 6 7 8 9 and B C D E F G H J K M N P R T V W X Y Z. Check it and try again.",
+        ),
+        "base-game-key-is-expansion-key" => (
+            "The Diablo II CD key is not right",
+            "This is the Lord of Destruction CD key. Type the Diablo II CD key in the Diablo II field.",
+        ),
+        "expansion-key-is-base-game-key" => (
+            "The Lord of Destruction CD key is not right",
+            "This is the Diablo II CD key. Type the Lord of Destruction CD key in the Lord of Destruction field.",
+        ),
+        "base-game-key-not-valid" => (
+            "The Diablo II CD key is not right",
+            "The Diablo II CD key is not valid: Blizzard's installer would refuse it. Check the Diablo II CD key and try again.",
+        ),
+        "expansion-key-not-valid" => (
+            "The Lord of Destruction CD key is not right",
+            "The Lord of Destruction CD key is not valid: Blizzard's installer would refuse it. Check the Lord of Destruction CD key and try again.",
+        ),
+        _ => return None,
+    };
+    Some(ResultCardView {
+        title,
+        message,
+        next: Some(ResultNextStep::TryAgain),
+    })
+}
+
 pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
     let operation = snapshot.operation.as_ref()?;
     if !matches!(
@@ -2337,6 +2416,9 @@ pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
         };
     }
     let stopped = |message| card("Installation stopped", message, Some(TryAgain));
+    if let Some(key_card) = key_card(operation.failure.unwrap_or_default()) {
+        return Some(key_card);
+    }
     match operation.failure.unwrap_or_default() {
         "base-game-key-rejected" => card(
             "Diablo II's installer rejected the CD key",
@@ -2411,6 +2493,21 @@ pub(crate) fn result_card(snapshot: &UiSnapshot) -> Option<ResultCardView> {
         "installer-payload-store-failed" => card(
             "Download didn't finish",
             "Blizzard's download finished, but its files couldn't be stored. Check that the install location has free space and try again.",
+            Some(TryAgain),
+        ),
+        "direct-download-refused" => card(
+            "Download didn't finish",
+            "Blizzard's server refused the download. Try again later. Anything already downloaded is kept.",
+            Some(TryAgain),
+        ),
+        "direct-download-incomplete" => card(
+            "Download didn't finish",
+            "Some parts of the download didn't arrive. Check your internet connection and try again. Anything already downloaded is kept.",
+            Some(TryAgain),
+        ),
+        "direct-download-mismatch" => card(
+            "The downloaded files didn't pass the check",
+            "Blizzard's download isn't the expected Diablo II files. Try again, or open Diagnostics and choose Save report to ask for help.",
             Some(TryAgain),
         ),
         "download-failed" => card(
@@ -4489,6 +4586,12 @@ pub(crate) enum Intent {
     ContinueInstallation,
     /// Step 3: download and verify everything.
     DownloadAll,
+    /// Stop the Download job and remove what the Launcher's own downloads
+    /// made, for an import (the Android app).
+    DiscardDownloads,
+    /// The Control channel refused an `authorize` (its key check): keys an
+    /// earlier one left waiting go too. Never sent by the app itself.
+    ForgetWaitingKeys,
     /// Step 4 for a Diablo II the user already has, of any version.
     ImportExistingInstall(ImportModeView),
     /// Step 5: install Project Diablo 2.
@@ -4563,6 +4666,8 @@ impl Intent {
             Self::AuthorizeAndInstall(_) => "Authorize and start Managed installation",
             Self::ContinueInstallation => "Continue Managed installation",
             Self::DownloadAll => "Download everything",
+            Self::DiscardDownloads => "Remove the downloads for an import",
+            Self::ForgetWaitingKeys => "Forget the waiting CD keys",
             Self::ImportExistingInstall(_) => "Import the existing Diablo II",
             Self::InstallProjectDiablo => "Install Project Diablo 2",
             Self::SelectExistingInstall(_) => "Choose an existing Diablo II folder",
@@ -4595,6 +4700,9 @@ impl Intent {
             Self::ChangeSettings(SettingsChange::AppMenuEntry(_)) => "Change the app menu entry",
             Self::ChangeSettings(SettingsChange::UpdateChecks(_)) => {
                 "Change Project Diablo 2's update checks"
+            }
+            Self::ChangeSettings(SettingsChange::InstallSource(_)) => {
+                "Change where Blizzard's installers come from"
             }
             Self::ExportDiagnostics => "Save a redacted report",
             Self::RevealReport => "Open the report's folder",
@@ -4771,15 +4879,6 @@ fn normalize_key_input(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Blizzard's current Diablo II and Lord of Destruction installers accept
-/// only 26-character CD keys; an older 16-character boxed key is added to a
-/// Blizzard account, which shows its 26-character version.
-pub(crate) const KEY_LENGTH: usize = 26;
-
-pub(crate) const fn key_length_valid(len: usize) -> bool {
-    len == KEY_LENGTH
-}
-
 /// An Install Diablo II job failed. A stop is not a failure: the install
 /// continues later with the same keys.
 pub(crate) fn install_diablo_failed(snapshot: &UiSnapshot) -> bool {
@@ -4803,10 +4902,40 @@ pub(crate) fn keys_spent(snapshot: &UiSnapshot, failed_before: bool) -> bool {
     ) || (install_diablo_failed(snapshot) && !failed_before)
 }
 
-/// Why a typed key cannot be right yet, in plain words.
-pub(crate) fn key_length_problem(game: &str, len: usize) -> Option<String> {
-    (len > 0 && !key_length_valid(len))
-        .then(|| format!("{game} CD keys are 26 letters and numbers. This one has {len}."))
+/// Why a typed key cannot be right, in plain words: the installers' check
+/// of a key for the `field` of `game`.
+pub(crate) fn key_problem(
+    game: &str,
+    field: crate::blizzard::KeyField,
+    typed: &[u8],
+) -> Option<String> {
+    use crate::blizzard::{KeyProblem, check_key};
+    if typed.is_empty() {
+        return None;
+    }
+    match check_key(field, typed) {
+        Ok(_) => None,
+        Err(KeyProblem::ExpansionKeyInBaseField) => Some(
+            "This is a Lord of Destruction CD key. Type it in the Lord of Destruction field."
+                .to_owned(),
+        ),
+        Err(KeyProblem::BaseKeyInExpansionField) => {
+            Some("This is a Diablo II CD key. Type it in the Diablo II field.".to_owned())
+        }
+        Err(KeyProblem::WrongProduct) => Some(format!(
+            "This is not a {game} CD key. Check the key: your Blizzard account shows it."
+        )),
+        Err(KeyProblem::OldKeyLength) => Some(format!(
+            "This is a 16-character {game} CD key. Blizzard's installers take only 26-character keys: your Blizzard account shows the 26-character key for it."
+        )),
+        Err(KeyProblem::InvalidCharacter) => Some(format!(
+            "{game} CD keys do not use A, I, L, O, Q, S, U, 0, 1, 3 or 5. Check the key."
+        )),
+        Err(_) => Some(format!(
+            "{game} CD keys are 26 letters and numbers. This one has {}.",
+            typed.len()
+        )),
+    }
 }
 
 #[cfg(feature = "gui")]
@@ -4839,9 +4968,9 @@ impl SecretInput {
         }
     }
 
-    /// Both a valid length and (by construction) only letters and digits.
-    fn is_complete(&self) -> bool {
-        key_length_valid(self.content.len())
+    /// A key the installers take in `field`.
+    fn is_valid_for(&self, field: crate::blizzard::KeyField) -> bool {
+        crate::blizzard::check_key(field, &self.content).is_ok()
     }
 
     fn len(&self) -> usize {
@@ -6154,8 +6283,14 @@ impl LauncherView {
 
     fn authorization_complete(&self, cx: &App) -> bool {
         self.consent
-            && self.base_key.read(cx).is_complete()
-            && self.expansion_key.read(cx).is_complete()
+            && self
+                .base_key
+                .read(cx)
+                .is_valid_for(crate::blizzard::KeyField::BaseGame)
+            && self
+                .expansion_key
+                .read(cx)
+                .is_valid_for(crate::blizzard::KeyField::Expansion)
     }
 
     fn choose_installer_media(&mut self, cx: &mut Context<Self>) {
@@ -7876,17 +8011,43 @@ mod tests {
             b"ABCDEFGHIJKLMNOP".to_vec()
         );
         assert_eq!(normalize_key_input("a\tb_c.d\u{e9}"), b"ABCD".to_vec());
-        assert!(key_length_valid(26));
+        use crate::blizzard::{KeyField, TEST_BASE_KEY, TEST_EXPANSION_KEY};
+        let base = KeyField::BaseGame;
         assert!(
-            !key_length_valid(16),
-            "old 16-character keys are not accepted"
+            key_problem("Diablo II", base, &[b'2'; 17]).is_some(),
+            "only 26-character keys are accepted"
         );
-        assert!(!key_length_valid(15) && !key_length_valid(17) && !key_length_valid(0));
-        assert_eq!(key_length_problem("Diablo II", 0), None);
-        assert_eq!(key_length_problem("Diablo II", 26), None);
+        assert_eq!(key_problem("Diablo II", base, b""), None);
         assert_eq!(
-            key_length_problem("Diablo II", 15).as_deref(),
+            key_problem("Diablo II", base, TEST_BASE_KEY.as_bytes()),
+            None
+        );
+        assert_eq!(
+            key_problem(
+                "Lord of Destruction",
+                KeyField::Expansion,
+                TEST_EXPANSION_KEY.as_bytes()
+            ),
+            None
+        );
+        assert_eq!(
+            key_problem("Diablo II", base, &[b'2'; 15]).as_deref(),
             Some("Diablo II CD keys are 26 letters and numbers. This one has 15.")
+        );
+        assert!(
+            key_problem("Diablo II", base, &[b'2'; 16])
+                .is_some_and(|problem| problem.contains("16-character"))
+        );
+        let mut letter = [b'2'; 26];
+        letter[3] = b'O';
+        assert!(
+            key_problem("Diablo II", base, &letter)
+                .is_some_and(|problem| problem.contains("do not use"))
+        );
+        // Of the form, but no key of the product.
+        assert_eq!(
+            key_problem("Diablo II", base, &[b'2'; 26]).as_deref(),
+            Some("This is not a Diablo II CD key. Check the key: your Blizzard account shows it.")
         );
         // "ABCD EFGH": positions around the group gap map both ways.
         assert_eq!(key_display_index(8, 0), 0);

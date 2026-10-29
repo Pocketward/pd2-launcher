@@ -2870,17 +2870,7 @@ fn check_transaction(probe: &dyn TransactionProbe) -> CheckResult {
 /// from the last audit's, so a steady installation adds nothing.
 fn log_android_audit(status: InstallationStatus, findings: &[AuditFinding]) {
     static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-    let line = format!(
-        "{status:?}: {}",
-        findings
-            .iter()
-            .map(|finding| match &finding.path {
-                Some(path) => format!("{:?} {:?} {}", finding.check, finding.reason, path.as_str()),
-                None => format!("{:?} {:?}", finding.check, finding.reason),
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
+    let line = android_audit_line(status, findings);
     let mut last = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2888,6 +2878,30 @@ fn log_android_audit(status: InstallationStatus, findings: &[AuditFinding]) {
         eprintln!("pd2-launcher: audit {line}");
         *last = line;
     }
+}
+
+/// [`log_android_audit`]'s line. A client with no accepted manifest yet is
+/// a client not recorded yet (before Install Project Diablo 2, or an import
+/// before it records the copied client), not a fault, and the line says so.
+fn android_audit_line(status: InstallationStatus, findings: &[AuditFinding]) -> String {
+    format!(
+        "{status:?}: {}",
+        findings
+            .iter()
+            .map(|finding| match (&finding.path, finding.reason) {
+                (Some(path), _) => {
+                    format!("{:?} {:?} {}", finding.check, finding.reason, path.as_str())
+                }
+                (None, FindingReason::ManifestUnavailable)
+                    if finding.check == AuditCheck::Client =>
+                {
+                    "Client NotRecordedYet".to_owned()
+                }
+                (None, _) => format!("{:?} {:?}", finding.check, finding.reason),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 fn classify_installation(
@@ -3691,6 +3705,45 @@ mod tests {
         assert_eq!(
             lookup(&["projectd2"], "ProjectD2/d2gl.json"),
             "projectd2/d2gl.json"
+        );
+    }
+
+    #[test]
+    fn the_android_audit_line_says_a_client_without_a_record_is_not_recorded_yet() {
+        let finding = |check, reason, path: Option<&str>| AuditFinding {
+            check,
+            reason,
+            path: path.map(|path| RelativeGamePath::parse(path).expect("test path")),
+        };
+        assert_eq!(
+            android_audit_line(
+                InstallationStatus::NeedsClient,
+                &[finding(
+                    AuditCheck::Client,
+                    FindingReason::ManifestUnavailable,
+                    None
+                )],
+            ),
+            "NeedsClient: Client NotRecordedYet"
+        );
+        // Every other finding keeps its check, reason and path.
+        assert_eq!(
+            android_audit_line(
+                InstallationStatus::NeedsClient,
+                &[
+                    finding(
+                        AuditCheck::Client,
+                        FindingReason::Missing,
+                        Some("ProjectD2/Game.exe")
+                    ),
+                    finding(
+                        AuditCheck::Transaction,
+                        FindingReason::UnsafeTransaction,
+                        None
+                    ),
+                ],
+            ),
+            "NeedsClient: Client Missing ProjectD2/Game.exe; Transaction UnsafeTransaction"
         );
     }
 }

@@ -11,6 +11,7 @@ mod activity;
 mod app_menu;
 pub mod audit;
 mod automation;
+mod blizzard;
 mod builtin_fex;
 mod composition;
 mod control_channel;

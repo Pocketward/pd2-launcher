@@ -198,7 +198,7 @@ impl<'a> VerifiedUpdater<'a> {
         }
 
         reject_cancelled(control)?;
-        control.report(WorkProgress::for_phase(WorkPhase::ClientManifest));
+        control.report(WorkProgress::for_phase(self.source.manifest_phase()));
         let manifest = fetch_manifest(self.source, Some(control), self.retry_policy)?;
         reject_cancelled(control)?;
         manifest.accepted()?;
@@ -864,6 +864,12 @@ impl<'a> CopiedClientPd2Source<'a> {
 }
 
 impl Pd2Source for CopiedClientPd2Source<'_> {
+    /// The copied files are read and hashed, not downloaded: the import's
+    /// record of them is a check.
+    fn manifest_phase(&self) -> WorkPhase {
+        WorkPhase::Verification
+    }
+
     fn fetch_manifest(&mut self) -> Result<crate::manifest::ManifestResponse, NetworkError> {
         self.copied_manifest()
     }
@@ -3606,7 +3612,7 @@ mod tests {
     /// with its own MD5; the player's files, the official launcher's and
     /// anything else are left out, and nothing is fetched or changed. The
     /// record is not the server's manifest, so Play's check offers the
-    /// update.
+    /// update. Its progress names a check, never a download.
     #[test]
     fn a_copied_client_is_recorded_from_its_own_files_with_no_network() {
         let project = TempDir::new().unwrap();
@@ -3634,14 +3640,30 @@ mod tests {
         fs::write(&record, b"{\"checksum\":[]}").unwrap();
         let installed = Directory::open(project.path()).unwrap();
         let mut source = CopiedClientPd2Source::new(&installed);
+        let control = OperationControl::default();
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&phases);
+        control.observe(Arc::new(move |progress| {
+            seen.lock().unwrap().push(progress.phase());
+        }));
         VerifiedUpdater::new(project.path(), &mut source)
             .with_retry_policy(RetryPolicy::once())
-            .apply(
+            .apply_controlled(
                 "txn-copied",
                 GameActivity::Idle,
                 ProtectedInventoryEvidence::Complete,
+                &control,
             )
             .unwrap();
+        let phases = phases.lock().unwrap().clone();
+        assert_eq!(phases.first(), Some(&WorkPhase::Verification), "{phases:?}");
+        assert!(
+            !phases.iter().any(|phase| matches!(
+                phase,
+                WorkPhase::ClientManifest | WorkPhase::ClientDownload
+            )),
+            "{phases:?}"
+        );
         let mut sorted = copied.to_vec();
         sorted.sort_by_key(|(name, _)| *name);
         assert_eq!(fs::read(&record).unwrap(), manifest_body(&sorted));

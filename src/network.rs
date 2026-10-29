@@ -21,7 +21,7 @@ use zed_reqwest::{
 
 use crate::{
     manifest::{ManifestResponse, Pd2ClientBase},
-    operation::OperationControl,
+    operation::{OperationControl, WorkPhase},
 };
 
 const REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -160,6 +160,12 @@ pub(crate) trait Pd2Source: Send {
     /// The base whose manifest this source serves.
     fn client_base(&self) -> Pd2ClientBase {
         Pd2ClientBase::BuiltIn
+    }
+    /// The phase an update reports while it gets this source's manifest.
+    /// A source that reads its manifest from the installed files, with no
+    /// download, names a check instead.
+    fn manifest_phase(&self) -> WorkPhase {
+        WorkPhase::ClientManifest
     }
     fn fetch_manifest(&mut self) -> Result<ManifestResponse, NetworkError>;
     fn fetch_manifest_controlled(

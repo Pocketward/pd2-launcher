@@ -91,9 +91,14 @@ const ANDROID: [&str; 5] = [
     "FONTCONFIG_FILE",
     "XLOCALEDIR",
 ];
-/// Prefixes of what the Android app's guests also keep: Box64's settings and
-/// PanVK's (the Mali driver's).
-const ANDROID_PREFIXES: [&str; 2] = ["BOX64_", "PAN_"];
+/// Prefixes of what the Android app's guests also keep: Box64's settings,
+/// PanVK's (the Mali driver's), and those of the routes to the phone's own
+/// driver: libhybris's (`HYBRIS_*`: its linker's folder and library path,
+/// the Android API level) with the app's libhybris Vulkan driver's
+/// (`PD2_HYBRIS_*`), and RADV's (`RADV_*`, Mesa's driver for Samsung's
+/// Xclipse GPUs). The app starts the engine with an environment of its own
+/// making, which has these values only for the route it takes.
+const ANDROID_PREFIXES: [&str; 5] = ["BOX64_", "PAN_", "HYBRIS_", "PD2_HYBRIS_", "RADV_"];
 
 /// Added to the Launcher's DLL overrides on the Android host: the XInput
 /// bridge (`tools/xinput-bridge.c`) installed as `xinput1_4.dll`, and no
@@ -369,6 +374,62 @@ mod tests {
             get(&desktop, "PULSE_SERVER"),
             Some("unix:/data/run/pulse/native")
         );
+    }
+
+    #[test]
+    fn the_android_host_passes_the_phone_driver_routes_values_and_no_other() {
+        let app = host(&[
+            ("HYBRIS_LD_LIBRARY_PATH", "/data/hybris/lib:/vendor/lib64"),
+            ("HYBRIS_LINKER_DIR", "/data/hybris/lib/libhybris/linker"),
+            ("HYBRIS_ANDROID_SDK_VERSION", "36"),
+            ("PD2_HYBRIS_DEBUG", "1"),
+            ("PD2_HYBRIS_SEGV", "1"),
+            ("RADV_XCLIPSE_LOG", "1"),
+            ("RADV_DEBUG", "nocache"),
+            ("HYBRIS", "1"),
+            ("PD2_HYBRIS", "1"),
+            ("RADV", "1"),
+            ("XHYBRIS_LD_LIBRARY_PATH", "/elsewhere"),
+            ("PD2_HYBRID_DEBUG", "1"),
+            ("ACO_DEBUG", "1"),
+            ("PD2_LAUNCHER_HOME", "/private"),
+            ("HYBRIS_LD_DEBUG", "bad\nvalue"),
+            ("RADV_PERFTEST", ""),
+        ]);
+        let android = compose_on(app.clone(), &[], true);
+        for (name, value) in [
+            ("HYBRIS_LD_LIBRARY_PATH", "/data/hybris/lib:/vendor/lib64"),
+            ("HYBRIS_LINKER_DIR", "/data/hybris/lib/libhybris/linker"),
+            ("HYBRIS_ANDROID_SDK_VERSION", "36"),
+            ("PD2_HYBRIS_DEBUG", "1"),
+            ("PD2_HYBRIS_SEGV", "1"),
+            ("RADV_XCLIPSE_LOG", "1"),
+            ("RADV_DEBUG", "nocache"),
+        ] {
+            assert_eq!(get(&android, name), Some(value), "{name}");
+        }
+        for name in [
+            "HYBRIS",
+            "PD2_HYBRIS",
+            "RADV",
+            "XHYBRIS_LD_LIBRARY_PATH",
+            "PD2_HYBRID_DEBUG",
+            "ACO_DEBUG",
+            "PD2_LAUNCHER_HOME",
+            "HYBRIS_LD_DEBUG",
+            "RADV_PERFTEST",
+        ] {
+            assert_eq!(get(&android, name), None, "{name}");
+        }
+        // The desktop keeps none of them.
+        let desktop = compose_on(app, &[], false);
+        for name in [
+            "HYBRIS_LD_LIBRARY_PATH",
+            "PD2_HYBRIS_DEBUG",
+            "RADV_XCLIPSE_LOG",
+        ] {
+            assert_eq!(get(&desktop, name), None, "{name}");
+        }
     }
 
     #[test]

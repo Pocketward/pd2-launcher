@@ -51,16 +51,16 @@ use crate::{
     presentation::{
         self, ActiveJobView, AuthorizationInput, AuthorizationInputError, AuthorizationView,
         DirectDrawRendererView, DownloadSourceView, ExistingProblemView, GameNoticeView, GameView,
-        HostView, ImportModeView, InstallerMediaView, Intent, OperationPhase, OperationStatusView,
-        Prerequisite, ReduceOutcome, RendererPreferenceView, ReportView, ResultNextStep,
-        SequencedEvent, ServiceEndpoint, SettingsChange, SettingsPersistenceView, SetupStep,
-        SourceBadgeView, UiReducer, UiSnapshot,
+        HostView, ImportModeView, InstallSourceView, InstallerMediaView, Intent, OperationPhase,
+        OperationStatusView, Prerequisite, ReduceOutcome, RendererPreferenceView, ReportView,
+        ResultNextStep, SequencedEvent, ServiceEndpoint, SettingsChange, SettingsPersistenceView,
+        SetupStep, SourceBadgeView, UiReducer, UiSnapshot,
     },
     sources::DownloadArtifact,
 };
 
 /// The protocol version this engine speaks.
-pub(crate) const PROTOCOL: u32 = 5;
+pub(crate) const PROTOCOL: u32 = 6;
 
 /// The largest frame either side may send: 1 MiB of JSON.
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -107,6 +107,10 @@ pub(crate) enum EngineMessage {
     /// The command `seq` was not taken (0: not known, or the engine itself
     /// failed). `reason` is a stable code: `malformed-message`,
     /// `unsupported-command`, `unexpected-hello`, `invalid-product-key`,
+    /// a key that the installers would refuse (protocol 6:
+    /// `d2-key-wrong-length`, `d2-key-16-characters`,
+    /// `d2-key-invalid-character`, `d2-key-not-valid`, `d2-key-is-lod-key`,
+    /// and `lod-key-…` with `lod-key-is-d2-key`),
     /// `relative-path`, `engine-busy`, `service-unavailable` or
     /// `engine-failed`; or the Launcher refused it
     /// (a guard failure such as `install-not-permitted`), named by the code
@@ -258,6 +262,10 @@ pub(crate) enum Command {
     ChangeSettings {
         change: SettingChange,
     },
+    /// Stop a running Download job, then remove what the Launcher's own
+    /// downloads made, for an import (protocol 6); refused while an install
+    /// stage runs.
+    DiscardDownloads,
     ExportDiagnostics,
     RevealReport,
     DismissReport,
@@ -418,6 +426,21 @@ pub(crate) enum SettingChange {
     UpdateChecks {
         enabled: bool,
     },
+    /// Where Blizzard's installers are downloaded from, from the next
+    /// Download or install step on (protocol 6).
+    InstallSource {
+        source: InstallSource,
+    },
+}
+
+/// Where Blizzard's installers come from: Blizzard's own downloader (the
+/// default), or the direct download, which fetches the same files without
+/// it and without Wine.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallSource {
+    Official,
+    DirectDownload,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -463,10 +486,18 @@ impl Command {
             Self::ResetDownloadSource { artifact } => Intent::ResetDownloadSource(artifact.into()),
             // The desktop's in-memory authorization, with the terms the
             // app's dialog confirmed.
-            Self::Authorize { d2_key, lod_key } => Intent::AuthorizeAndInstall(
-                AuthorizationInput::from_bytes(d2_key.take(), lod_key.take(), true)
-                    .map_err(|_: AuthorizationInputError| "invalid-product-key")?,
-            ),
+            Self::Authorize { d2_key, lod_key } => {
+                use crate::blizzard::{KeyField, check_key};
+                // Each key as the installers check it, before anything is
+                // downloaded.
+                let d2_check = check_key(KeyField::BaseGame, &d2_key.0).map(drop);
+                let lod_check = check_key(KeyField::Expansion, &lod_key.0).map(drop);
+                let input = AuthorizationInput::from_bytes(d2_key.take(), lod_key.take(), true)
+                    .map_err(|_: AuthorizationInputError| "invalid-product-key")?;
+                d2_check.map_err(|problem| key_reason(KeyField::BaseGame, problem))?;
+                lod_check.map_err(|problem| key_reason(KeyField::Expansion, problem))?;
+                Intent::AuthorizeAndInstall(input)
+            }
             Self::ContinueInstallation => Intent::ContinueInstallation,
             Self::DownloadAll => Intent::DownloadAll,
             Self::ImportExistingInstall { mode } => Intent::ImportExistingInstall(match mode {
@@ -499,6 +530,7 @@ impl Command {
                 strict_memory_order,
                 detailed_logging,
             } => Intent::OpenOfficialLauncherConfirmed(strict_memory_order, detailed_logging),
+            Self::DiscardDownloads => Intent::DiscardDownloads,
             Self::StartOver => Intent::StartOver,
             Self::RetryLocation => Intent::RetryLocation,
             Self::ChangeSettings { change } => Intent::ChangeSettings(match change {
@@ -519,12 +551,42 @@ impl Command {
                     SettingsChange::SoundInBackground(enabled)
                 }
                 SettingChange::UpdateChecks { enabled } => SettingsChange::UpdateChecks(enabled),
+                SettingChange::InstallSource { source } => {
+                    SettingsChange::InstallSource(match source {
+                        InstallSource::Official => InstallSourceView::Official,
+                        InstallSource::DirectDownload => InstallSourceView::DirectDownload,
+                    })
+                }
             }),
             Self::ExportDiagnostics => Intent::ExportDiagnostics,
             Self::RevealReport => Intent::RevealReport,
             Self::DismissReport => Intent::DismissReport,
             Self::RequestFullSnapshot => Intent::RequestFullSnapshot,
         })
+    }
+}
+
+/// The `command_error` reason for a key that the installers would refuse.
+fn key_reason(
+    field: crate::blizzard::KeyField,
+    problem: crate::blizzard::KeyProblem,
+) -> &'static str {
+    use crate::blizzard::{KeyField, KeyProblem};
+    match (field, problem) {
+        (KeyField::BaseGame, KeyProblem::WrongLength) => "d2-key-wrong-length",
+        (KeyField::BaseGame, KeyProblem::OldKeyLength) => "d2-key-16-characters",
+        (KeyField::BaseGame, KeyProblem::InvalidCharacter) => "d2-key-invalid-character",
+        (KeyField::BaseGame, KeyProblem::ExpansionKeyInBaseField) => "d2-key-is-lod-key",
+        (KeyField::BaseGame, KeyProblem::WrongProduct | KeyProblem::BaseKeyInExpansionField) => {
+            "d2-key-not-valid"
+        }
+        (KeyField::Expansion, KeyProblem::WrongLength) => "lod-key-wrong-length",
+        (KeyField::Expansion, KeyProblem::OldKeyLength) => "lod-key-16-characters",
+        (KeyField::Expansion, KeyProblem::InvalidCharacter) => "lod-key-invalid-character",
+        (KeyField::Expansion, KeyProblem::BaseKeyInExpansionField) => "lod-key-is-d2-key",
+        (KeyField::Expansion, KeyProblem::WrongProduct | KeyProblem::ExpansionKeyInBaseField) => {
+            "lod-key-not-valid"
+        }
     }
 }
 
@@ -878,6 +940,8 @@ pub(crate) enum Job {
     OfficialLauncher,
     Reset,
     Relocation,
+    /// Removing what the Launcher's own downloads made (protocol 6).
+    DiscardDownloads,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -956,6 +1020,8 @@ pub(crate) struct Settings {
     /// Project Diablo 2's update checks run (the default); off, none runs,
     /// the update stays unknown and the client plays as installed.
     pub(crate) update_checks: bool,
+    /// Where Blizzard's installers are downloaded from (protocol 6).
+    pub(crate) install_source: InstallSource,
     pub(crate) persistence: SettingsPersistence,
 }
 
@@ -1136,6 +1202,10 @@ impl Snapshot {
                 skip_to_bnet: settings.skip_to_bnet(),
                 sound_in_background: settings.sound_in_background(),
                 update_checks: settings.update_checks(),
+                install_source: match settings.install_source() {
+                    InstallSourceView::Official => InstallSource::Official,
+                    InstallSourceView::DirectDownload => InstallSource::DirectDownload,
+                },
                 persistence: match settings.persistence() {
                     SettingsPersistenceView::Loading => SettingsPersistence::Loading,
                     SettingsPersistenceView::Saved => SettingsPersistence::Saved,
@@ -1272,6 +1342,7 @@ fn job(job: ActiveJobView) -> Job {
         ActiveJobView::OfficialLauncher => Job::OfficialLauncher,
         ActiveJobView::Reset => Job::Reset,
         ActiveJobView::Relocation => Job::Relocation,
+        ActiveJobView::DiscardDownloads => Job::DiscardDownloads,
     }
 }
 
@@ -1740,18 +1811,31 @@ fn serve_commands(
         // The frame may hold CD keys.
         frame.zeroize();
         let refused = match command {
-            Ok((seq, command)) => match command.into_intent() {
-                Ok(intent) => {
-                    // Set first: the service may refuse it before try_send returns.
-                    taken.store(seq, Ordering::SeqCst);
-                    match intents.try_send(intent) {
-                        Ok(()) => None,
-                        Err(TrySendError::Full(_)) => Some((seq, "engine-busy")),
-                        Err(TrySendError::Disconnected(_)) => Some((seq, "service-unavailable")),
-                    }
+            Ok((seq, command)) => {
+                let authorize = matches!(command, Command::Authorize { .. });
+                let intent = command.into_intent();
+                if authorize && intent.is_err() {
+                    // New keys the check refused: keys an earlier authorize
+                    // left waiting must not install either. A blocking send:
+                    // a full queue must not lose it (the service empties
+                    // the queue every tick).
+                    let _ = intents.send(Intent::ForgetWaitingKeys);
                 }
-                Err(reason) => Some((seq, reason)),
-            },
+                match intent {
+                    Ok(intent) => {
+                        // Set first: the service may refuse it before try_send returns.
+                        taken.store(seq, Ordering::SeqCst);
+                        match intents.try_send(intent) {
+                            Ok(()) => None,
+                            Err(TrySendError::Full(_)) => Some((seq, "engine-busy")),
+                            Err(TrySendError::Disconnected(_)) => {
+                                Some((seq, "service-unavailable"))
+                            }
+                        }
+                    }
+                    Err(reason) => Some((seq, reason)),
+                }
+            }
             Err(refused) => Some(refused),
         };
         if let Some((seq, reason)) = refused {
@@ -1793,11 +1877,12 @@ mod tests {
     /// How many commands the protocol has. A new command needs a sample:
     /// `expected_label` does not compile without it, and this count keeps
     /// the samples complete.
-    const COMMANDS: usize = 29;
+    const COMMANDS: usize = 30;
 
-    /// Obviously fake keys: tests never hold real ones.
-    const FAKE_D2_KEY: &str = "AAAABBBBCCCCDDDDEEEEFFFFGG";
-    const FAKE_LOD_KEY: &str = "HHHHIIIIJJJJKKKKLLLLMMMMNN";
+    /// Obviously fake keys: tests never hold real ones. These are the test
+    /// builds' fake keys, which pass the check only there.
+    const FAKE_D2_KEY: &str = crate::blizzard::TEST_BASE_KEY;
+    const FAKE_LOD_KEY: &str = crate::blizzard::TEST_EXPANSION_KEY;
 
     fn key(value: &str) -> ProductKey {
         ProductKey(value.as_bytes().to_vec())
@@ -1881,10 +1966,16 @@ mod tests {
             Command::ChangeSettings {
                 change: SettingChange::UpdateChecks { enabled: false },
             },
+            Command::ChangeSettings {
+                change: SettingChange::InstallSource {
+                    source: InstallSource::DirectDownload,
+                },
+            },
             Command::ExportDiagnostics,
             Command::RevealReport,
             Command::DismissReport,
             Command::RequestFullSnapshot,
+            Command::DiscardDownloads,
         ]
     }
 
@@ -1909,6 +2000,7 @@ mod tests {
             Command::Authorize { .. } => "Authorize and start Managed installation",
             Command::ContinueInstallation => "Continue Managed installation",
             Command::DownloadAll => "Download everything",
+            Command::DiscardDownloads => "Remove the downloads for an import",
             Command::ImportExistingInstall { .. } => "Import the existing Diablo II",
             Command::InstallProjectDiablo => "Install Project Diablo 2",
             Command::SelectExistingInstall { .. } => "Choose an existing Diablo II folder",
@@ -1925,6 +2017,9 @@ mod tests {
                 SettingChange::SkipToBnet { .. } => "Change next-launch online shortcut",
                 SettingChange::SoundInBackground { .. } => "Change next-launch background sound",
                 SettingChange::UpdateChecks { .. } => "Change Project Diablo 2's update checks",
+                SettingChange::InstallSource { .. } => {
+                    "Change where Blizzard's installers come from"
+                }
             },
             Command::ExportDiagnostics => "Save a redacted report",
             Command::RevealReport => "Open the report's folder",
@@ -1988,6 +2083,31 @@ mod tests {
             }),
             Some("invalid-product-key")
         );
+        // Of the right characters, but not the installers' form.
+        for (d2, lod, reason) in [
+            ("BCDF-GHJK-MNPR-TVWX", FAKE_LOD_KEY, "d2-key-16-characters"),
+            (
+                "ABCDGHJKMNPRTVWXYZ24678922",
+                FAKE_LOD_KEY,
+                "d2-key-invalid-character",
+            ),
+            (FAKE_D2_KEY, "CDFGHJK", "lod-key-wrong-length"),
+            // Of the form, but no key of the product.
+            (
+                "2222-2222-2222-2222-2222-2222-22",
+                FAKE_LOD_KEY,
+                "d2-key-not-valid",
+            ),
+            (FAKE_D2_KEY, FAKE_D2_KEY, "lod-key-not-valid"),
+        ] {
+            assert_eq!(
+                refused(Command::Authorize {
+                    d2_key: key(d2),
+                    lod_key: key(lod),
+                }),
+                Some(reason)
+            );
+        }
         assert_eq!(
             refused(Command::SelectInstallerMedia {
                 path: "Download".to_owned()
@@ -2161,6 +2281,91 @@ mod tests {
         );
     }
 
+    /// The install source on the wire (protocol 6): snake_case in the
+    /// command and in the snapshot (the settings file has `direct-download`).
+    #[test]
+    fn the_install_source_has_its_wire_form() {
+        let frame = br#"{"type":"command","seq":4,"intent":{"type":"change_settings","change":{"setting":"install_source","source":"direct_download"}}}"#;
+        let Ok((4, command)) = decode_command(frame) else {
+            panic!("the change decodes");
+        };
+        assert_eq!(
+            command,
+            Command::ChangeSettings {
+                change: SettingChange::InstallSource {
+                    source: InstallSource::DirectDownload,
+                },
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            serde_json::json!({
+                "type": "change_settings",
+                "change": {"setting": "install_source", "source": "direct_download"}
+            })
+        );
+        assert!(
+            decode_command(
+                br#"{"type":"command","seq":5,"intent":{"type":"change_settings","change":{"setting":"install_source","source":"direct-download"}}}"#
+            )
+            .is_err(),
+            "the settings file's spelling is not the wire's"
+        );
+        let snapshot = full_ui_snapshot().with_settings(
+            crate::presentation::LaunchSettingsView::new(
+                RendererPreferenceView::Glide,
+                false,
+                false,
+            )
+            .with_install_source(InstallSourceView::DirectDownload),
+        );
+        let message = serde_json::to_value(snapshot_message(&snapshot)).unwrap();
+        assert_eq!(
+            message["snapshot"]["settings"]["install_source"],
+            serde_json::json!("direct_download")
+        );
+        let official = serde_json::to_value(snapshot_message(&full_ui_snapshot())).unwrap();
+        assert_eq!(
+            official["snapshot"]["settings"]["install_source"],
+            serde_json::json!("official")
+        );
+    }
+
+    /// `discard_downloads` on the wire (protocol 6), its refusal, and the
+    /// job a snapshot names while it runs.
+    #[test]
+    fn discard_downloads_has_its_wire_form() {
+        let Ok((12, command)) =
+            decode_command(br#"{"type":"command","seq":12,"intent":{"type":"discard_downloads"}}"#)
+        else {
+            panic!("decoded");
+        };
+        assert_eq!(command, Command::DiscardDownloads);
+        assert!(matches!(
+            command.into_intent(),
+            Ok(Intent::DiscardDownloads)
+        ));
+        assert_eq!(
+            serde_json::to_string(&EngineMessage::CommandError {
+                seq: 12,
+                reason: "discard-downloads-not-permitted".to_owned(),
+            })
+            .unwrap(),
+            r#"{"type":"command_error","seq":12,"reason":"discard-downloads-not-permitted"}"#
+        );
+        assert_eq!(
+            serde_json::to_value(job(ActiveJobView::DiscardDownloads)).unwrap(),
+            serde_json::json!("discard_downloads")
+        );
+        // The early start is gone.
+        assert!(
+            decode_command(
+                br#"{"type":"command","seq":13,"intent":{"type":"start_direct_download"}}"#
+            )
+            .is_err()
+        );
+    }
+
     fn authorize_frame(d2_key: &str, lod_key: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "type": "command",
@@ -2168,6 +2373,23 @@ mod tests {
             "intent": {"type": "authorize", "d2_key": d2_key, "lod_key": lod_key}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_key_of_the_other_product_has_its_own_reason() {
+        use crate::blizzard::{KeyField, KeyProblem};
+        assert_eq!(
+            key_reason(KeyField::BaseGame, KeyProblem::ExpansionKeyInBaseField),
+            "d2-key-is-lod-key"
+        );
+        assert_eq!(
+            key_reason(KeyField::Expansion, KeyProblem::BaseKeyInExpansionField),
+            "lod-key-is-d2-key"
+        );
+        assert_eq!(
+            key_reason(KeyField::Expansion, KeyProblem::WrongProduct),
+            "lod-key-not-valid"
+        );
     }
 
     #[test]
@@ -2711,6 +2933,68 @@ mod tests {
         assert!(matches!(
             outbox.next(),
             Some(Outgoing::Error(1, reason)) if reason == "engine-busy"
+        ));
+    }
+
+    #[test]
+    fn a_refused_authorize_tells_the_service_to_forget_waiting_keys() {
+        let (mut app, engine) = UnixStream::pair().unwrap();
+        let (intents, received) = std::sync::mpsc::sync_channel(4);
+        let outbox = Outbox::default();
+        let taken = AtomicU64::new(0);
+        let status = std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve_commands(&engine, &intents, &outbox, &taken));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "command", "seq": 5,
+                "intent": {"type": "authorize", "d2_key": "2222-2222-2222-2222-2222-2222-22", "lod_key": FAKE_LOD_KEY}
+            }))
+            .unwrap();
+            app.write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                .unwrap();
+            app.write_all(&body).unwrap();
+            let forgotten = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(forgotten, Intent::ForgetWaitingKeys));
+            drop(app);
+            serving.join().unwrap()
+        });
+        assert_eq!(status, 0);
+        outbox.close();
+        assert!(matches!(
+            outbox.next(),
+            Some(Outgoing::Error(5, reason)) if reason == "d2-key-not-valid"
+        ));
+    }
+
+    #[test]
+    fn a_full_queue_does_not_lose_the_forget_of_waiting_keys() {
+        let (mut app, engine) = UnixStream::pair().unwrap();
+        // The service's queue is full.
+        let (intents, received) = std::sync::mpsc::sync_channel(1);
+        intents.send(Intent::CheckAgain).unwrap();
+        let outbox = Outbox::default();
+        let taken = AtomicU64::new(0);
+        let status = std::thread::scope(|scope| {
+            let serving = scope.spawn(|| serve_commands(&engine, &intents, &outbox, &taken));
+            let body = serde_json::to_vec(&serde_json::json!({
+                "type": "command", "seq": 6,
+                "intent": {"type": "authorize", "d2_key": "BCDF-GHJK-MNPR-TVWX", "lod_key": FAKE_LOD_KEY}
+            }))
+            .unwrap();
+            app.write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+                .unwrap();
+            app.write_all(&body).unwrap();
+            // Once the queue has room, the forget arrives.
+            assert!(matches!(received.recv().unwrap(), Intent::CheckAgain));
+            let forgotten = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(forgotten, Intent::ForgetWaitingKeys));
+            drop(app);
+            serving.join().unwrap()
+        });
+        assert_eq!(status, 0);
+        outbox.close();
+        assert!(matches!(
+            outbox.next(),
+            Some(Outgoing::Error(6, reason)) if reason == "d2-key-16-characters"
         ));
     }
 

@@ -40,14 +40,17 @@ use crate::{
     manifest::{ManifestResponse, PD2_MANIFEST_URL, Pd2ClientBase, Pd2Manifest},
     network::SystemPd2Source,
     operation::WorkPhase,
-    persistence::{LauncherPaths, LayoutError, RendererSetting, SettingsStore, SetupRecord},
+    persistence::{
+        InstallSourceSetting, LauncherPaths, LayoutError, RendererSetting, SettingsStore,
+        SetupRecord,
+    },
     presentation::{
         DirectDrawRendererView, DistroFamily, DownloadSourceView, DownloadsView, EvidenceTone,
         EvidenceView, ExistingInstallView, ExistingProblemView, FexSettingView, FexSourceView,
         GameFolderView, GameNoticeView, GraphicsDriver, GraphicsProfile, HostView, ImportModeView,
-        InstallerMediaView, LaunchSettingsView, LocationView, PREFIX_EVIDENCE_LABEL, Prerequisite,
-        RendererPreferenceView, SavesPutAsideView, SettingsChange, SourceBadgeView,
-        SystemContractView,
+        InstallSourceView, InstallerMediaView, LaunchSettingsView, LocationView,
+        PREFIX_EVIDENCE_LABEL, Prerequisite, RendererPreferenceView, SavesPutAsideView,
+        SettingsChange, SourceBadgeView, SystemContractView,
     },
     process::{
         D2glSetup, GameAudit, GameAuditFailure, GameAuditor, GameLaunchOptions, GameRenderer,
@@ -192,6 +195,10 @@ impl CoordinatorBackend for ProductionBackend {
 
     fn download_all(&self, cancellation: &CancellationToken) -> Result<(), BackendFailure> {
         self.ready()?.download_all(cancellation)
+    }
+
+    fn discard_downloads(&self, cancellation: &CancellationToken) -> Result<(), BackendFailure> {
+        self.ready()?.discard_downloads(cancellation)
     }
 
     fn install_base_game(
@@ -1214,6 +1221,13 @@ impl ReadyBackend {
             .clone()
             .with_custom_wine(sources.custom_url(DownloadArtifact::Wine).is_some())
             .with_wpf_software_rendering(self.official_launcher_software_rendering());
+        // Read at each job's start, like the sources.
+        let direct_download = self.settings.load().is_ok_and(|settings| {
+            settings.install_source() == InstallSourceSetting::DirectDownload
+        });
+        if direct_download {
+            eprintln!("pd2-launcher: Blizzard's installers come from the direct download");
+        }
         let mut installer = ManagedInstaller::new(
             &auditor,
             &artifacts,
@@ -1221,6 +1235,7 @@ impl ReadyBackend {
             &client,
             ArtifactCatalog::with_sources(&sources),
         )
+        .with_direct_download(direct_download)
         .with_client_as_installed(client_as_installed(&self.settings));
         let result = run(&mut installer);
         self.record_custom_sources(activity, &sources, &used.take())?;
@@ -1302,6 +1317,32 @@ impl ReadyBackend {
             })?;
             self.record_existing_choice(&choice)?;
             reject_cancelled(cancellation)?;
+            activity.progress(WorkPhase::Verification, None, None, None)
+        })();
+        activity.defer(&result)?;
+        result
+    }
+
+    /// Remove what this Launcher's own downloads made, for a player who
+    /// imports the game instead; imported files stay.
+    fn discard_downloads(&self, cancellation: &CancellationToken) -> Result<(), BackendFailure> {
+        let activity = self.begin_job(
+            JobKind::DiscardDownloads,
+            WorkPhase::Verification,
+            cancellation,
+        )?;
+        let result = (|| {
+            reject_cancelled(cancellation)?;
+            let removed = self.run_setup_job(&activity, None, true, |installer| match installer
+                .discard_downloads(&self.paths.managed_root(), cancellation)
+            {
+                Ok(()) => Ok(true),
+                Err(InstallError::StageFailed { .. }) => Ok(false),
+                Err(error) => Err(error),
+            })?;
+            if !removed {
+                return Err(backend_failure("discard-downloads-failed"));
+            }
             activity.progress(WorkPhase::Verification, None, None, None)
         })();
         activity.defer(&result)?;
@@ -3688,6 +3729,10 @@ fn launch_settings_view(settings: &crate::persistence::LauncherSettings) -> Laun
     )
     .with_official_launcher_software_rendering(settings.official_launcher_software_rendering())
     .with_app_menu_entry(settings.app_menu_entry())
+    .with_install_source(match settings.install_source() {
+        InstallSourceSetting::Official => InstallSourceView::Official,
+        InstallSourceSetting::DirectDownload => InstallSourceView::DirectDownload,
+    })
     .with_update_checks(settings.update_checks())
     .with_direct_draw_renderer(match settings.direct_draw_renderer() {
         crate::persistence::DirectDrawRendererSetting::Untouched
@@ -3761,6 +3806,10 @@ fn update_launch_settings(
         }
         SettingsChange::AppMenuEntry(enabled) => settings.with_app_menu_entry(enabled),
         SettingsChange::UpdateChecks(enabled) => settings.with_update_checks(enabled),
+        SettingsChange::InstallSource(source) => settings.with_install_source(match source {
+            InstallSourceView::Official => InstallSourceSetting::Official,
+            InstallSourceView::DirectDownload => InstallSourceSetting::DirectDownload,
+        }),
     };
     store
         .save(&settings)
@@ -3901,7 +3950,7 @@ fn update_download_source_setting(
 /// The stable code of an install that stopped at a known stage, so the view
 /// can say which step failed and what to do next.
 fn install_failure_code(error: &InstallError) -> &'static str {
-    use crate::install::{ArtifactKind, DownloaderFailure, InstallStage};
+    use crate::install::{ArtifactKind, DirectFailure, DownloaderFailure, InstallStage};
     match error {
         InstallError::KeyRejected {
             stage: InstallStage::BaseGame,
@@ -3951,6 +4000,13 @@ fn install_failure_code(error: &InstallError) -> &'static str {
             DownloaderFailure::Rejected => "installer-download-rejected",
             DownloaderFailure::Ended => "installer-downloader-failed",
         },
+        InstallError::KeyInvalid { stage, problem } => key_failure_code(*stage, *problem),
+        // How the direct download failed, each its own code.
+        InstallError::DirectDownloadFailed { failure, .. } => match failure {
+            DirectFailure::Refused => "direct-download-refused",
+            DirectFailure::Incomplete => "direct-download-incomplete",
+            DirectFailure::Mismatch => "direct-download-mismatch",
+        },
         InstallError::BaseGameRequired => "base-game-required",
         InstallError::BaseGameInstalled => "base-game-installed",
         InstallError::ExistingInstallInvalid(_) => "existing-install-invalid",
@@ -3966,6 +4022,31 @@ fn install_failure_code(error: &InstallError) -> &'static str {
             _ => "download-failed",
         },
         _ => "managed-install-failed",
+    }
+}
+
+/// Why a CD key failed the installers' own check, for its field.
+fn key_failure_code(
+    stage: crate::install::InstallStage,
+    problem: crate::blizzard::KeyProblem,
+) -> &'static str {
+    use crate::blizzard::KeyProblem;
+    let expansion = stage == crate::install::InstallStage::Expansion;
+    match (expansion, problem) {
+        (false, KeyProblem::WrongLength) => "base-game-key-wrong-length",
+        (false, KeyProblem::OldKeyLength) => "base-game-key-16-characters",
+        (false, KeyProblem::InvalidCharacter) => "base-game-key-invalid-character",
+        (false, KeyProblem::ExpansionKeyInBaseField) => "base-game-key-is-expansion-key",
+        (false, KeyProblem::BaseKeyInExpansionField | KeyProblem::WrongProduct) => {
+            "base-game-key-not-valid"
+        }
+        (true, KeyProblem::WrongLength) => "expansion-key-wrong-length",
+        (true, KeyProblem::OldKeyLength) => "expansion-key-16-characters",
+        (true, KeyProblem::InvalidCharacter) => "expansion-key-invalid-character",
+        (true, KeyProblem::BaseKeyInExpansionField) => "expansion-key-is-base-game-key",
+        (true, KeyProblem::ExpansionKeyInBaseField | KeyProblem::WrongProduct) => {
+            "expansion-key-not-valid"
+        }
     }
 }
 
@@ -4242,7 +4323,7 @@ mod tests {
 
     #[test]
     fn install_failures_name_the_stage_and_a_rejected_key() {
-        use crate::install::{ArtifactKind, DownloaderFailure, InstallStage};
+        use crate::install::{ArtifactKind, DirectFailure, DownloaderFailure, InstallStage};
         for (error, code) in [
             (
                 InstallError::KeyRejected {
@@ -4345,6 +4426,48 @@ mod tests {
                     failure: DownloaderFailure::Ended,
                 },
                 "installer-downloader-failed",
+            ),
+            (
+                InstallError::DirectDownloadFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DirectFailure::Refused,
+                },
+                "direct-download-refused",
+            ),
+            (
+                InstallError::KeyInvalid {
+                    stage: InstallStage::BaseGame,
+                    problem: crate::blizzard::KeyProblem::ExpansionKeyInBaseField,
+                },
+                "base-game-key-is-expansion-key",
+            ),
+            (
+                InstallError::KeyInvalid {
+                    stage: InstallStage::Expansion,
+                    problem: crate::blizzard::KeyProblem::OldKeyLength,
+                },
+                "expansion-key-16-characters",
+            ),
+            (
+                InstallError::KeyInvalid {
+                    stage: InstallStage::Expansion,
+                    problem: crate::blizzard::KeyProblem::WrongProduct,
+                },
+                "expansion-key-not-valid",
+            ),
+            (
+                InstallError::DirectDownloadFailed {
+                    stage: InstallStage::ExpansionDownload,
+                    failure: DirectFailure::Incomplete,
+                },
+                "direct-download-incomplete",
+            ),
+            (
+                InstallError::DirectDownloadFailed {
+                    stage: InstallStage::BaseGameDownload,
+                    failure: DirectFailure::Mismatch,
+                },
+                "direct-download-mismatch",
             ),
             (InstallError::AuditUnavailable, "managed-install-failed"),
         ] {

@@ -136,6 +136,8 @@ pub(crate) enum JobKind {
     Reset,
     /// Choosing or changing the install location.
     Relocation,
+    /// Removing what this Launcher's own downloads made, for an import.
+    DiscardDownloads,
 }
 
 impl JobKind {
@@ -150,6 +152,7 @@ impl JobKind {
             Self::OfficialLauncher => "Official PD2 launcher session",
             Self::Reset => "Start over",
             Self::Relocation => "Install location change",
+            Self::DiscardDownloads => "Removal of the downloads for an import",
         }
     }
 }

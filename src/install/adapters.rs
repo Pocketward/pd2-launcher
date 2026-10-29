@@ -50,6 +50,8 @@ use crate::{
     update::{GameActivity, ProtectedInventoryEvidence, VerifiedUpdater},
 };
 
+mod direct;
+
 const RUNTIME_RECEIPT: &str = crate::runtime::BUILTIN_RUNTIME_RECEIPT;
 const RUNTIME_MATERIALIZATION_STATE: &str = ".pd2launcher-runtime-materialization.sha512";
 const GECKO_RECEIPT: &str = ".pd2launcher-gecko.sha256";
@@ -539,9 +541,13 @@ impl ArtifactHttp for SystemArtifactHttp {
     }
 }
 
-/// Built-in sources use HTTPS only; none has a cleartext exception. A
-/// user-supplied custom source may use plain HTTP as well; its
-/// content is unverified by the user's explicit choice.
+/// Built-in sources use HTTPS only. A user-supplied custom source may use
+/// plain HTTP as well; its content is unverified by the user's explicit
+/// choice. The one built-in exception does not come here: the direct
+/// download's pieces ([`crate::blizzard`]) come over plain HTTP from the one
+/// pinned piece host, which presents no certificate for its name; each piece
+/// must match its SHA-1 in a torrent whose infohash is pinned, and the
+/// finished files their SHA-256 pins.
 fn approved_request_transport(spec: &ArtifactSpec) -> bool {
     spec.request_url().starts_with("https://")
         || (spec.is_custom()
@@ -1155,6 +1161,28 @@ impl ProductionArtifactSource {
                     _ => true,
                 },
             };
+            // getLegacy rate-limits with an empty (or next to empty) 200
+            // answer: asked again after a pause, like a 429.
+            let smallest = match spec.size {
+                SizePolicy::Exact(size) | SizePolicy::Bounded { min: size, .. } => size,
+            };
+            if completed
+                && volatile_wrapper(spec.kind)
+                && !spec.is_custom()
+                && existing.saturating_add(copied) < smallest.min(RATE_LIMITED_WRAPPER_BYTES)
+            {
+                if self
+                    .retry_policy
+                    .pause(failed, None, started, Some(control))
+                {
+                    failed += 1;
+                    completed = false;
+                    output.set_len(0).map_err(|_| AdapterFailure::here())?;
+                    continue;
+                }
+                reject_artifact_cancelled_with_guard(control, &mut guard)?;
+                return Err(AdapterFailure::here());
+            }
             if completed {
                 break;
             }
@@ -1238,6 +1266,10 @@ impl ProductionArtifactSource {
 /// about a week after the wrapper was fetched; an older cached wrapper is
 /// downloaded again rather than run.
 const WRAPPER_REUSE_LIMIT: Duration = Duration::from_secs(6 * 24 * 60 * 60);
+
+/// A 200 answer for a wrapper shorter than this (and than the wrapper's
+/// smallest size) is getLegacy's rate limit, not a wrapper.
+const RATE_LIMITED_WRAPPER_BYTES: u64 = 1024;
 
 fn expired_wrapper(cached: &File) -> bool {
     cached
@@ -1346,6 +1378,22 @@ fn check_complete_payload_directory(
     identity: CompletePayloadIdentity,
     allow_known_source_directories: bool,
 ) -> Result<(), PayloadProblem> {
+    check_complete_payload_directory_until(
+        directory,
+        identity,
+        allow_known_source_directories,
+        &|| false,
+    )
+}
+
+/// The same check, ended between reads once `stop` says so: its problem
+/// is then `stopped`.
+fn check_complete_payload_directory_until(
+    directory: &Directory,
+    identity: CompletePayloadIdentity,
+    allow_known_source_directories: bool,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), PayloadProblem> {
     let mut files = BTreeSet::new();
     let mut directx = None;
     for name in directory
@@ -1388,6 +1436,7 @@ fn check_complete_payload_directory(
         identity.installer_size,
         identity.installer_sha256,
         true,
+        stop,
     )?;
     check_complete_payload_file(
         directory,
@@ -1396,10 +1445,12 @@ fn check_complete_payload_directory(
         identity.tome_size,
         identity.tome_sha256,
         false,
+        stop,
     )?;
     check_payload_file_set(
         &directx.ok_or_else(|| PayloadProblem::new(DIRECTX_DIRECTORY, "missing"))?,
         identity.directx_files,
+        stop,
     )
 }
 
@@ -1441,6 +1492,7 @@ fn unexpected_payload_entry(shown: String) -> PayloadProblem {
 fn check_payload_file_set(
     directory: &Directory,
     identities: &[PayloadFileIdentity],
+    stop: &dyn Fn() -> bool,
 ) -> Result<(), PayloadProblem> {
     let inside = |name: &str| format!("{DIRECTX_DIRECTORY}/{name}");
     let observed = directory
@@ -1469,6 +1521,7 @@ fn check_payload_file_set(
             identity.size,
             identity.sha256,
             false,
+            stop,
         )?;
     }
     Ok(())
@@ -1481,6 +1534,7 @@ fn check_complete_payload_file(
     expected_size: u64,
     expected_sha256: &str,
     executable: bool,
+    stop: &dyn Fn() -> bool,
 ) -> Result<(), PayloadProblem> {
     let shown = if folder.is_empty() {
         name.to_owned()
@@ -1504,10 +1558,83 @@ fn check_complete_payload_file(
     if executable {
         validate_open_pe(&mut file).map_err(|_| problem("not-a-program"))?;
     }
-    if sha256_open_file(&mut file).map_err(|_| problem("unreadable"))? != expected_sha256 {
-        return Err(problem("sha256"));
+    // The same file, unchanged, that this process checked in full: not
+    // read again. The program itself is always hashed again (it is small,
+    // and it may be run).
+    if !executable && SESSION_CHECKS.trusts(&metadata, expected_sha256) {
+        return Ok(());
+    }
+    match sha256_open_file_until(&mut file, stop).map_err(|_| problem("unreadable"))? {
+        None => return Err(problem("stopped")),
+        Some(sha256) if sha256 != expected_sha256 => return Err(problem("sha256")),
+        Some(_) => {}
+    }
+    if !executable {
+        SESSION_CHECKS.record(&metadata, expected_sha256);
     }
     Ok(())
+}
+
+/// The payload files this engine process checked in full: the same file,
+/// unchanged, is trusted for the rest of the process, so Install Diablo II
+/// does not read the 1.5 GB Tome again right after the download checked it.
+/// A new process checks once again. A file is the same while its device,
+/// inode, size, modification time and change time are; any write changes
+/// the times.
+static SESSION_CHECKS: SessionChecks = SessionChecks::new();
+
+struct SessionChecks(std::sync::Mutex<Vec<(SessionFile, String)>>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SessionFile {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl SessionFile {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+impl SessionChecks {
+    /// The pinned payload has 11 files per product.
+    const MAX: usize = 64;
+
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record(&self, metadata: &std::fs::Metadata, sha256: &str) {
+        let file = SessionFile::of(metadata);
+        let mut checked = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        checked.retain(|(known, _)| (known.device, known.inode) != (file.device, file.inode));
+        if checked.len() >= Self::MAX {
+            checked.remove(0);
+        }
+        checked.push((file, sha256.to_owned()));
+    }
+
+    fn trusts(&self, metadata: &std::fs::Metadata, sha256: &str) -> bool {
+        let file = SessionFile::of(metadata);
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(known, known_sha256)| *known == file && known_sha256 == sha256)
+    }
 }
 
 /// A product's complete installer already imported into the cache, when it
@@ -1630,7 +1757,92 @@ fn import_complete_payload(
         }
         validate_complete_payload_directory(&retained, identity, false)?;
     }
+    // Imported (or from Blizzard's downloader): not the direct download's,
+    // so a discard keeps it.
+    remove_file_if_present(cache_directory, &direct_marker(&identity))
+        .map_err(|_| AdapterFailure::here())?;
     Ok(())
+}
+
+/// The file that says the direct download made `identity`'s complete
+/// installer in the cache.
+fn direct_marker(identity: &CompletePayloadIdentity) -> String {
+    format!("{}.direct", identity.cache_directory)
+}
+
+fn remove_file_if_present(directory: &Directory, name: &str) -> io::Result<()> {
+    match directory.open_file(Path::new(name)) {
+        Ok(file) => directory.remove_open_file_bounded(OsStr::new(name), &file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove what this Launcher's own downloads made, for a player who imports
+/// the game instead (the Control channel's `discard_downloads`): Blizzard's
+/// downloader programs it downloaded (one the player chose from a folder
+/// stays), the custom downloads of them and of Project Diablo 2's installer,
+/// Project Diablo 2's installer and client files, their partial downloads,
+/// the direct download's folders and the complete installers it made, and
+/// the Download's record. Nothing imported is removed. The caller holds the
+/// installation lease.
+pub(crate) fn discard_downloads(paths: &ManagedPaths) -> io::Result<()> {
+    let root = paths.directory();
+    direct::discard(paths)?;
+    let open = |path: &str| match root.open_directory(Path::new(path)) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    if let Some(cache) = open("cache/artifacts")? {
+        for kind in [
+            ArtifactKind::BaseGameWrapper,
+            ArtifactKind::ExpansionWrapper,
+            ArtifactKind::ClientBootstrap,
+        ] {
+            let pinned = pinned_cache_name(kind);
+            let receipt = format!("{pinned}.provenance.json");
+            // A Blizzard downloader program says where it came from: only a
+            // downloaded one goes. The pinned PD2 installer has no receipt.
+            let downloaded = kind == ArtifactKind::ClientBootstrap
+                || read_cache_receipt(&cache, &receipt)
+                    .is_some_and(|origin| origin == ArtifactOrigin::ApprovedNetwork);
+            if downloaded {
+                remove_file_if_present(&cache, pinned)?;
+                remove_file_if_present(&cache, &receipt)?;
+            }
+            let custom = custom_cache_name(kind);
+            remove_file_if_present(&cache, custom)?;
+            remove_file_if_present(&cache, &format!("{custom}.provenance.json"))?;
+            let partial = artifact_partial_name(kind);
+            remove_file_if_present(&cache, partial)?;
+            remove_file_if_present(&cache, &format!("{partial}.source"))?;
+        }
+    }
+    if let Some(cache) = open("cache")? {
+        match cache.open_directory(Path::new("client")) {
+            Ok(_) => cache.remove_owned_tree(OsStr::new("client"))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    crate::downloads::clear(root)?;
+    eprintln!("pd2-launcher: the Launcher's own downloads were removed for an import");
+    Ok(())
+}
+
+/// The origin a cache receipt names; `None` when there is none or it does
+/// not read.
+fn read_cache_receipt(cache: &Directory, name: &str) -> Option<ArtifactOrigin> {
+    let mut file = cache.open_file(Path::new(name)).ok()?;
+    if file.metadata().ok()?.len() > 16 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice::<CacheReceipt>(&bytes)
+        .ok()
+        .map(|receipt| receipt.origin)
 }
 
 fn import_selected_installer(
@@ -4032,23 +4244,43 @@ fn require_named_program(
 }
 
 fn sha256_open_file(file: &mut File) -> Result<String, AdapterFailure> {
+    sha256_open_file_until(file, &|| false)?.ok_or_else(|| AdapterFailure::here())
+}
+
+/// The SHA-256 of `file`, or `None` once `stop` says so between reads.
+fn sha256_open_file_until(
+    file: &mut File,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<String>, AdapterFailure> {
     file.seek(SeekFrom::Start(0))
         .map_err(|_| AdapterFailure::here())?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if stop() {
+            return Ok(None);
+        }
         let read = file.read(&mut buffer).map_err(|_| AdapterFailure::here())?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex(&hasher.finalize()))
+    Ok(Some(hex(&hasher.finalize())))
 }
 
 fn managed_complete_payload_directory(
     artifact: &VerifiedArtifact,
     paths: &ManagedPaths,
+) -> Result<Option<PathBuf>, AdapterFailure> {
+    managed_complete_payload_directory_until(artifact, paths, &|| false)
+}
+
+/// The same, ended between reads once `stop` says so (a failure).
+fn managed_complete_payload_directory_until(
+    artifact: &VerifiedArtifact,
+    paths: &ManagedPaths,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Option<PathBuf>, AdapterFailure> {
     let Some(identity) = complete_payload_identity(artifact.kind()) else {
         return Ok(None);
@@ -4058,7 +4290,8 @@ fn managed_complete_payload_directory(
         return Ok(None);
     }
     let opened = Directory::open(&directory).map_err(|_| AdapterFailure::here())?;
-    validate_complete_payload_directory(&opened, identity, false)?;
+    check_complete_payload_directory_until(&opened, identity, false, stop)
+        .map_err(|_| AdapterFailure::here())?;
     Ok(Some(directory))
 }
 
@@ -4840,6 +5073,33 @@ impl InstallDriver for ProductionInstallDriver {
         drop(downloaded);
         remove_wrapper_downloads(paths)?;
         Ok(())
+    }
+
+    fn download_vendor_payloads_direct(
+        &self,
+        paths: &ManagedPaths,
+        wrappers: &[&VerifiedArtifact],
+        control: &OperationControl,
+    ) -> Vec<(ArtifactKind, VendorFailure)> {
+        direct::download_payloads(paths, wrappers, control)
+    }
+
+    fn discard_downloads(&self, paths: &ManagedPaths) -> Result<(), VendorFailure> {
+        discard_downloads(paths).map_err(|error| {
+            eprintln!(
+                "pd2-launcher: the Launcher's downloads were not all removed: {}",
+                error.kind()
+            );
+            VendorFailure::Install
+        })
+    }
+
+    fn install_vendor_native(
+        &self,
+        request: VendorInstallRequest<'_>,
+        control: &OperationControl,
+    ) -> Result<(), VendorFailure> {
+        direct::install_native(request, control)
     }
 
     fn import_existing(
@@ -6604,6 +6864,154 @@ mod tests {
     }
 
     #[test]
+    fn discard_downloads_removes_only_the_launchers_own_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ManagedPaths::prepare(root.path()).unwrap();
+        let cache = root.path().join("cache/artifacts");
+        fs::create_dir_all(&cache).unwrap();
+        let receipt = |origin: ArtifactOrigin| {
+            serde_json::to_vec(&CacheReceipt {
+                schema: CACHE_RECEIPT_SCHEMA,
+                origin,
+                requested_url: String::new(),
+                final_url: String::new(),
+                attachment: String::new(),
+                observed_size: 1,
+                observed_sha256: String::new(),
+            })
+            .unwrap()
+        };
+        // Downloaded from Blizzard: goes. Chosen from the player's folder:
+        // stays.
+        fs::write(cache.join("d2-wrapper.verified"), b"downloaded").unwrap();
+        fs::write(
+            cache.join("d2-wrapper.verified.provenance.json"),
+            receipt(ArtifactOrigin::ApprovedNetwork),
+        )
+        .unwrap();
+        fs::write(cache.join("lod-wrapper.verified"), b"from a folder").unwrap();
+        fs::write(
+            cache.join("lod-wrapper.verified.provenance.json"),
+            receipt(ArtifactOrigin::UserSelected),
+        )
+        .unwrap();
+        for ours in [
+            "pd2-bootstrap.verified",
+            "custom-pd2-installer.download",
+            "custom-pd2-installer.download.provenance.json",
+            "artifact-02.partial",
+            "artifact-05.partial",
+            "artifact-05.partial.source",
+            "d2-payload.direct",
+        ] {
+            fs::write(cache.join(ours), b"ours").unwrap();
+        }
+        for folder in ["d2-payload", "d2-payload.partial", "lod-payload"] {
+            fs::create_dir_all(cache.join(folder)).unwrap();
+            fs::write(cache.join(folder).join("Installer.exe"), b"x").unwrap();
+        }
+        // Imported, and the Wine runtime: stay.
+        fs::write(cache.join("wine-gecko-2.47.4-x86.verified"), b"kept").unwrap();
+        fs::create_dir_all(root.path().join("cache/client/objects")).unwrap();
+        fs::write(root.path().join("cache/client/objects/a"), b"pd2").unwrap();
+        fs::write(root.path().join("cache/downloads.json"), b"{}").unwrap();
+
+        discard_downloads(&paths).unwrap();
+        for gone in [
+            "d2-wrapper.verified",
+            "d2-wrapper.verified.provenance.json",
+            "pd2-bootstrap.verified",
+            "custom-pd2-installer.download",
+            "custom-pd2-installer.download.provenance.json",
+            "artifact-02.partial",
+            "artifact-05.partial",
+            "artifact-05.partial.source",
+            "d2-payload",
+            "d2-payload.partial",
+            "d2-payload.direct",
+        ] {
+            assert!(!cache.join(gone).exists(), "{gone}");
+        }
+        for kept in [
+            "lod-wrapper.verified",
+            "lod-wrapper.verified.provenance.json",
+            "lod-payload/Installer.exe",
+            "wine-gecko-2.47.4-x86.verified",
+        ] {
+            assert!(cache.join(kept).exists(), "{kept}");
+        }
+        assert!(!root.path().join("cache/client").exists());
+        assert!(!root.path().join("cache/downloads.json").exists());
+        // Nothing left: a second discard does nothing.
+        discard_downloads(&paths).unwrap();
+    }
+
+    #[test]
+    fn a_full_check_is_trusted_in_the_same_process_only() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("Installer Tome.mpq");
+        fs::write(&path, b"tome").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let checks = SessionChecks::new();
+        assert!(!checks.trusts(&metadata, "sha"));
+        checks.record(&metadata, "sha");
+        // The same process, the same file: trusted.
+        assert!(checks.trusts(&metadata, "sha"));
+        assert!(!checks.trusts(&metadata, "other"));
+        // A new process (a new record): checked again.
+        assert!(!SessionChecks::new().trusts(&metadata, "sha"));
+        // A write changes the file: checked again.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&path, b"TOME").unwrap();
+        assert!(!checks.trusts(&fs::metadata(&path).unwrap(), "sha"));
+
+        // The payload check uses it: a Tome this process checked is not
+        // read again (here its recorded SHA-256 is not its own, to show it).
+        let directory = Directory::open(folder.path()).unwrap();
+        let tome = fs::metadata(&path).unwrap();
+        assert_eq!(
+            check_complete_payload_file(
+                &directory,
+                "",
+                "Installer Tome.mpq",
+                4,
+                "recorded",
+                false,
+                &|| false
+            )
+            .unwrap_err()
+            .check,
+            "sha256"
+        );
+        SESSION_CHECKS.record(&tome, "recorded");
+        assert_eq!(
+            check_complete_payload_file(
+                &directory,
+                "",
+                "Installer Tome.mpq",
+                4,
+                "recorded",
+                false,
+                &|| false
+            ),
+            Ok(())
+        );
+        // The program is always hashed again.
+        assert!(
+            check_complete_payload_file(
+                &directory,
+                "",
+                "Installer Tome.mpq",
+                4,
+                "recorded",
+                true,
+                &|| false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn installer_media_requires_both_exact_official_file_names_and_valid_pe_files() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
@@ -7327,6 +7735,48 @@ mod tests {
         let binding = read_partial_binding(&Directory::open(cache).unwrap(), spec.kind)?;
         assert_eq!(binding.fingerprint, partial_fingerprint(spec));
         (!partial.is_empty()).then_some(partial)
+    }
+
+    #[test]
+    fn an_empty_wrapper_answer_is_getlegacys_rate_limit_and_is_asked_again() {
+        let catalog = ArtifactCatalog::pinned();
+        let spec = catalog.spec(ArtifactKind::BaseGameWrapper);
+        let filename = "Downloader_Diablo2_enUS.exe";
+        let answer = |bytes: Vec<u8>| ArtifactHttpResponse {
+            final_url: spec.request_url().to_owned(),
+            status: 200,
+            declared_length: Some(bytes.len() as u64),
+            content_range: None,
+            suggested_filename: Some(filename.to_owned()),
+            retry_after: None,
+            body: Box::new(Cursor::new(bytes)),
+        };
+        let cache = tempfile::tempdir().unwrap();
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let acquired = ProductionArtifactSource::with_http(SequenceHttp {
+            responses: Mutex::new(VecDeque::from([
+                answer(Vec::new()),
+                answer(b"slow down".to_vec()),
+                answer(release_sized_pe()),
+            ])),
+            ranges: Arc::clone(&ranges),
+        })
+        .acquire(spec, cache.path(), &OperationControl::default())
+        .unwrap();
+        assert_eq!(fs::read(acquired.path).unwrap(), release_sized_pe());
+        assert_eq!(*ranges.lock().unwrap(), [None, None, None]);
+
+        // Only while the retry budget lasts.
+        let cache = tempfile::tempdir().unwrap();
+        assert!(
+            ProductionArtifactSource::with_http(SequenceHttp {
+                responses: Mutex::new((0..8).map(|_| answer(Vec::new())).collect()),
+                ranges: Arc::default(),
+            })
+            .acquire(spec, cache.path(), &OperationControl::default())
+            .is_err()
+        );
+        assert!(!cache.path().join("d2-wrapper.verified").exists());
     }
 
     #[test]

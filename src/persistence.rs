@@ -275,6 +275,19 @@ pub(crate) enum DirectDrawRendererSetting {
     Software,
 }
 
+/// Where Blizzard's Diablo II and Lord of Destruction installers come from
+/// when they are downloaded.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InstallSourceSetting {
+    /// Blizzard's own downloader, run under Wine.
+    #[default]
+    Official,
+    /// The direct download: the same files, fetched by the Launcher itself
+    /// (`crate::blizzard`), with no Wine.
+    DirectDownload,
+}
+
 impl DirectDrawRendererSetting {
     /// cnc-ddraw's `renderer=` value, or `None` to leave the file alone.
     pub(crate) const fn cnc_ddraw_value(self) -> Option<&'static str> {
@@ -354,6 +367,15 @@ pub(crate) struct LauncherSettings {
     /// How DirectDraw mode draws; absent until the player chooses.
     #[serde(default, skip_serializing_if = "is_untouched_direct_draw")]
     direct_draw_renderer: DirectDrawRendererSetting,
+    /// Where Blizzard's installers are downloaded from; absent while it is
+    /// Blizzard's own downloader, so older Launchers read the file until the
+    /// direct download is chosen.
+    #[serde(default, skip_serializing_if = "is_official_install_source")]
+    install_source: InstallSourceSetting,
+}
+
+fn is_official_install_source(value: &InstallSourceSetting) -> bool {
+    *value == InstallSourceSetting::Official
 }
 
 /// Where the launcher's x86 Wine gets FEX on ARM64 builds.
@@ -457,6 +479,7 @@ impl Default for LauncherSettings {
             fex_source: None,
             fex: None,
             direct_draw_renderer: DirectDrawRendererSetting::Untouched,
+            install_source: InstallSourceSetting::Official,
         }
     }
 }
@@ -532,6 +555,15 @@ impl LauncherSettings {
 
     pub(crate) fn with_direct_draw_renderer(mut self, renderer: DirectDrawRendererSetting) -> Self {
         self.direct_draw_renderer = renderer;
+        self
+    }
+
+    pub(crate) fn install_source(&self) -> InstallSourceSetting {
+        self.install_source
+    }
+
+    pub(crate) fn with_install_source(mut self, source: InstallSourceSetting) -> Self {
+        self.install_source = source;
         self
     }
 
@@ -961,6 +993,42 @@ mod tests {
         let text = String::from_utf8(bytes).expect("UTF-8");
         assert!(!text.contains("key"));
         assert!(!text.contains("authorization"));
+    }
+
+    #[test]
+    fn the_install_source_is_official_unless_the_direct_download_is_saved() {
+        let fixture = TempDir::new().expect("fixture");
+        let path = fixture.path().join("config/settings.json");
+        let store = SettingsStore::new(&path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            br#"{"schema":1,"renderer":"glide","skip_to_bnet":true,"sound_in_background":false,"network_concurrency":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            store.load().expect("load").install_source(),
+            InstallSourceSetting::Official
+        );
+        // The default is not written, so older Launchers still read the file.
+        store.save(&LauncherSettings::default()).expect("save");
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("install_source")
+        );
+        let direct =
+            LauncherSettings::default().with_install_source(InstallSourceSetting::DirectDownload);
+        store.save(&direct).expect("save");
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""install_source":"direct-download""#)
+        );
+        assert_eq!(
+            store.load().expect("load").install_source(),
+            InstallSourceSetting::DirectDownload
+        );
     }
 
     #[test]

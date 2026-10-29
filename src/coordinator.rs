@@ -209,6 +209,11 @@ pub(crate) trait CoordinatorBackend: Send + Sync + 'static {
     /// Step 5: install Project Diablo 2.
     fn install_project_diablo(&self, cancellation: &OperationControl)
     -> Result<(), BackendFailure>;
+    /// Remove what this Launcher's own downloads made, for a player who
+    /// imports the game instead.
+    fn discard_downloads(&self, _cancellation: &OperationControl) -> Result<(), BackendFailure> {
+        Err(BackendFailure::new("discard-downloads-unavailable"))
+    }
     fn apply_update(&self, cancellation: &OperationControl) -> Result<(), BackendFailure>;
     /// Run the official PD2 launcher under the exclusive installation lease
     /// until it and everything it started exit, then reconcile a client
@@ -349,6 +354,8 @@ enum MutationKind {
     Relocate,
     /// Removing the installation a move to another filesystem left behind.
     RemovePrevious,
+    /// Removing what this Launcher's own downloads made, for an import.
+    DiscardDownloads,
 }
 
 impl MutationKind {
@@ -369,6 +376,7 @@ impl MutationKind {
             Self::OfficialLauncher => ActiveJobView::OfficialLauncher,
             Self::Reset => ActiveJobView::Reset,
             Self::Relocate | Self::RemovePrevious => ActiveJobView::Relocation,
+            Self::DiscardDownloads => ActiveJobView::DiscardDownloads,
         }
     }
 }
@@ -452,6 +460,7 @@ fn service_loop<B: CoordinatorBackend>(
             if coordinator.handle_completion(completion) {
                 coordinator.start_update_check(backend.clone(), completion_sender.clone());
             }
+            coordinator.start_pending_work(backend.clone(), completion_sender.clone());
         }
         coordinator.poll_progress();
         coordinator.poll_game(backend.as_ref());
@@ -487,6 +496,19 @@ struct Coordinator {
     official_launcher_detailed_logging: bool,
     /// How the next Install Diablo II job imports the existing installation.
     import_mode: Option<ImportModeView>,
+    /// Keys given while the Download job ran: Install Diablo II starts with
+    /// them once a Download ends well.
+    pending_install: Option<InstallationAuthorization>,
+    /// A Download that ended well found keys waiting.
+    install_after_download: bool,
+    /// The running Download stops, then the Launcher's downloads are
+    /// removed.
+    discard_after_stop: bool,
+    /// A stop was asked of the running Download: even if it ends well,
+    /// Install Diablo II does not start (the keys keep waiting).
+    download_stop_requested: bool,
+    /// The last Download failed or stopped: new keys wait for its Try again.
+    download_unfinished: bool,
     /// Download speed of the running job's byte progress.
     byte_rate: ByteRate,
     /// The Launcher engine on the Android host: an update's progress is
@@ -494,10 +516,13 @@ struct Coordinator {
     android_host: bool,
 }
 
-/// A smoothed bytes-per-second estimate for one phase's byte progress.
+/// A smoothed bytes-per-second estimate for one file's byte progress in one
+/// phase.
 #[derive(Default)]
 struct ByteRate {
-    phase: Option<WorkPhase>,
+    /// The phase and the file's size, when known: another one is another
+    /// file.
+    file: Option<(WorkPhase, Option<u64>)>,
     last: Option<(Instant, u64)>,
     rate: Option<f64>,
 }
@@ -506,10 +531,20 @@ impl ByteRate {
     /// Samples closer than a second apart keep the current estimate.
     const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-    fn sample(&mut self, phase: WorkPhase, completed: u64, now: Instant) -> Option<u64> {
-        if self.phase != Some(phase) {
+    fn sample(
+        &mut self,
+        phase: WorkPhase,
+        completed: u64,
+        total: Option<u64>,
+        now: Instant,
+    ) -> Option<u64> {
+        // A new phase or a new file starts a new estimate: the time between
+        // two files (the check of the one done, the entries already in
+        // place) is no download time, so a new file has no speed and no
+        // time left until a second of its own bytes is measured.
+        if self.file != Some((phase, total)) {
             *self = Self {
-                phase: Some(phase),
+                file: Some((phase, total)),
                 ..Self::default()
             };
         }
@@ -549,6 +584,11 @@ impl Coordinator {
             official_launcher_strict_memory_order: false,
             official_launcher_detailed_logging: false,
             import_mode: None,
+            pending_install: None,
+            install_after_download: false,
+            discard_after_stop: false,
+            download_stop_requested: false,
+            download_unfinished: false,
             byte_rate: ByteRate::default(),
             android_host: crate::android_host(),
         }
@@ -685,6 +725,27 @@ impl Coordinator {
                     "Downloading",
                 );
             }
+            Intent::ForgetWaitingKeys => self.drop_pending_install(),
+            Intent::DiscardDownloads => match self.active_kind() {
+                Some(MutationKind::Download) => {
+                    // Stop first; the downloads go once it stopped.
+                    self.discard_after_stop = true;
+                    self.drop_pending_install();
+                    self.request_safe_stop(backend.as_ref());
+                }
+                None if self.setup_idle() => {
+                    self.drop_pending_install();
+                    self.start_mutation(
+                        backend,
+                        completions,
+                        MutationKind::DiscardDownloads,
+                        None,
+                        OperationPhase::Verification,
+                        "Removing the downloads",
+                    );
+                }
+                _ => self.publish_guard_failure("discard-downloads-not-permitted"),
+            },
             Intent::ImportExistingInstall(mode) => {
                 if !self.import_guard() {
                     self.publish_guard_failure("import-not-permitted");
@@ -759,12 +820,50 @@ impl Coordinator {
                 let result = backend.update_download_source(artifact, None);
                 self.apply_download_sources(artifact, result);
             }
+            Intent::AuthorizeAndInstall(input)
+                if self.active_kind() == Some(MutationKind::Download) =>
+            {
+                // Agree and install during the Download job: the keys
+                // wait, and Install Diablo II starts with them once the
+                // Download ends well.
+                if !self.installers_wanted() || self.discard_after_stop {
+                    self.publish_guard_failure("install-not-permitted");
+                    return;
+                }
+                let (base, expansion, consent) = input.into_parts();
+                match InstallationAuthorization::new(base, expansion, consent) {
+                    Ok(authorization) => {
+                        self.pending_install = Some(authorization);
+                        self.change_authorization(AuthorizationView::Authorized);
+                    }
+                    Err(_) => self.publish_guard_failure("authorization-invalid"),
+                }
+            }
             Intent::AuthorizeAndInstall(input) => {
+                // Keys given now replace any that waited.
+                self.drop_pending_install();
                 if !self.base_game_guard(true) {
-                    self.publish_guard_failure(if self.snapshot.downloads_ready() {
-                        "install-not-permitted"
-                    } else {
+                    let downloads_missing = !self.snapshot.downloads_ready();
+                    // After a failed or stopped Download, the new keys wait
+                    // for its Try again; the refusal still says why nothing
+                    // started now.
+                    if downloads_missing
+                        && self.download_unfinished
+                        && self.setup_idle()
+                        && self.installers_wanted()
+                    {
+                        let (base, expansion, consent) = input.into_parts();
+                        if let Ok(authorization) =
+                            InstallationAuthorization::new(base, expansion, consent)
+                        {
+                            self.pending_install = Some(authorization);
+                            self.change_authorization(AuthorizationView::Authorized);
+                        }
+                    }
+                    self.publish_guard_failure(if downloads_missing {
                         "downloads-required"
+                    } else {
+                        "install-not-permitted"
                     });
                     return;
                 }
@@ -848,6 +947,9 @@ impl Coordinator {
             }
             Intent::ChangeSettings(change) => match backend.update_settings(change) {
                 Ok(settings) => {
+                    if settings.install_source() != self.snapshot.settings().install_source() {
+                        self.drop_pending_install();
+                    }
                     self.change_settings(settings);
                     if let SettingsChange::UpdateChecks(_) = change {
                         self.update_checks_changed(backend, completions);
@@ -1104,6 +1206,10 @@ impl Coordinator {
                     Ok(()) if kind == MutationKind::Download => {
                         (OperationStatusView::Succeeded, "All downloads verified.")
                     }
+                    Ok(()) if kind == MutationKind::DiscardDownloads => (
+                        OperationStatusView::Succeeded,
+                        "The Launcher's own downloads were removed; imported files were kept.",
+                    ),
                     Ok(()) if kind == MutationKind::InstallBaseGame => (
                         OperationStatusView::Succeeded,
                         "Diablo II and Lord of Destruction are installed and checked.",
@@ -1144,7 +1250,8 @@ impl Coordinator {
                 let phase = match kind {
                     MutationKind::Download
                     | MutationKind::InstallBaseGame
-                    | MutationKind::InstallProjectDiablo => OperationPhase::Verification,
+                    | MutationKind::InstallProjectDiablo
+                    | MutationKind::DiscardDownloads => OperationPhase::Verification,
                     MutationKind::Update => OperationPhase::Verification,
                     MutationKind::Repair => OperationPhase::Repair,
                     MutationKind::OfficialLauncher => OperationPhase::OfficialLauncher,
@@ -1160,7 +1267,21 @@ impl Coordinator {
                     outcome = outcome.with_failure(code);
                 }
                 self.change_operation(Some(outcome));
-                if kind.is_setup() && stopped {
+                let mut stop_asked = false;
+                if kind == MutationKind::Download {
+                    // A stop asked at its very end counts as a stop.
+                    stop_asked = std::mem::take(&mut self.download_stop_requested);
+                    self.download_unfinished = !operation_succeeded || stop_asked;
+                    if operation_succeeded && !stop_asked && self.pending_install.is_some() {
+                        // One flow: Install Diablo II starts with the waiting
+                        // keys.
+                        self.install_after_download = true;
+                    }
+                }
+                // A Download asked to stop shows its stop even when it ended
+                // well (the stop came at its very end): the app then knows no
+                // install follows.
+                if !self.install_after_download && kind.is_setup() && (stopped || stop_asked) {
                     self.finish_install_stop(pending_return);
                 }
                 // A new installation's first launch opens D2GL at 800x600:
@@ -1267,6 +1388,12 @@ impl Coordinator {
             self.publish_guard_failure("mutation-already-active");
             return;
         }
+        if kind != MutationKind::Download {
+            // Keys wait only for a Download (the install that takes them has
+            // taken them already).
+            self.drop_pending_install();
+        }
+        self.download_stop_requested = false;
         let relocation_target = self.relocation_target.take();
         let official_launcher_confirmed = std::mem::take(&mut self.official_launcher_confirmed);
         let official_launcher_strict_memory_order =
@@ -1293,6 +1420,7 @@ impl Coordinator {
         if spawn_named("pd2-mutation", move || {
             let result = match kind {
                 MutationKind::Download => backend.download_all(&cancellation),
+                MutationKind::DiscardDownloads => backend.discard_downloads(&cancellation),
                 MutationKind::InstallBaseGame => {
                     backend.install_base_game(authorization, import_mode, &cancellation)
                 }
@@ -1452,7 +1580,8 @@ impl Coordinator {
                     match kind {
                         MutationKind::Download
                         | MutationKind::InstallBaseGame
-                        | MutationKind::InstallProjectDiablo => OperationPhase::Verification,
+                        | MutationKind::InstallProjectDiablo
+                        | MutationKind::DiscardDownloads => OperationPhase::Verification,
                         MutationKind::Update => OperationPhase::Promotion,
                         MutationKind::Repair => OperationPhase::Repair,
                         MutationKind::OfficialLauncher => OperationPhase::OfficialLauncher,
@@ -1467,11 +1596,15 @@ impl Coordinator {
                 return;
             }
             cancellation.request_cancel();
+            if kind == MutationKind::Download {
+                self.download_stop_requested = true;
+            }
             self.change_operation(Some(OperationView::mutating(
                 match kind {
                     MutationKind::Download
                     | MutationKind::InstallBaseGame
-                    | MutationKind::InstallProjectDiablo => OperationPhase::Verification,
+                    | MutationKind::InstallProjectDiablo
+                    | MutationKind::DiscardDownloads => OperationPhase::Verification,
                     MutationKind::Update => OperationPhase::Promotion,
                     MutationKind::Repair => OperationPhase::Repair,
                     MutationKind::OfficialLauncher => OperationPhase::OfficialLauncher,
@@ -1581,9 +1714,12 @@ impl Coordinator {
         }
         let mut summary = Vec::new();
         if let Some(bytes) = bytes {
-            let rate = self
-                .byte_rate
-                .sample(progress.phase(), bytes.completed(), Instant::now());
+            let rate = self.byte_rate.sample(
+                progress.phase(),
+                bytes.completed(),
+                bytes.total(),
+                Instant::now(),
+            );
             summary.push(match bytes.total() {
                 Some(total) => format!(
                     "{} of {}",
@@ -1672,6 +1808,78 @@ impl Coordinator {
             }
             _ => false,
         }
+    }
+
+    /// Blizzard's installers are what the install still needs: Diablo II or
+    /// Lord of Destruction to install, from the installers' choice (not an
+    /// existing installation).
+    fn installers_wanted(&self) -> bool {
+        matches!(
+            self.snapshot.installation(),
+            InstallationStatus::NeedsBaseGame | InstallationStatus::NeedsExpansion
+        ) && self.snapshot.installer_media().is_ready()
+            && self.snapshot.installer_media().existing().is_none()
+    }
+
+    fn active_kind(&self) -> Option<MutationKind> {
+        self.active_mutation.as_ref().map(|active| active.kind)
+    }
+
+    fn drop_pending_install(&mut self) {
+        self.install_after_download = false;
+        if self.pending_install.take().is_some() {
+            self.change_authorization(AuthorizationView::Absent);
+        }
+    }
+
+    /// What waits for the job that just ended: the removal after a stopped
+    /// Download, or Install Diablo II with the keys given during it.
+    fn start_pending_work<B: CoordinatorBackend>(
+        &mut self,
+        backend: Arc<B>,
+        completions: Sender<Completion>,
+    ) {
+        if self.active_mutation.is_some() {
+            return;
+        }
+        if std::mem::take(&mut self.discard_after_stop) {
+            if self.setup_idle() {
+                self.start_mutation(
+                    backend,
+                    completions,
+                    MutationKind::DiscardDownloads,
+                    None,
+                    OperationPhase::Verification,
+                    "Removing the downloads",
+                );
+            } else {
+                self.publish_guard_failure("discard-downloads-not-permitted");
+            }
+            return;
+        }
+        if !std::mem::take(&mut self.install_after_download) {
+            return;
+        }
+        let Some(authorization) = self.pending_install.take() else {
+            return;
+        };
+        if !self.base_game_guard(true) {
+            self.change_authorization(AuthorizationView::Absent);
+            self.publish_guard_failure(if self.snapshot.downloads_ready() {
+                "install-not-permitted"
+            } else {
+                "downloads-required"
+            });
+            return;
+        }
+        self.start_mutation(
+            backend,
+            completions,
+            MutationKind::InstallBaseGame,
+            Some(authorization),
+            OperationPhase::BaseGameInstall,
+            "Installing Diablo II",
+        );
     }
 
     /// Step 4 for an existing installation: a usable folder, verified
@@ -2006,6 +2214,9 @@ impl Coordinator {
     fn apply_installer_media(&mut self, result: Result<InstallerMediaView, BackendFailure>) {
         match result {
             Ok(media) => {
+                if media != *self.snapshot.installer_media() {
+                    self.drop_pending_install();
+                }
                 self.change_installer_media(media);
                 self.change_installer_media_rejection(None);
             }
@@ -2403,6 +2614,9 @@ mod tests {
         opened_folders: Vec<PathBuf>,
         /// What the next keep puts aside, taken once.
         saves_put_aside: Option<SavesPutAsideView>,
+        /// The setup job ends well even when a stop was asked (a stop that
+        /// comes at its very end).
+        stop_too_late: bool,
     }
 
     struct FakeBackend {
@@ -2457,6 +2671,7 @@ mod tests {
                     saved_records: Vec::new(),
                     opened_folders: Vec::new(),
                     saves_put_aside: None,
+                    stop_too_late: false,
                 }),
                 check_gate: Gate::open(),
                 install_gate: Gate::open(),
@@ -2654,6 +2869,16 @@ mod tests {
             self.run_setup_job("install-project-diablo", None, None, cancellation)
         }
 
+        fn discard_downloads(
+            &self,
+            _cancellation: &CancellationToken,
+        ) -> Result<(), BackendFailure> {
+            let mut state = self.state.lock().expect("state");
+            state.calls.push("discard-downloads");
+            self.notify(state);
+            Ok(())
+        }
+
         fn request_mutation_safe_stop(&self) -> Result<(), BackendFailure> {
             let mut state = self.state.lock().expect("state");
             state.calls.push("safe-stop");
@@ -2840,6 +3065,7 @@ mod tests {
                 }
                 SettingsChange::AppMenuEntry(enabled) => current.with_app_menu_entry(enabled),
                 SettingsChange::UpdateChecks(enabled) => current.with_update_checks(enabled),
+                SettingsChange::InstallSource(source) => current.with_install_source(source),
             };
             state.settings_updates += 1;
             let settings = state.settings;
@@ -2917,7 +3143,8 @@ mod tests {
                     .with_overall(crate::operation::ProgressUnit::Files, 3, Some(8))
                     .with_verification(2, Some(8)),
             );
-            let completed = self.install_gate.wait(Some(cancellation));
+            let too_late = self.state.lock().expect("state").stop_too_late;
+            let completed = self.install_gate.wait((!too_late).then_some(cancellation));
             drop(authorization);
             let mut state = self.state.lock().expect("state");
             state.cancellation_observed = !completed;
@@ -5342,6 +5569,379 @@ mod tests {
         assert_eq!(backend.state.lock().unwrap().authorized_installs, 1);
     }
 
+    fn setup_calls(backend: &FakeBackend) -> Vec<&'static str> {
+        backend
+            .calls()
+            .into_iter()
+            .filter(|call| {
+                call.starts_with("download")
+                    || call.starts_with("install")
+                    || call.starts_with("discard")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keys_given_during_the_download_start_install_diablo_ii_as_one_flow() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsClient),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        // Agree and install while the small downloads run: the keys wait.
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        assert_eq!(setup_calls(&backend), ["download"]);
+        backend.install_gate.release();
+        let installed = finished(&mut harness, ActiveJobView::InstallBaseGame);
+        assert_eq!(installed.installation(), InstallationStatus::NeedsClient);
+        assert_eq!(installed.authorization(), AuthorizationView::Absent);
+        // One Download, then Install Diablo II with the keys: no second
+        // download.
+        assert_eq!(setup_calls(&backend), ["download", "install-base-game"]);
+        assert_eq!(backend.state.lock().unwrap().authorized_installs, 1);
+    }
+
+    #[test]
+    fn keys_refused_during_the_download_leave_it_running() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        // An existing installation chosen: keys have no install to wait
+        // for. (A key the installers refuse never gets here: the Control
+        // channel refuses it with its reason first.)
+        harness
+            .intents
+            .send(Intent::SelectExistingInstall(PathBuf::from("/tmp/d2")))
+            .unwrap();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        assert_eq!(harness.next_refusal(), "install-not-permitted");
+        backend.install_gate.release();
+        let downloaded = finished(&mut harness, ActiveJobView::Download);
+        assert_eq!(
+            downloaded.operation().map(OperationView::status),
+            Some(OperationStatusView::Succeeded)
+        );
+        assert_eq!(downloaded.authorization(), AuthorizationView::Absent);
+        assert_eq!(setup_calls(&backend), ["download"]);
+    }
+
+    #[test]
+    fn waiting_keys_stay_for_a_try_again_of_a_failed_download() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsClient),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked()
+            .with_install_failure(BackendFailure::new("download-failed")),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        backend.install_gate.release();
+        let failed = finished(&mut harness, ActiveJobView::Download);
+        assert_eq!(
+            failed.operation().and_then(OperationView::failure),
+            Some("download-failed")
+        );
+        // The failure is reported; the keys wait for a Try again.
+        assert_eq!(failed.authorization(), AuthorizationView::Authorized);
+        backend.state.lock().unwrap().install_failure = None;
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        let installed = finished(&mut harness, ActiveJobView::InstallBaseGame);
+        assert_eq!(installed.installation(), InstallationStatus::NeedsClient);
+        assert_eq!(
+            setup_calls(&backend),
+            ["download", "download", "install-base-game"]
+        );
+        assert_eq!(backend.state.lock().unwrap().authorized_installs, 1);
+    }
+
+    #[test]
+    fn a_discard_stops_the_download_then_removes_the_downloads() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [audit_without_downloads(InstallationStatus::NeedsBaseGame)],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        harness.intents.send(Intent::DiscardDownloads).unwrap();
+        let removed = finished(&mut harness, ActiveJobView::DiscardDownloads);
+        assert_eq!(
+            removed.operation().map(OperationView::status),
+            Some(OperationStatusView::Succeeded)
+        );
+        // Stopped first, then removed; the keys went with it.
+        let calls = backend.calls();
+        let stop = calls.iter().position(|call| *call == "safe-stop").unwrap();
+        let discard = calls
+            .iter()
+            .position(|call| *call == "discard-downloads")
+            .unwrap();
+        assert!(stop < discard, "{calls:?}");
+        assert_eq!(removed.authorization(), AuthorizationView::Absent);
+        assert_eq!(setup_calls(&backend), ["download", "discard-downloads"]);
+
+        // Idle, it removes at once; during an install it is refused.
+        harness.intents.send(Intent::DiscardDownloads).unwrap();
+        backend.wait_for(|state| {
+            state
+                .calls
+                .iter()
+                .filter(|call| **call == "discard-downloads")
+                .count()
+                == 2
+        });
+    }
+
+    #[test]
+    fn a_discard_is_refused_while_install_diablo_ii_runs() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [audit(InstallationStatus::NeedsBaseGame)],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        authorize(&harness);
+        backend.wait_for(|state| state.calls.contains(&"install-base-game"));
+        harness.intents.send(Intent::DiscardDownloads).unwrap();
+        assert_eq!(harness.next_refusal(), "discard-downloads-not-permitted");
+        backend.install_gate.release();
+        finished(&mut harness, ActiveJobView::InstallBaseGame);
+        assert!(!backend.calls().contains(&"discard-downloads"));
+    }
+
+    /// A Download that fails with keys waiting, as the Try again tests
+    /// start from.
+    fn failed_download_with_waiting_keys(
+        audits: impl IntoIterator<Item = BackendAudit>,
+    ) -> (Arc<FakeBackend>, Harness) {
+        let backend = Arc::new(
+            FakeBackend::new(audits, UpdateStatus::UpToDate)
+                .with_install_blocked()
+                .with_install_failure(BackendFailure::new("download-failed")),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        backend.install_gate.release();
+        finished(&mut harness, ActiveJobView::Download);
+        backend.state.lock().unwrap().install_failure = None;
+        (backend, harness)
+    }
+
+    #[test]
+    fn keys_the_channel_refuses_during_the_download_drop_the_waiting_ones() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        // A second authorize with a bad key: the Control channel refuses it
+        // and tells the service to forget the waiting keys.
+        harness.intents.send(Intent::ForgetWaitingKeys).unwrap();
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Absent);
+        backend.install_gate.release();
+        let downloaded = finished(&mut harness, ActiveJobView::Download);
+        assert_eq!(downloaded.authorization(), AuthorizationView::Absent);
+        assert_eq!(setup_calls(&backend), ["download"]);
+    }
+
+    #[test]
+    fn new_keys_after_a_failed_download_wait_for_its_try_again() {
+        let (backend, mut harness) = failed_download_with_waiting_keys([
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+            audit(InstallationStatus::NeedsBaseGame),
+            audit(InstallationStatus::NeedsClient),
+        ]);
+        // Keys typed again: refused for now (no downloads), but they wait.
+        authorize(&harness);
+        assert_eq!(harness.next_refusal(), "downloads-required");
+        assert_eq!(
+            harness.reducer.snapshot().authorization(),
+            AuthorizationView::Authorized
+        );
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        let installed = finished(&mut harness, ActiveJobView::InstallBaseGame);
+        assert_eq!(installed.installation(), InstallationStatus::NeedsClient);
+        assert_eq!(
+            setup_calls(&backend),
+            ["download", "download", "install-base-game"]
+        );
+        assert_eq!(backend.state.lock().unwrap().authorized_installs, 1);
+    }
+
+    #[test]
+    fn a_refused_authorize_with_no_failed_download_leaves_no_keys() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit_without_downloads(InstallationStatus::NeedsBaseGame)],
+            UpdateStatus::UpToDate,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        authorize(&harness);
+        assert_eq!(harness.next_refusal(), "downloads-required");
+        assert_eq!(
+            harness.reducer.snapshot().authorization(),
+            AuthorizationView::Absent
+        );
+    }
+
+    #[test]
+    fn a_new_installer_choice_or_another_job_drops_the_waiting_keys() {
+        let (backend, mut harness) = failed_download_with_waiting_keys([
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+            audit(InstallationStatus::NeedsBaseGame),
+        ]);
+        assert_eq!(
+            harness.reducer.snapshot().authorization(),
+            AuthorizationView::Authorized
+        );
+        // Another choice of installers: the keys go.
+        harness
+            .intents
+            .send(Intent::SelectInstallerMedia(PathBuf::from(
+                "/tmp/other-installers",
+            )))
+            .unwrap();
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Absent);
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| {
+            state
+                .calls
+                .iter()
+                .filter(|call| **call == "download")
+                .count()
+                == 2
+        });
+        harness.wait_for(|snapshot| {
+            snapshot.operation().is_some_and(|operation| {
+                operation.job() == Some(ActiveJobView::Download)
+                    && operation.status() == OperationStatusView::Succeeded
+            })
+        });
+        assert_eq!(setup_calls(&backend), ["download", "download"]);
+
+        // Another job (here the removal of the downloads) drops them too.
+        let (backend, mut harness) = failed_download_with_waiting_keys([
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+            audit_without_downloads(InstallationStatus::NeedsBaseGame),
+        ]);
+        harness.intents.send(Intent::DiscardDownloads).unwrap();
+        let removed = finished(&mut harness, ActiveJobView::DiscardDownloads);
+        assert_eq!(removed.authorization(), AuthorizationView::Absent);
+        assert_eq!(setup_calls(&backend), ["download", "discard-downloads"]);
+    }
+
+    #[test]
+    fn a_stop_at_the_very_end_of_the_download_starts_no_install() {
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit_without_downloads(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::NeedsClient),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        backend.state.lock().unwrap().stop_too_late = true;
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::NeedsBaseGame);
+        harness.select_installers();
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"download"));
+        authorize(&harness);
+        harness.wait_for(|snapshot| snapshot.authorization() == AuthorizationView::Authorized);
+        harness.intents.send(Intent::RequestSafeStop).unwrap();
+        backend.wait_for(|state| state.calls.contains(&"safe-stop"));
+        // The Download ends well all the same: no install, the keys wait.
+        backend.install_gate.release();
+        let downloaded = finished(&mut harness, ActiveJobView::Download);
+        assert_eq!(
+            downloaded.operation().map(OperationView::status),
+            Some(OperationStatusView::Succeeded)
+        );
+        assert_eq!(downloaded.authorization(), AuthorizationView::Authorized);
+        assert_eq!(setup_calls(&backend), ["download"]);
+        // The snapshot shows the stop, so the app waits for no install.
+        let stopped = harness.wait_for(|snapshot| snapshot.stop_result().is_some());
+        assert_eq!(stopped.authorization(), AuthorizationView::Authorized);
+        // A Download asked again installs with them.
+        backend.state.lock().unwrap().stop_too_late = false;
+        harness.intents.send(Intent::DownloadAll).unwrap();
+        finished(&mut harness, ActiveJobView::InstallBaseGame);
+        assert_eq!(
+            setup_calls(&backend),
+            ["download", "download", "install-base-game"]
+        );
+    }
+
     #[test]
     fn install_project_diablo_waits_for_diablo_ii() {
         let backend = Arc::new(FakeBackend::new(
@@ -5729,40 +6329,80 @@ mod tests {
     fn download_speed_is_smoothed_and_restarts_with_each_phase() {
         let mut rate = ByteRate::default();
         let start = Instant::now();
-        assert_eq!(rate.sample(WorkPhase::BaseGameInstall, 0, start), None);
+        let sample = |rate: &mut ByteRate, phase, completed, after| {
+            rate.sample(phase, completed, None, start + after)
+        };
+        assert_eq!(
+            sample(&mut rate, WorkPhase::BaseGameInstall, 0, Duration::ZERO),
+            None
+        );
         // Samples closer than a second apart keep the estimate.
         assert_eq!(
-            rate.sample(
+            sample(
+                &mut rate,
                 WorkPhase::BaseGameInstall,
                 500_000,
-                start + Duration::from_millis(500)
+                Duration::from_millis(500)
             ),
             None
         );
         assert_eq!(
-            rate.sample(
+            sample(
+                &mut rate,
                 WorkPhase::BaseGameInstall,
                 2_000_000,
-                start + Duration::from_secs(2)
+                Duration::from_secs(2)
             ),
             Some(1_000_000)
         );
         assert_eq!(
-            rate.sample(
+            sample(
+                &mut rate,
                 WorkPhase::BaseGameInstall,
                 6_000_000,
-                start + Duration::from_secs(4)
+                Duration::from_secs(4)
             ),
             Some(1_300_000)
         );
         // A new phase (or a restarted download) starts over.
         assert_eq!(
-            rate.sample(
+            sample(
+                &mut rate,
                 WorkPhase::ExpansionInstall,
                 10,
-                start + Duration::from_secs(5)
+                Duration::from_secs(5)
             ),
             None
+        );
+    }
+
+    /// An update's small file, then, 16 s later (its check and the entries
+    /// already in place), a big one that downloads at 23.4 MB/s.
+    #[test]
+    fn a_new_file_has_no_speed_until_its_own_bytes_are_measured() {
+        let mut rate = ByteRate::default();
+        let start = Instant::now();
+        let mut sample = |completed, total, after| {
+            rate.sample(
+                WorkPhase::ClientDownload,
+                completed,
+                Some(total),
+                start + after,
+            )
+        };
+        assert_eq!(sample(64_000, 100_000, Duration::ZERO), None);
+        assert_eq!(sample(100_000, 100_000, Duration::from_millis(200)), None);
+        // The time since the small file is not the big one's: no speed of
+        // 27 KB/s and no "about 88 minutes left".
+        assert_eq!(sample(500_000, 143_900_000, Duration::from_secs(16)), None);
+        assert_eq!(
+            sample(18_400_000, 143_900_000, Duration::from_millis(16_800)),
+            None
+        );
+        // A second of its own bytes gives its own speed.
+        assert_eq!(
+            sample(23_900_000, 143_900_000, Duration::from_secs(17)),
+            Some(23_400_000)
         );
     }
 
@@ -5781,7 +6421,7 @@ mod tests {
             progress,
         });
         coordinator.byte_rate = ByteRate {
-            phase: Some(WorkPhase::ClientDownload),
+            file: Some((WorkPhase::ClientDownload, Some(10_000_000))),
             last: Instant::now()
                 .checked_sub(Duration::from_secs(2))
                 .map(|at| (at, 0)),
@@ -5831,6 +6471,40 @@ mod tests {
             "{summary}"
         );
         assert!(!summary.contains("left"), "{summary}");
+    }
+
+    /// A big file's first bytes are not measured against the last sample of
+    /// the small file before it, 16 s earlier: that gives a caption such as
+    /// "18.4 of 143.9 MB · 26.8 KB/s · about 79 minutes left".
+    #[test]
+    fn on_android_a_new_file_shows_no_speed_from_the_file_before() {
+        let (events, _received) = sync_channel(64);
+        let mut coordinator = Coordinator::new(events);
+        coordinator.android_host = true;
+        let (publisher, progress) = progress_channel();
+        let cancellation = OperationControl::with_progress(publisher);
+        coordinator.active_mutation = Some(ActiveMutation {
+            kind: MutationKind::Update,
+            cancellation: cancellation.clone(),
+            progress,
+        });
+        coordinator.byte_rate = ByteRate {
+            file: Some((WorkPhase::ClientDownload, Some(100_000))),
+            last: Instant::now()
+                .checked_sub(Duration::from_secs(16))
+                .map(|at| (at, 64_000)),
+            rate: None,
+        };
+        cancellation.report(
+            crate::operation::WorkProgress::for_phase(WorkPhase::ClientDownload)
+                .with_file_bytes(500_000, Some(143_900_000))
+                .with_overall(crate::operation::ProgressUnit::Files, 30, Some(46))
+                .with_verification(30, Some(46)),
+        );
+        coordinator.poll_progress();
+        let operation = coordinator.snapshot.operation().expect("operation");
+        assert_eq!(operation.progress(), Some((500_000, 143_900_000)));
+        assert_eq!(operation.progress_summary(), Some("500.0 KB of 143.9 MB"));
     }
 
     #[test]
@@ -5888,7 +6562,7 @@ mod tests {
                 progress,
             });
             coordinator.byte_rate = ByteRate {
-                phase: Some(WorkPhase::ClientDownload),
+                file: Some((WorkPhase::ClientDownload, Some(10_000_000))),
                 last: Instant::now()
                     .checked_sub(Duration::from_secs(2))
                     .map(|at| (at, 0)),

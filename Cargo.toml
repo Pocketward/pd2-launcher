@@ -1,6 +1,6 @@
 [package]
 name = "pd2-launcher"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.98"
 repository = "https://github.com/Pocketward/pd2-launcher"
@@ -16,11 +16,14 @@ zstd = { version = "=0.13.3", default-features = false }
 command-fds = "=0.3.3"
 gpui-kit = { version = "=0.6.6", optional = true }
 md-5 = "=0.10.6"
+miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-alloc"] }
+roxmltree = "=0.20.0"
 rustix = { version = "=0.38.44", features = ["fs", "param", "process", "rand", "system"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 # preserve_order: a JSON object keeps the order of its keys (d2gl.json keeps
 # D2GL's own order), also in a build without the window, whose crates turn it on.
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+sha1 = "=0.10.7"
 sha2 = "=0.10.9"
 tar = "=0.4.46"
 xz2 = { version = "=0.1.7", features = ["static"] }
