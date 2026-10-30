@@ -56,15 +56,19 @@ const SESSION: [&str; 7] = [
 
 /// Prefixes of the variables describing the computer's graphics drivers:
 /// which Mesa driver to load (Zink on DroidDeck), where the Vulkan driver is
-/// (Turnip), and their options. Without them the game may find no GPU
+/// (Turnip), and their options. `FD_` is Mesa freedreno's prefix, which
+/// Turnip also reads: the Android app sets `FD_DEV_FEATURES` on an Adreno
+/// 740 so that Turnip's TP UBWC flag hint is the same as that of the
+/// phone's own driver. Without them the game may find no GPU
 /// driver. NVIDIA's (`__NV_`, `__VK_LAYER_NV_`, `__GL_`) and Mesa's
 /// `DRI_PRIME` come with them, so a laptop started with `prime-run` (or
 /// `DRI_PRIME=1`) draws on the same GPU throughout.
-const GRAPHICS_PREFIXES: [&str; 11] = [
+const GRAPHICS_PREFIXES: [&str; 12] = [
     "MESA_",
     "GALLIUM_",
     "ZINK_",
     "TU_",
+    "FD_",
     "VK_",
     "LIBGL_",
     "__GLX_",
@@ -452,6 +456,30 @@ mod tests {
         assert_eq!(get(&compatibility, "TU_DEBUG"), Some("sysmem,noubwc,nolrz"));
         assert_eq!(get(&desktop, "TU_DEBUG"), Some("sysmem"));
         assert_eq!(get(&compose_on(app, &[], true), "TU_DEBUG"), Some("sysmem"));
+    }
+
+    #[test]
+    fn mesa_freedrenos_options_reach_wine_with_either_graphics_driver() {
+        let _driver = DRIVER_IN_USE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let app = host(&[
+            ("FD_DEV_FEATURES", "enable_tp_ubwc_flag_hint=0"),
+            ("PD2_APP_COMPATIBILITY_TU_DEBUG", "sysmem,noubwc,nolrz"),
+            ("FDX", "1"),
+        ]);
+        let standard = compose_on(app.clone(), &[], true);
+        use_compatibility_driver(true);
+        let compatibility = compose_on(app.clone(), &[], true);
+        use_compatibility_driver(false);
+        let desktop = compose_on(app, &[], false);
+        for environment in [&standard, &compatibility, &desktop] {
+            assert_eq!(
+                get(environment, "FD_DEV_FEATURES"),
+                Some("enable_tp_ubwc_flag_hint=0")
+            );
+            assert_eq!(get(environment, "FDX"), None);
+        }
     }
 
     #[test]
