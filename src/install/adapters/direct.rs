@@ -421,6 +421,33 @@ pub(super) fn discard(paths: &ManagedPaths) -> io::Result<()> {
 /// Lord of Destruction goes into that folder in place; its archive addition
 /// cannot break the archive, and the stage's marker makes a stopped one
 /// start over.
+/// The Managed game folder's parent below the managed root, made when it is
+/// missing, and the game folder's name: the prefix's `Program Files (x86)` on
+/// the desktop, the managed root itself on the Android host, whose game
+/// folder is outside the prefix.
+fn game_parent(paths: &ManagedPaths) -> io::Result<(Directory, OsString)> {
+    let not_ours = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the game folder is not the Launcher's",
+        )
+    };
+    let relative = paths
+        .game()
+        .strip_prefix(paths.root())
+        .map_err(|_| not_ours())?;
+    let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
+        return Err(not_ours());
+    };
+    let directory = if parent.as_os_str().is_empty() {
+        paths.directory().try_clone()
+    } else {
+        paths.directory().ensure_directory(parent)
+    }
+    .map_err(|_| io::Error::other("the game folder's parent could not be made"))?;
+    Ok((directory, name.to_owned()))
+}
+
 pub(super) fn install_native(
     request: VendorInstallRequest<'_>,
     control: &OperationControl,
@@ -465,17 +492,8 @@ pub(super) fn install_native(
     };
     let outcome = match request.product() {
         VendorProduct::BaseGame => {
-            let relative = paths
-                .game()
-                .strip_prefix(paths.root())
-                .map_err(|_| failed("the game folder is not the Launcher's"))?;
-            let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
-                return Err(failed("the game folder is not the Launcher's"));
-            };
-            let parent = paths
-                .directory()
-                .ensure_directory(parent)
-                .map_err(|_| failed("the game folder's parent could not be made"))?;
+            let (parent, name) = game_parent(paths).map_err(|error| failed(&error.to_string()))?;
+            let name = name.as_os_str();
             // A game folder with files is never written over: refused
             // before anything is written.
             let empty_game_there = match parent.open_directory(Path::new(name)) {
@@ -773,6 +791,29 @@ mod tests {
         eprintln!(
             "native install test: the game is in {}",
             paths.game().display()
+        );
+    }
+
+    #[test]
+    fn the_game_folders_parent_is_the_managed_root_on_android_and_the_prefix_on_the_desktop() {
+        let root = tempfile::tempdir().unwrap();
+        let (parent, name) =
+            game_parent(&ManagedPaths::prepare_on(root.path(), true).unwrap()).unwrap();
+        assert_eq!(name, OsString::from("Diablo II"));
+        let parent = parent.try_clone_file().unwrap().metadata().unwrap();
+        let expected = fs::metadata(root.path()).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            (parent.dev(), parent.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let (_, name) =
+            game_parent(&ManagedPaths::prepare_on(root.path(), false).unwrap()).unwrap();
+        assert_eq!(name, OsString::from("Diablo II"));
+        assert!(
+            root.path()
+                .join("prefix/drive_c/Program Files (x86)")
+                .is_dir()
         );
     }
 

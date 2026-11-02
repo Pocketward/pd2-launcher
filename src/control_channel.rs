@@ -59,8 +59,11 @@ use crate::{
     sources::DownloadArtifact,
 };
 
-/// The protocol version this engine speaks.
-pub(crate) const PROTOCOL: u32 = 6;
+/// The protocol version this engine speaks. 7: on the Android host the game
+/// folder is outside the disposable prefix and an import is moved into it
+/// (`game_folder::ANDROID_GAME_RELATIVE`); an app of an earlier protocol
+/// looks for the game in the prefix, so the handshake refuses it.
+pub(crate) const PROTOCOL: u32 = 7;
 
 /// The largest frame either side may send: 1 MiB of JSON.
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;

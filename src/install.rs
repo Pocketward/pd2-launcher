@@ -948,12 +948,44 @@ pub(crate) struct PrefixNeeds {
 }
 
 /// Verified prefix-component installers for one provisioning pass; `None`
-/// keeps an accepted component exactly as audited.
+/// keeps an accepted component exactly as audited. `template`: the template
+/// a new prefix of the Android app's runtime is a copy of.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PrefixArtifacts<'a> {
     pub(crate) gecko: Option<&'a VerifiedArtifact>,
     pub(crate) mono: Option<&'a VerifiedArtifact>,
     pub(crate) dotnet: Option<&'a VerifiedArtifact>,
+    pub(crate) template: crate::runtime::PrefixTemplate,
+}
+
+/// Whether the Android host's prefix (`paths.android()`) must be made again
+/// from `template`: its mark ([`crate::runtime::PREFIX_TEMPLATE_MARK`]) names
+/// the other template, and the Managed game folder holds nothing yet (Blizzard's
+/// installers must never see the GOLDEN template's values of an installed
+/// game; Fast download and an import get the official installers' state from
+/// the GOLDEN one). A prefix without a readable mark is kept as it is.
+pub(crate) fn prefix_has_other_template(
+    paths: &ManagedPaths,
+    template: crate::runtime::PrefixTemplate,
+) -> bool {
+    if !paths.android() {
+        return false;
+    }
+    let mut mark = String::new();
+    let marked = paths
+        .directory()
+        .open_directory(Path::new("prefix"))
+        .and_then(|prefix| prefix.open_file(Path::new(crate::runtime::PREFIX_TEMPLATE_MARK)))
+        .and_then(|file| file.take(64).read_to_string(&mut mark));
+    let other = match (marked, mark.trim()) {
+        (Ok(_), mark @ ("plain" | "golden")) => mark != template.mark(),
+        _ => false,
+    };
+    other
+        && match paths.open_game() {
+            Ok(game) => game.names().is_ok_and(|names| names.is_empty()),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
 }
 
 pub(crate) trait InstallationAuditor {
@@ -970,6 +1002,9 @@ pub(crate) struct ManagedPaths {
     prefix: PathBuf,
     game: PathBuf,
     game_folder: GameFolder,
+    /// The layout of the Android host: the Managed game folder outside the
+    /// prefix, the records of an import in the managed root.
+    android: bool,
 }
 
 impl fmt::Debug for ManagedPaths {
@@ -987,6 +1022,12 @@ impl fmt::Debug for ManagedPaths {
 
 impl ManagedPaths {
     pub(crate) fn prepare(root: &Path) -> Result<Self, InstallError> {
+        Self::prepare_on(root, crate::android_host())
+    }
+
+    /// [`Self::prepare`] with the layout of the Android host (`android`) or
+    /// the desktop.
+    pub(crate) fn prepare_on(root: &Path, android: bool) -> Result<Self, InstallError> {
         if !root.is_absolute() {
             return Err(InstallError::ManagedRootInvalid);
         }
@@ -995,14 +1036,26 @@ impl ManagedPaths {
         let game_folder =
             GameFolder::read(&directory).map_err(|_| InstallError::GameFolderUnavailable)?;
         Ok(Self {
-            game: game_folder.host_path(root),
+            game: game_folder.host_path_on(root, android),
             directory,
             root: root.to_owned(),
             cache: root.join("cache/artifacts"),
             runtime: root.join("runner").join(crate::runtime::current().identity),
             prefix: root.join("prefix"),
             game_folder,
+            android,
         })
+    }
+
+    /// Whether these are the Android host's paths ([`Self::prepare_on`]).
+    pub(crate) fn android(&self) -> bool {
+        self.android
+    }
+
+    /// The folder of the records of an import
+    /// ([`crate::game_folder::records_relative`]).
+    pub(crate) fn records(&self) -> std::io::Result<Directory> {
+        crate::game_folder::records_directory(&self.directory, self.android)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -1032,7 +1085,7 @@ impl ManagedPaths {
     /// Open the game folder: beneath the root, or a folder used in place
     /// proven to be the recorded one.
     pub(crate) fn open_game(&self) -> std::io::Result<Directory> {
-        self.game_folder.open(&self.directory)
+        self.game_folder.open_on(&self.directory, self.android)
     }
 
     /// The recorded game folder: the Managed one or a folder used in place.
@@ -1537,6 +1590,9 @@ pub(crate) struct ManagedInstaller<'a> {
     /// The player turned Project Diablo 2's update checks off: a Project
     /// Diablo 2 already in the game folder is kept as it is.
     client_as_installed: bool,
+    /// The job imports a game: a new prefix of the Android app's runtime is
+    /// a copy of the GOLDEN template, as for the direct download.
+    importing: bool,
 }
 
 /// What the Download job verified.
@@ -1563,7 +1619,24 @@ impl<'a> ManagedInstaller<'a> {
             downloading: std::cell::Cell::new(false),
             direct_download: false,
             client_as_installed: false,
+            importing: false,
         }
+    }
+
+    /// The template a new prefix of the Android app's runtime is made from
+    /// in this job: GOLDEN for the direct download and an import, PLAIN for
+    /// Blizzard's installers.
+    fn prefix_template(&self) -> crate::runtime::PrefixTemplate {
+        crate::runtime::PrefixTemplate::for_source(self.direct_download, self.importing)
+    }
+
+    /// Whether the job's setup must run although the audit accepts the
+    /// runtime and the prefix: the Android host's prefix was made from the
+    /// other template, and the game is not there yet
+    /// ([`prefix_has_other_template`]).
+    fn needs_other_template(&self, paths: &ManagedPaths, report: &InstallAudit) -> bool {
+        report.status == InstallationStatus::NeedsBaseGame
+            && prefix_has_other_template(paths, self.prefix_template())
     }
 
     /// Fetch Blizzard's installers with the direct download.
@@ -1839,7 +1912,10 @@ impl<'a> ManagedInstaller<'a> {
         if is_complete_payload(paths, &artifact) {
             return Ok(report);
         }
-        if report.runtime != CheckStatus::Satisfied || report.prefix != CheckStatus::Satisfied {
+        if report.runtime != CheckStatus::Satisfied
+            || report.prefix != CheckStatus::Satisfied
+            || self.needs_other_template(paths, &report)
+        {
             report = self.ensure_runtime(paths, report, control)?;
         }
         control.report(WorkProgress::for_phase(match product {
@@ -1995,7 +2071,10 @@ impl<'a> ManagedInstaller<'a> {
             }
             _ => check_recovery_status(report.status)?,
         }
-        if report.runtime != CheckStatus::Satisfied || report.prefix != CheckStatus::Satisfied {
+        if report.runtime != CheckStatus::Satisfied
+            || report.prefix != CheckStatus::Satisfied
+            || self.needs_other_template(&paths, &report)
+        {
             report = self.ensure_runtime(&paths, report, control)?;
             completed_stages.push(InstallStage::ManagedRuntime);
         }
@@ -2064,6 +2143,8 @@ impl<'a> ManagedInstaller<'a> {
     ) -> Result<InstallOutcome, InstallError> {
         let paths = ManagedPaths::prepare(managed_root)?;
         drop(MutationLease::acquire(&paths)?);
+        // A new prefix is a copy of the GOLDEN template.
+        self.importing = true;
         let mut completed_stages = Vec::new();
         check_cancelled(control)?;
         let mut report = self.audit(&paths)?;
@@ -2081,7 +2162,10 @@ impl<'a> ManagedInstaller<'a> {
                 crate::game_folder::ExistingInstallProblem::UnsupportedPath,
             ));
         }
-        if report.runtime != CheckStatus::Satisfied || report.prefix != CheckStatus::Satisfied {
+        if report.runtime != CheckStatus::Satisfied
+            || report.prefix != CheckStatus::Satisfied
+            || self.needs_other_template(&paths, &report)
+        {
             report = self.ensure_runtime(&paths, report, control)?;
             completed_stages.push(InstallStage::ManagedRuntime);
         }
@@ -2368,6 +2452,7 @@ impl<'a> ManagedInstaller<'a> {
             gecko: gecko.as_ref(),
             mono: mono.as_ref(),
             dotnet: dotnet.as_ref(),
+            template: self.prefix_template(),
         };
         self.driver
             .provision_runtime(paths, wine.as_ref(), prefix, &lease.0, control)
@@ -2638,13 +2723,13 @@ fn has_project_folder(paths: &ManagedPaths) -> bool {
         .is_ok_and(|names| names.iter().any(|name| name != ".pd2launcher"))
 }
 
-/// The mark, in the Managed prefix, of the record that an import wrote
-/// from the copied files: the SHA-256 of that record. Play's update check
-/// then compares PD2's manifest with the files themselves, once
+/// The mark, in the records' folder (the Managed prefix, or the managed root
+/// on the Android host: `game_folder::records_relative`), of the record that
+/// an import wrote from the copied files: the SHA-256 of that record. Play's
+/// update check then compares PD2's manifest with the files themselves, once
 /// ([`is_copied_client_record`]): a client that already is the current
 /// release gets PD2's record with no question. A later record (an update's)
-/// has another SHA-256, so the mark no longer counts; Start over removes it
-/// with the prefix.
+/// has another SHA-256, so the mark no longer counts; Start over removes it.
 pub(crate) const COPIED_CLIENT_MARK: &str = ".pd2launcher-copied-client";
 
 /// Write [`COPIED_CLIENT_MARK`] for the record in the game folder. The
@@ -2656,20 +2741,22 @@ fn mark_copied_client(paths: &ManagedPaths) -> std::io::Result<()> {
         .open_file(Path::new("ProjectD2/.pd2launcher/accepted-manifest.json"))?
         .take(1024 * 1024 + 1)
         .read_to_end(&mut record)?;
-    paths
-        .directory()
-        .open_directory(Path::new("prefix"))?
-        .atomic_write(
-            OsStr::new(COPIED_CLIENT_MARK),
-            sha256_hex(&record).as_bytes(),
-        )
+    paths.records()?.atomic_write(
+        OsStr::new(COPIED_CLIENT_MARK),
+        sha256_hex(&record).as_bytes(),
+    )
 }
 
 /// Whether `accepted`, the client's record, is the one that an import wrote
-/// from the copied files (its mark in the Managed prefix below `root`).
+/// from the copied files (its mark in the records' folder below `root`).
 pub(crate) fn is_copied_client_record(root: &Directory, accepted: &[u8]) -> bool {
+    is_copied_client_record_on(root, accepted, crate::android_host())
+}
+
+fn is_copied_client_record_on(root: &Directory, accepted: &[u8], android: bool) -> bool {
     let mut mark = String::new();
-    root.open_file(&Path::new("prefix").join(COPIED_CLIENT_MARK))
+    crate::game_folder::records_directory(root, android)
+        .and_then(|records| records.open_file(Path::new(COPIED_CLIENT_MARK)))
         .and_then(|file| file.take(128).read_to_string(&mut mark))
         .is_ok_and(|_| mark.trim() == sha256_hex(accepted))
 }
@@ -2803,8 +2890,48 @@ fn stage_failure(control: &OperationControl, stage: InstallStage) -> InstallErro
 /// runtime) and `cache/` (verified downloads, including unfinished ones)
 /// are kept, and Wine Gecko, Mono, and .NET are reinstalled into the new
 /// prefix from that cache. `lease` must be this root's installation lock,
-/// held exclusively by the caller for the whole reset.
+/// held exclusively by the caller for the whole reset. On the Android host
+/// the game folder, the records of an import and the app's prefix state are
+/// outside the prefix, and go too, before it ([`ANDROID_START_OVER`]).
 pub(crate) fn reset_managed_prefix(root: &Directory, lease: &File) -> std::io::Result<()> {
+    reset_managed_installation_on(root, lease, crate::android_host())
+}
+
+/// What Start over removes on the Android host, in this order, each removal
+/// on the disk before the next, once a started base-game stage marker is on
+/// the disk ([`start_over_android`]; it goes after the last removal).
+/// The app's prefix state goes first: the app makes a prefix again only for
+/// an installation whose prefix state has `player.reg` (one that was Ready
+/// once), and keeps that state only while the installation is Ready. The
+/// game folder goes last: the audit reads a started game stage beside any
+/// file of a game as an interrupted step that only Start over resolves
+/// (`audit::classify_installation`). So a stop at any step before the end
+/// shows Repair with Start over, which finishes the removal, never a Ready
+/// installation; a stop after the game folder went leaves no part of the
+/// installation (the marker beside no game reads as the start of an
+/// install).
+const ANDROID_START_OVER: [&str; 6] = [
+    crate::game_folder::ANDROID_PREFIX_STATE,
+    "Diablo II.partial",
+    crate::game_folder::IMPORT_RECORD_NAME,
+    COPIED_CLIENT_MARK,
+    "prefix",
+    crate::game_folder::ANDROID_GAME_RELATIVE,
+];
+
+/// [`reset_managed_prefix`] on the Android host (`android`) or the desktop.
+/// On the Android host, after a started base-game stage marker, it removes
+/// the app's prefix state (`game_folder::ANDROID_PREFIX_STATE`), Fast
+/// download's partial game folder, the import record, the copied client's
+/// mark, the prefix and then the Managed game folder ([`ANDROID_START_OVER`]).
+/// No removal follows a link: a link (the game folder's `Save`, which leads
+/// to the player's characters, or the prefix's link to the game folder) goes
+/// as a link, and what it leads to stays.
+fn reset_managed_installation_on(
+    root: &Directory,
+    lease: &File,
+    android: bool,
+) -> std::io::Result<()> {
     let lock = root.open_file(Path::new(".pd2launcher.lock"))?;
     if !crate::safe_fs::FileIdentity::of(&lock)?.matches(lease)? {
         return Err(std::io::Error::new(
@@ -2812,13 +2939,53 @@ pub(crate) fn reset_managed_prefix(root: &Directory, lease: &File) -> std::io::R
             "reset requires this root's installation lease",
         ));
     }
-    match root.open_directory(Path::new("prefix")) {
-        Ok(_) => root.remove_owned_tree(OsStr::new("prefix"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+    if android {
+        start_over_android(root, &ANDROID_START_OVER)?;
+    } else {
+        match root.open_directory(Path::new("prefix")) {
+            Ok(_) => root.remove_owned_tree(OsStr::new("prefix"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     crate::stage_marker::clear(root)?;
     root.sync()
+}
+
+/// The Android host's Start over up to the marker's clear: a started
+/// base-game stage marker, synced before the first removal (a stop before it
+/// has removed nothing), then `names` removed in order
+/// ([`remove_entries_in_order`]). Any marker that was there (an interrupted
+/// stage that this Start over resolves) gives way to it.
+fn start_over_android(root: &Directory, names: &[&str]) -> std::io::Result<()> {
+    crate::stage_marker::write(root, crate::InterruptedStage::BaseGame)?;
+    remove_entries_in_order(root, names)
+}
+
+/// Remove the entries `names` of `root` in their order ([`remove_entry`]),
+/// each removal on the disk before the next starts.
+fn remove_entries_in_order(root: &Directory, names: &[&str]) -> std::io::Result<()> {
+    for name in names {
+        remove_entry(root, OsStr::new(name))?;
+        root.sync()?;
+    }
+    Ok(())
+}
+
+/// Remove the entry `name` of `root`, whatever it is, without following a
+/// link: a folder as an owned tree ([`Directory::remove_owned_tree`]), a
+/// file or a link by its name. Nothing there is no error.
+fn remove_entry(root: &Directory, name: &OsStr) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, FileType};
+    match rustix::fs::statat(root.as_file(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {
+            root.remove_owned_tree(name)
+        }
+        Ok(_) => rustix::fs::unlinkat(root.as_file(), name, AtFlags::empty())
+            .map_err(std::io::Error::from),
+        Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn prepare_artifact_cache(paths: &ManagedPaths) -> Result<(), ArtifactRejection> {
@@ -4463,6 +4630,325 @@ mod tests {
             ),
             (true, 1, installer.to_vec())
         );
+    }
+
+    #[test]
+    fn on_android_start_over_removes_the_game_location_and_follows_no_link() {
+        let fixture = TempDir::new().unwrap();
+        let root_path = fixture.path().join("managed");
+        // The player's own folders, outside the managed root: links lead there.
+        let user_save = fixture.path().join("userdata/Save");
+        fs::create_dir_all(&user_save).unwrap();
+        fs::write(user_save.join("hero.d2s"), b"hero").unwrap();
+        let outside = fixture.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"keep").unwrap();
+        // The game folder outside the prefix, its Save a link to the characters.
+        let game = root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        crate::game_folder::tests::write_game_folder(&game, b"game", b"archive");
+        fs::remove_dir_all(game.join("Save")).unwrap();
+        std::os::unix::fs::symlink(&user_save, game.join("Save")).unwrap();
+        fs::write(game.join("ProjectD2/loot.filter"), b"mine").unwrap();
+        // The prefix with its link to the game folder; the app's prefix
+        // state with a folder link; the records of an import; Fast
+        // download's partial folder.
+        fs::create_dir_all(root_path.join("prefix/drive_c/Program Files (x86)")).unwrap();
+        let root = Directory::open(&root_path).unwrap();
+        crate::game_folder::link_game(&root).unwrap();
+        let state = root_path.join(crate::game_folder::ANDROID_PREFIX_STATE);
+        fs::create_dir_all(state.join("files")).unwrap();
+        fs::write(state.join("player.reg"), b"WINE REGISTRY Version 2\n").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("files/linked")).unwrap();
+        fs::write(
+            root_path.join(crate::game_folder::IMPORT_RECORD_NAME),
+            b"{}",
+        )
+        .unwrap();
+        fs::write(root_path.join(COPIED_CLIENT_MARK), b"mark").unwrap();
+        fs::create_dir_all(root_path.join("Diablo II.partial")).unwrap();
+        // A file of the game folder's name as a link: removed as a link.
+        let paths = ManagedPaths::prepare_on(&root_path, true).unwrap();
+        let lease = MutationLease::acquire(&paths).unwrap();
+        reset_managed_installation_on(&root, &lease.0, true).expect("start over");
+        drop(lease);
+        // The marker that it wrote first goes last.
+        assert_eq!(
+            crate::stage_marker::read(&root),
+            crate::stage_marker::MarkerState::Absent
+        );
+        for name in [
+            "prefix",
+            crate::game_folder::ANDROID_GAME_RELATIVE,
+            "Diablo II.partial",
+            crate::game_folder::ANDROID_PREFIX_STATE,
+            crate::game_folder::IMPORT_RECORD_NAME,
+            COPIED_CLIENT_MARK,
+        ] {
+            assert!(
+                fs::symlink_metadata(root_path.join(name)).is_err(),
+                "{name} is still there"
+            );
+        }
+        // What the links led to stays: the characters and the other folder.
+        assert_eq!(fs::read(user_save.join("hero.d2s")).unwrap(), b"hero");
+        assert_eq!(fs::read(outside.join("keep")).unwrap(), b"keep");
+        // The desktop's Start over leaves the root's other names alone.
+        fs::create_dir_all(root_path.join("prefix")).unwrap();
+        fs::create_dir_all(root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE)).unwrap();
+        let paths = ManagedPaths::prepare_on(&root_path, false).unwrap();
+        let lease = MutationLease::acquire(&paths).unwrap();
+        reset_managed_installation_on(&root, &lease.0, false).expect("start over");
+        assert!(!root_path.join("prefix").exists());
+        assert!(
+            root_path
+                .join(crate::game_folder::ANDROID_GAME_RELATIVE)
+                .is_dir()
+        );
+    }
+
+    /// A Rust copy of the Android app's rule, `LegacyPrefix.broken` and
+    /// `LegacyPrefix.gameInLocation` in
+    /// `android/app/src/main/java/com/pd2launcher/app/LegacyPrefix.kt`: the
+    /// app makes the prefix again only with no move begun (no `.prefix.old`)
+    /// and only for an installation whose prefix state has `player.reg`, and
+    /// then only when the prefix is gone while the game folder holds an entry
+    /// other than its `Save` link (a real `Save` folder counts), or the prefix
+    /// lacks a hive or `drive_c/windows`. The app's guard for a template that
+    /// is not whole is left out: without it this copy says "made again" in
+    /// more states, so a test that it says no is the stricter one. The app's
+    /// own test of the same steps is `DisposablePrefixTest`.
+    fn android_app_makes_the_prefix_again(root: &Path) -> bool {
+        let state = root.join(crate::game_folder::ANDROID_PREFIX_STATE);
+        if fs::symlink_metadata(root.join(".prefix.old")).is_ok()
+            || !state.join("player.reg").is_file()
+        {
+            return false;
+        }
+        let prefix = root.join("prefix");
+        if fs::symlink_metadata(&prefix).is_err() {
+            return crate::audit::GameTree::managed_on(&Directory::open(root).unwrap(), true)
+                .holds_an_entry();
+        }
+        ["system.reg", "user.reg"]
+            .iter()
+            .any(|hive| !prefix.join(hive).is_file())
+            || !prefix.join("drive_c/windows").is_dir()
+    }
+
+    /// A whole Android installation that was Ready once, below `fixture`: the
+    /// game folder with its `Save` link to the player's characters, the prefix
+    /// with its hives, `drive_c/windows` and the link to the game folder, the
+    /// app's prefix state; with `imported`, the records of an import and Fast
+    /// download's partial folder too. The managed root and the player's `Save`.
+    fn whole_android_installation(fixture: &TempDir, imported: bool) -> (PathBuf, PathBuf) {
+        let root_path = fixture.path().join("managed");
+        let user_save = fixture.path().join("userdata/Save");
+        fs::create_dir_all(&user_save).unwrap();
+        fs::write(user_save.join("hero.d2s"), b"hero").unwrap();
+        let game = root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        crate::game_folder::tests::write_game_folder(&game, b"game", b"archive");
+        fs::remove_dir_all(game.join("Save")).unwrap();
+        std::os::unix::fs::symlink(&user_save, game.join("Save")).unwrap();
+        fs::create_dir_all(root_path.join("prefix/drive_c/windows")).unwrap();
+        fs::create_dir_all(root_path.join("prefix/drive_c/Program Files (x86)")).unwrap();
+        for hive in ["system.reg", "user.reg"] {
+            fs::write(
+                root_path.join("prefix").join(hive),
+                b"WINE REGISTRY Version 2\n",
+            )
+            .unwrap();
+        }
+        crate::game_folder::link_game(&Directory::open(&root_path).unwrap()).unwrap();
+        let state = root_path.join(crate::game_folder::ANDROID_PREFIX_STATE);
+        fs::create_dir_all(state.join("files")).unwrap();
+        fs::write(state.join("player.reg"), b"WINE REGISTRY Version 2\n").unwrap();
+        fs::write(state.join("files.list"), b"").unwrap();
+        if imported {
+            fs::write(
+                root_path.join(crate::game_folder::IMPORT_RECORD_NAME),
+                b"{}",
+            )
+            .unwrap();
+            fs::write(root_path.join(COPIED_CLIENT_MARK), b"mark").unwrap();
+            fs::create_dir_all(root_path.join("Diablo II.partial")).unwrap();
+        }
+        (root_path, user_save)
+    }
+
+    #[test]
+    fn on_android_a_start_over_stopped_at_any_step_leaves_nothing_the_app_makes_again() {
+        use crate::stage_marker::{MarkerState, read};
+        assert_eq!(
+            ANDROID_START_OVER.first(),
+            Some(&crate::game_folder::ANDROID_PREFIX_STATE)
+        );
+        assert_eq!(
+            ANDROID_START_OVER.last(),
+            Some(&crate::game_folder::ANDROID_GAME_RELATIVE)
+        );
+        // A stop after `done` steps, and part way through the next one
+        // (`inside`): one file of it gone, the worst one for the rule (the
+        // prefix state keeps its player.reg, the prefix loses a hive); in the
+        // game folder's step also a late stop that leaves only `ProjectD2/`
+        // or only a stray file, none of them a file that a check names.
+        for done in 0..ANDROID_START_OVER.len() {
+            for inside in ["no", "one file", "only ProjectD2", "only a stray file"] {
+                let game_step =
+                    ANDROID_START_OVER[done] == crate::game_folder::ANDROID_GAME_RELATIVE;
+                if inside.starts_with("only") && !game_step {
+                    continue;
+                }
+                let fixture = TempDir::new().unwrap();
+                let (root_path, user_save) = whole_android_installation(&fixture, true);
+                let root = Directory::open(&root_path).unwrap();
+                assert!(!android_app_makes_the_prefix_again(&root_path));
+
+                start_over_android(&root, &ANDROID_START_OVER[..done]).unwrap();
+                let game = root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+                if inside.starts_with("only") {
+                    fs::write(game.join("stray.txt"), b"stray").unwrap();
+                    let keep = if inside == "only ProjectD2" {
+                        "ProjectD2"
+                    } else {
+                        "stray.txt"
+                    };
+                    for entry in fs::read_dir(&game).unwrap() {
+                        let name = entry.unwrap().file_name();
+                        if name != keep && name != "Save" {
+                            remove_entry(&Directory::open(&game).unwrap(), &name).unwrap();
+                        }
+                    }
+                } else if inside == "one file" {
+                    let next = root_path.join(ANDROID_START_OVER[done]);
+                    match ANDROID_START_OVER[done] {
+                        crate::game_folder::ANDROID_PREFIX_STATE => {
+                            fs::remove_file(next.join("files.list")).unwrap()
+                        }
+                        crate::game_folder::ANDROID_GAME_RELATIVE => {
+                            fs::remove_file(next.join("Game.exe")).unwrap()
+                        }
+                        "prefix" => fs::remove_file(next.join("system.reg")).unwrap(),
+                        _ => remove_entry(&root, OsStr::new(ANDROID_START_OVER[done])).unwrap(),
+                    }
+                }
+                let case = format!("a stop after {done} steps (inside the next one: {inside})");
+                assert!(!android_app_makes_the_prefix_again(&root_path), "{case}");
+                // The started base-game marker is on the disk beside an entry of
+                // the game folder, which the audit reads as an interrupted step
+                // (Repair with Start over), never as a Ready installation: the
+                // audit's own reader of the folder
+                // (`audit::tests::a_game_folder_with_only_unnamed_entries_beside_a_started_marker_is_interrupted`).
+                assert_eq!(
+                    read(&root),
+                    MarkerState::Present(InterruptedStage::BaseGame),
+                    "{case}"
+                );
+                assert!(
+                    crate::audit::GameTree::managed_on(&root, true).holds_an_entry(),
+                    "{case}"
+                );
+                // The next Start over finishes.
+                start_over_android(&root, &ANDROID_START_OVER).unwrap();
+                crate::stage_marker::clear(&root).unwrap();
+                for name in ANDROID_START_OVER {
+                    assert!(
+                        fs::symlink_metadata(root_path.join(name)).is_err(),
+                        "{name}"
+                    );
+                }
+                // No removal followed the Save link.
+                assert_eq!(fs::read(user_save.join("hero.d2s")).unwrap(), b"hero");
+            }
+        }
+    }
+
+    /// A GOLDEN installation from Fast download, on a device: a kill 1.27 s
+    /// after the Start over command found the prefix state gone, the game
+    /// folder and the prefix whole, no partial folder and no marker, and the
+    /// next start was Ready again, the Start over undone. That state now has
+    /// the started base-game marker, which the audit reads as an interrupted
+    /// step beside the whole game
+    /// (`audit::tests::a_start_over_stopped_after_the_prefix_state_is_an_interrupted_step`).
+    #[test]
+    fn on_android_a_start_over_stopped_after_the_prefix_state_leaves_the_marker() {
+        use crate::stage_marker::{MarkerState, read};
+        let fixture = TempDir::new().unwrap();
+        let (root_path, _) = whole_android_installation(&fixture, false);
+        let root = Directory::open(&root_path).unwrap();
+        start_over_android(&root, &ANDROID_START_OVER[..1]).unwrap();
+        assert!(
+            fs::symlink_metadata(root_path.join(crate::game_folder::ANDROID_PREFIX_STATE)).is_err()
+        );
+        let game = root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        assert_eq!(fs::read(game.join("Game.exe")).unwrap(), b"game");
+        assert!(
+            fs::symlink_metadata(game.join("Save"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        for hive in ["system.reg", "user.reg"] {
+            assert!(root_path.join("prefix").join(hive).is_file());
+        }
+        assert!(fs::symlink_metadata(root_path.join("Diablo II.partial")).is_err());
+        assert_eq!(
+            read(&root),
+            MarkerState::Present(InterruptedStage::BaseGame)
+        );
+        assert!(!android_app_makes_the_prefix_again(&root_path));
+    }
+
+    #[test]
+    fn on_android_the_prefix_is_made_again_only_for_the_other_template_and_no_game() {
+        use crate::runtime::PrefixTemplate;
+        let fixture = TempDir::new().unwrap();
+        let root_path = fixture.path();
+        let mark = root_path
+            .join("prefix")
+            .join(crate::runtime::PREFIX_TEMPLATE_MARK);
+        fs::create_dir_all(mark.parent().unwrap()).unwrap();
+        let android = ManagedPaths::prepare_on(root_path, true).unwrap();
+        // No mark (a prefix of an older layout): kept.
+        assert!(!prefix_has_other_template(&android, PrefixTemplate::Plain));
+        fs::write(&mark, b"golden\n").unwrap();
+        assert!(!prefix_has_other_template(&android, PrefixTemplate::Golden));
+        // The GOLDEN one before Blizzard's installers, with no game yet (no
+        // game folder, or an empty one): made again from PLAIN.
+        assert!(prefix_has_other_template(&android, PrefixTemplate::Plain));
+        let game = root_path.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        fs::create_dir_all(&game).unwrap();
+        assert!(prefix_has_other_template(&android, PrefixTemplate::Plain));
+        fs::write(&mark, b"plain\n").unwrap();
+        assert!(prefix_has_other_template(&android, PrefixTemplate::Golden));
+        // Once a file of the game is there, the prefix stays.
+        fs::write(game.join("Game.exe"), b"game").unwrap();
+        assert!(!prefix_has_other_template(&android, PrefixTemplate::Golden));
+        // A mark of another kind, and the desktop: kept.
+        fs::remove_file(game.join("Game.exe")).unwrap();
+        fs::write(&mark, b"other\n").unwrap();
+        assert!(!prefix_has_other_template(&android, PrefixTemplate::Golden));
+        fs::write(&mark, b"plain\n").unwrap();
+        let desktop = ManagedPaths::prepare_on(root_path, false).unwrap();
+        assert!(!prefix_has_other_template(&desktop, PrefixTemplate::Golden));
+    }
+
+    #[test]
+    fn on_android_the_copied_clients_mark_is_in_the_managed_root() {
+        let fixture = TempDir::new().unwrap();
+        let root_path = fixture.path();
+        fs::create_dir_all(root_path.join("prefix")).unwrap();
+        let root = Directory::open(root_path).unwrap();
+        let record = b"{\"schema\":1}";
+        fs::write(root_path.join(COPIED_CLIENT_MARK), sha256_hex(record)).unwrap();
+        assert!(is_copied_client_record_on(&root, record, true));
+        assert!(!is_copied_client_record_on(&root, record, false));
+        fs::rename(
+            root_path.join(COPIED_CLIENT_MARK),
+            root_path.join("prefix").join(COPIED_CLIENT_MARK),
+        )
+        .unwrap();
+        assert!(is_copied_client_record_on(&root, record, false));
+        assert!(!is_copied_client_record_on(&root, record, true));
     }
 
     #[test]

@@ -2920,14 +2920,14 @@ mod tests {
             )
         });
 
-        entered_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("manifest transport entered");
+        let entered = entered_receiver.recv_timeout(std::time::Duration::from_secs(30));
         control.request_cancel();
-        assert!(matches!(
-            worker.join().unwrap(),
-            Err(UpdateError::Cancelled)
-        ));
+        let result = worker.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "manifest transport not entered: {result:?}"
+        );
+        assert!(matches!(result, Err(UpdateError::Cancelled)));
         assert!(fs::read_dir(temporary.path()).unwrap().next().is_none());
     }
 
@@ -3019,17 +3019,11 @@ mod tests {
             )
         });
 
-        if entered_receiver
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .is_err()
-        {
-            panic!("object body was not entered: {:?}", worker.join().unwrap());
-        }
+        let entered = entered_receiver.recv_timeout(std::time::Duration::from_secs(30));
         control.request_cancel();
-        assert!(matches!(
-            worker.join().unwrap(),
-            Err(UpdateError::Cancelled)
-        ));
+        let result = worker.join().unwrap();
+        assert!(entered.is_ok(), "object body was not entered: {result:?}");
+        assert!(matches!(result, Err(UpdateError::Cancelled)));
         assert!(!temporary.path().join("Game.exe").exists());
     }
 

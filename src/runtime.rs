@@ -136,7 +136,56 @@ pub(crate) const APP_RUNTIME_VERSION: &str = "wine-11.0";
 /// The prefix the Android app's runtime starts from, in the managed root: a
 /// copy of it becomes a new prefix (the app makes it with the same Wine, so
 /// no `wineboot` runs on the phone). Game.exe already runs as Windows 7 in it.
+/// This is the PLAIN template; [`APP_PREFIX_TEMPLATE_GOLDEN`] is the other.
 pub(crate) const APP_PREFIX_TEMPLATE: &str = "runner/wine-11.0-arm64-prefix";
+/// The GOLDEN template: the PLAIN one with what the official installers
+/// create (Blizzard's Diablo II and Lord of Destruction installers, the
+/// Project Diablo 2 installer with its Visual C++ redist), except Blizzard's
+/// own files (the app's `runtime/golden.py`).
+pub(crate) const APP_PREFIX_TEMPLATE_GOLDEN: &str = "runner/wine-11.0-arm64-prefix-golden";
+/// The mark of a template's kind in it, and so in each prefix made from it:
+/// `plain` or `golden`.
+pub(crate) const PREFIX_TEMPLATE_MARK: &str = ".pd2-prefix-template";
+
+/// Which template a new prefix of the Android app's runtime is a copy of.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PrefixTemplate {
+    /// For Blizzard's installers, which must never see an installed game.
+    #[default]
+    Plain,
+    /// For Fast download and imports: the official installers' state is
+    /// there from the start.
+    Golden,
+}
+
+impl PrefixTemplate {
+    /// The template's folder in the managed root.
+    pub(crate) const fn directory(self) -> &'static str {
+        match self {
+            Self::Plain => APP_PREFIX_TEMPLATE,
+            Self::Golden => APP_PREFIX_TEMPLATE_GOLDEN,
+        }
+    }
+
+    /// The kind as [`PREFIX_TEMPLATE_MARK`] holds it.
+    pub(crate) const fn mark(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Golden => "golden",
+        }
+    }
+
+    /// The template for an install that the source decides: GOLDEN for Fast
+    /// download (`direct_download`) and for an import, PLAIN for Blizzard's
+    /// installers.
+    pub(crate) const fn for_source(direct_download: bool, import: bool) -> Self {
+        if direct_download || import {
+            Self::Golden
+        } else {
+            Self::Plain
+        }
+    }
+}
 /// The link a prefix of the Android app's runtime reaches the app's x86
 /// .NET runtime (the official PD2 launcher's) by, and its target, relative
 /// to the link's folder: `runner/dotnet-6.0.36-x86` in the managed root.
@@ -224,6 +273,33 @@ impl InstalledRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_install_source_decides_the_prefix_template() {
+        // Blizzard's installers must never see an installed game.
+        assert_eq!(
+            PrefixTemplate::for_source(false, false),
+            PrefixTemplate::Plain
+        );
+        assert_eq!(
+            PrefixTemplate::for_source(true, false),
+            PrefixTemplate::Golden
+        );
+        assert_eq!(
+            PrefixTemplate::for_source(false, true),
+            PrefixTemplate::Golden
+        );
+        assert_eq!(
+            PrefixTemplate::Plain.directory(),
+            super::APP_PREFIX_TEMPLATE
+        );
+        assert_eq!(
+            PrefixTemplate::Golden.directory(),
+            "runner/wine-11.0-arm64-prefix-golden"
+        );
+        assert_eq!(PrefixTemplate::Plain.mark(), "plain");
+        assert_eq!(PrefixTemplate::Golden.mark(), "golden");
+    }
 
     #[test]
     fn each_row_selects_its_frozen_runtime() {

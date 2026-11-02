@@ -2499,7 +2499,24 @@ mod tests {
         RendererPreferenceView, SettingsPersistenceView, UiReducer,
     };
 
-    const WAIT: Duration = Duration::from_secs(3);
+    // A limit for the waits below, not a delay: a test goes on as soon as its condition holds.
+    // CI's small runners took more than 3 s for some events (2026-10-30).
+    const WAIT: Duration = Duration::from_secs(30);
+
+    /// Waits until the backend has made `call` `count` times, then checks that it made it
+    /// exactly that often. The coordinator records a call on its own thread, so the call can
+    /// come a moment after the snapshot that the test waited for.
+    fn wait_for_calls(backend: &FakeBackend, call: &str, count: usize) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let made = backend.calls().iter().filter(|made| **made == call).count();
+            if made >= count || Instant::now() >= deadline {
+                assert_eq!(made, count, "{call} calls: {:?}", backend.calls());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn a_chosen_built_in_fex_downloads_for_an_installed_game() {
@@ -3185,15 +3202,33 @@ mod tests {
             }
         }
 
+        // The caller's line in a panic, and what the coordinator showed last: a wait that
+        // fails on CI only must say which wait it was and where the coordinator stood.
+        #[track_caller]
         fn wait_for(&mut self, predicate: impl Fn(&UiSnapshot) -> bool) -> UiSnapshot {
             let deadline = Instant::now() + WAIT;
             while !predicate(self.reducer.snapshot()) {
                 let now = Instant::now();
-                assert!(now < deadline, "snapshot condition timed out");
-                let event = self
-                    .events
-                    .recv_timeout(deadline - now)
-                    .expect("service event");
+                let left = deadline.saturating_duration_since(now);
+                let event = match self.events.recv_timeout(left) {
+                    Ok(event) if now < deadline => event,
+                    result => {
+                        let snapshot = self.reducer.snapshot();
+                        panic!(
+                            "no snapshot met the condition in {WAIT:?} ({}); the last one: \
+                             installation {:?}, operation {:?}, setup record {:?}, update {:?}",
+                            if result.is_ok() {
+                                "events came"
+                            } else {
+                                "no event"
+                            },
+                            snapshot.installation(),
+                            snapshot.operation(),
+                            snapshot.setup_record(),
+                            snapshot.update(),
+                        )
+                    }
+                };
                 assert_ne!(
                     self.reducer.reduce(event),
                     ReduceOutcome::SnapshotRequired,
@@ -3800,6 +3835,29 @@ mod tests {
         let calls = backend.calls();
         let reset_call = calls.iter().position(|call| *call == "reset").unwrap();
         assert_eq!(&calls[reset_call..reset_call + 2], ["reset", "open"]);
+    }
+
+    /// An Indeterminate installation lets Start over through to the backend:
+    /// on the Android host a stop inside a Start over's removal of the update
+    /// records can leave the transaction check Indeterminate, and the
+    /// backend's own preflight then goes on while the started base-game
+    /// marker stands (`composition::production` `start_over_on`).
+    #[test]
+    fn an_indeterminate_installation_lets_start_over_reach_the_backend() {
+        let backend = Arc::new(FakeBackend::new(
+            [audit(InstallationStatus::Indeterminate)],
+            UpdateStatus::UpToDate,
+        ));
+        let mut harness = Harness::start(backend.clone());
+        harness.wait_for(|snapshot| snapshot.installation() == InstallationStatus::Indeterminate);
+        harness.intents.send(Intent::StartOver).unwrap();
+        harness.wait_for(|snapshot| {
+            snapshot.operation().is_some_and(|operation| {
+                operation.phase() == OperationPhase::Reset
+                    && operation.status() == OperationStatusView::Succeeded
+            })
+        });
+        assert!(backend.calls().contains(&"reset"));
     }
 
     #[test]
@@ -4617,11 +4675,9 @@ mod tests {
         harness.wait_for(|snapshot| {
             !snapshot.settings().update_checks() && snapshot.update() == UpdateStatus::Unknown
         });
-        let audits = |calls: &[&str]| calls.iter().filter(|call| **call == "audit").count();
         // The client is held to the other rule at once.
-        assert_eq!(audits(&backend.calls()), 2);
-        let checks = |calls: &[&str]| calls.iter().filter(|call| **call == "check-update").count();
-        assert_eq!(checks(&backend.calls()), 1);
+        wait_for_calls(&backend, "audit", 2);
+        wait_for_calls(&backend, "check-update", 1);
 
         harness
             .intents
@@ -4630,8 +4686,8 @@ mod tests {
         harness.wait_for(|snapshot| {
             snapshot.settings().update_checks() && snapshot.update() == UpdateStatus::Available
         });
-        assert_eq!(audits(&backend.calls()), 3);
-        assert_eq!(checks(&backend.calls()), 2);
+        wait_for_calls(&backend, "audit", 3);
+        wait_for_calls(&backend, "check-update", 2);
     }
 
     #[test]
@@ -5274,6 +5330,18 @@ mod tests {
         });
     }
 
+    /// Prints the fake backend's calls, in order, when the test fails (for a failure that only
+    /// CI shows, 2026-10-30).
+    struct CallsOnPanic(Arc<FakeBackend>);
+
+    impl Drop for CallsOnPanic {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("fake backend calls, in order: {:?}", self.0.calls());
+            }
+        }
+    }
+
     fn authorize(harness: &Harness) {
         harness
             .intents
@@ -5290,14 +5358,21 @@ mod tests {
 
     #[test]
     fn the_setup_record_is_written_as_the_setup_progresses() {
-        let backend = Arc::new(FakeBackend::new(
-            [
-                audit(InstallationStatus::NeedsBaseGame),
-                audit(InstallationStatus::Ready),
-                audit(InstallationStatus::NeedsBaseGame),
-            ],
-            UpdateStatus::UpToDate,
-        ));
+        // The install waits at its gate: an install that ends before the
+        // service's next tick goes from no job to Ready, and the record from
+        // none to installed with no started between.
+        let backend = Arc::new(
+            FakeBackend::new(
+                [
+                    audit(InstallationStatus::NeedsBaseGame),
+                    audit(InstallationStatus::Ready),
+                    audit(InstallationStatus::NeedsBaseGame),
+                ],
+                UpdateStatus::UpToDate,
+            )
+            .with_install_blocked(),
+        );
+        let _calls = CallsOnPanic(backend.clone());
         let mut harness = Harness::start(backend.clone());
         harness.wait_for(|snapshot| {
             snapshot.installation() == InstallationStatus::NeedsBaseGame
@@ -5310,6 +5385,7 @@ mod tests {
         // reachable, none again after Start over.
         authorize(&harness);
         harness.wait_for(|snapshot| snapshot.setup_record() == SetupRecord::Started);
+        backend.install_gate.release();
         harness.wait_for(|snapshot| {
             snapshot.installation() == InstallationStatus::Ready
                 && snapshot.setup_record() == SetupRecord::Installed

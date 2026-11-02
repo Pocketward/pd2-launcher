@@ -463,6 +463,17 @@ impl GameSupervisor {
                 Err(error) => eprintln!("pd2-launcher: the G: drive was not linked: {error}"),
             }
         }
+        // The Android host's game folder is outside the prefix: its link
+        // there, made again should it be missing.
+        if android_host() && matches!(paths.game_folder, crate::game_folder::GameFolder::Managed) {
+            match crate::game_folder::link_game(&root) {
+                Ok(true) => eprintln!("pd2-launcher: the prefix's game folder link was made again"),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("pd2-launcher: the game folder's link was not made: {error}")
+                }
+            }
+        }
         let d2gl_setup = prepare_d2gl(&paths.folder, options, android_host())?;
         // How DirectDraw mode draws; a failure keeps PD2's own setting.
         if options.renderer == GameRenderer::DirectDraw
@@ -591,6 +602,7 @@ impl GameSupervisor {
         );
         let request = game_profile_request(
             &root,
+            &paths.root,
             &leases,
             runtime,
             &program,
@@ -650,6 +662,8 @@ struct ActiveGame {
 struct GamePaths {
     root: PathBuf,
     project_d2: PathBuf,
+    /// Which game folder: the Managed one, or a folder used in place.
+    game_folder: crate::game_folder::GameFolder,
     /// The game folder: the Managed one, or a folder used in place proven
     /// to be the recorded one.
     folder: Directory,
@@ -673,6 +687,7 @@ impl GamePaths {
                 .open(retained)
                 .map_err(|_| GameLaunchError::UnsafeManagedInstallation)?,
             in_place_drive: crate::in_place_drive::folder(android_host(), &folder),
+            game_folder: folder,
         })
     }
 
@@ -832,6 +847,7 @@ fn build_game_request(
     // boundary.
     let mut request = game_profile_request(
         root,
+        &paths.root,
         leases,
         runtime,
         WINDOWS_GAME_EXECUTABLE,
@@ -854,8 +870,10 @@ fn build_game_request(
 /// `program` run through the managed runtime exactly as the game is: the
 /// same prefix, Wine cache, DLL overrides, session variables, and leases,
 /// with `extra` settings on top and, with `detailed`, Detailed logging's.
+#[allow(clippy::too_many_arguments)]
 fn game_profile_request(
     root: &Directory,
+    managed_root: &Path,
     leases: &GameLeases,
     runtime: RuntimeHandles,
     program: &str,
@@ -894,6 +912,13 @@ fn game_profile_request(
     }
     for (name, value) in environment {
         request = request.with_environment(name, value);
+    }
+    // The game folder outside the Android host's prefix is
+    // C:\Program Files (x86)\Diablo II to the game, not a folder on the
+    // root drive (`game_folder::wine_pwd`).
+    if let Some(pwd) = crate::game_folder::wine_pwd(managed_root, working_directory, android_host())
+    {
+        request = request.with_environment("PWD", pwd);
     }
 
     request = request
@@ -1048,7 +1073,7 @@ impl GameLogs {
             .and_then(|root| crate::game_folder::GameFolder::read(&root).ok())
         {
             Some(crate::game_folder::GameFolder::External(external)) => external.path().to_owned(),
-            _ => managed_root.join(crate::game_folder::GAME_RELATIVE),
+            _ => managed_root.join(crate::game_folder::managed_relative(android_host())),
         };
         let mut logs = Self {
             folder,

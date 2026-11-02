@@ -577,7 +577,7 @@ fn game_directory(paths: &ReportPaths) -> Option<PathBuf> {
     paths.game_folder.clone().or_else(|| {
         let managed = paths
             .managed_root
-            .join("prefix/drive_c/Program Files (x86)/Diablo II");
+            .join(crate::game_folder::managed_relative(crate::android_host()));
         managed.is_dir().then_some(managed)
     })
 }

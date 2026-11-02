@@ -96,6 +96,16 @@ const ACCEPTED_MANIFEST_LIMIT: u64 = 1024 * 1024;
 /// Saved reports kept in `logs/reports`.
 const REPORTS_KEPT: usize = 10;
 const PROJECT_D2_RELATIVE: &str = "prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2";
+
+/// [`PROJECT_D2_RELATIVE`] or, on the Android host, the ProjectD2 of the
+/// game folder outside the prefix.
+fn project_d2_relative() -> PathBuf {
+    if crate::android_host() {
+        Path::new(crate::game_folder::ANDROID_GAME_RELATIVE).join("ProjectD2")
+    } else {
+        PathBuf::from(PROJECT_D2_RELATIVE)
+    }
+}
 pub(super) const AARCH64_BINARY_IDENTITY: &str = "native-aarch64-binary";
 pub(super) const X86_64_BINARY_IDENTITY: &str = "native-x86_64-binary";
 const COMPILED_ARTIFACT_IDENTITY: Option<&str> = option_env!("PD2_LAUNCHER_ARTIFACT_IDENTITY");
@@ -2851,8 +2861,39 @@ fn start_over(
     kept: Option<&crate::save_keeper::KeptSaves>,
     transaction: impl FnOnce() -> Result<CheckStatus, BackendFailure>,
 ) -> Result<crate::save_keeper::PutAside, BackendFailure> {
+    start_over_on(
+        root,
+        root_path,
+        lease,
+        kept,
+        transaction,
+        crate::android_host(),
+    )
+}
+
+/// [`start_over`] on the Android host (`android`) or the desktop. On the
+/// Android host, while a started base-game marker stands (a Start over that
+/// a stop left part way writes it first, `install::start_over_android`; a
+/// base-game step that a stop left part way, which only Start over
+/// resolves, leaves one too), Start over needs no transaction preflight:
+/// a Start over that began has removed part of the game folder, so what is
+/// left of the update records in it is no update in flight (the lease is
+/// exclusive), and only Start over can go on. A stop inside the removal of
+/// `ProjectD2/.pd2launcher` can leave a journal beside an emptied staging
+/// folder, which the probe reads as Unsafe. The desktop does not change.
+fn start_over_on(
+    root: &Directory,
+    root_path: &Path,
+    lease: &InstallationMutationLease,
+    kept: Option<&crate::save_keeper::KeptSaves>,
+    transaction: impl FnOnce() -> Result<CheckStatus, BackendFailure>,
+    android: bool,
+) -> Result<crate::save_keeper::PutAside, BackendFailure> {
     let game = GameFolder::resolve(root);
-    if game.is_ok() && transaction()? != CheckStatus::Satisfied {
+    let begun = android
+        && crate::stage_marker::read(root)
+            == crate::stage_marker::MarkerState::Present(crate::InterruptedStage::BaseGame);
+    if game.is_ok() && !begun && transaction()? != CheckStatus::Satisfied {
         return Err(backend_failure("start-over-preflight-rejected"));
     }
     let mut put_aside = crate::save_keeper::PutAside::default();
@@ -3023,7 +3064,7 @@ fn anchored_update_layout(
             paths.project_d2_root(),
             root.try_clone()
                 .map_err(|_| backend_failure("launcher-state-unavailable"))?,
-            PathBuf::from(PROJECT_D2_RELATIVE),
+            project_d2_relative(),
         )),
         // A folder used in place: its ProjectD2, below the proven folder.
         GameFolder::External(external) => Ok(UpdateLayout::anchored(
@@ -5217,6 +5258,50 @@ mod tests {
         assert!(moved.join("ProjectD2").is_dir());
         assert!(!kept.path().exists());
         assert_eq!(GameFolder::resolve(&root), Ok(GameFolder::Managed));
+    }
+
+    /// A second Start over on the Android host after a stop inside the
+    /// first one's removal of `ProjectD2/.pd2launcher`, where the update
+    /// records read as Unsafe (`transaction::tests::
+    /// update_records_that_a_removal_cut_part_way_read_as_unsafe`): the
+    /// audit's transaction check is Indeterminate. With the started
+    /// base-game marker that the first one wrote, it goes on; without it,
+    /// with a finished marker, and on the desktop it is refused, as before.
+    #[test]
+    fn a_start_over_that_its_marker_shows_as_begun_needs_no_transaction_preflight() {
+        use crate::stage_marker::{MarkerState, finish, read, write};
+        let home = tempfile::tempdir().unwrap();
+        let root_path = home.path().join("managed");
+        std::fs::create_dir_all(root_path.join("prefix/drive_c")).unwrap();
+        std::fs::write(root_path.join(".pd2launcher.lock"), b"").unwrap();
+        let root = Directory::open(&root_path).unwrap();
+        let lease = InstallationMutationLease::acquire(&root).unwrap();
+        let unsafe_records = || Ok(CheckStatus::Indeterminate);
+        let refused = Some(backend_failure("start-over-preflight-rejected"));
+        // No marker: refused.
+        assert_eq!(
+            start_over_on(&root, &root_path, &lease, None, unsafe_records, true).err(),
+            refused
+        );
+        // A finished marker is no Start over under way: refused.
+        finish(&root, crate::InterruptedStage::BaseGame).unwrap();
+        assert_eq!(
+            start_over_on(&root, &root_path, &lease, None, unsafe_records, true).err(),
+            refused
+        );
+        // The desktop: no change.
+        write(&root, crate::InterruptedStage::BaseGame).unwrap();
+        assert_eq!(
+            start_over_on(&root, &root_path, &lease, None, unsafe_records, false).err(),
+            refused
+        );
+        assert!(root_path.join("prefix").is_dir());
+        // The Android host with the started marker: it goes on, and its end
+        // clears the marker.
+        start_over_on(&root, &root_path, &lease, None, unsafe_records, true)
+            .expect("start over goes on");
+        assert!(!root_path.join("prefix").exists());
+        assert_eq!(read(&root), MarkerState::Absent);
     }
 
     #[test]

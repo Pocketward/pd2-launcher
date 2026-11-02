@@ -14,9 +14,19 @@
 //! record lives in the Managed prefix, Start over forgets it together with
 //! the prefix and never touches the folder itself.
 //!
-//! Wine reaches a folder used in place through its default `Z:` drive (the
-//! host root), so the Launcher creates no link of its own; the Launcher
-//! itself only ever opens it by descriptor, below the proven directory.
+//! On the desktop Wine reaches a folder used in place through its default
+//! `Z:` drive (the host root), so the Launcher creates no link of its own;
+//! the Android host links the `G:` drive to it (`in_place_drive`). The
+//! Launcher itself only ever opens it by descriptor, below the proven
+//! directory.
+//!
+//! On the Android host the prefix is disposable (any app version makes it
+//! again from its template), so the Managed game folder is outside it:
+//! `Diablo II` in the managed root ([`ANDROID_GAME_RELATIVE`]), which Wine
+//! reaches as `C:\Program Files (x86)\Diablo II` through a relative link in
+//! the prefix ([`link_game`]). An import is moved there too, so no game
+//! folder is used in place there, and the records of an import are in the
+//! managed root, not in the prefix ([`records_relative`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,16 +46,123 @@ use crate::{
     safe_fs::Directory,
 };
 
-/// The Managed game folder below the managed root.
+/// The Managed game folder below the managed root (on the desktop), and the
+/// place of the link to it on the Android host ([`link_game`]).
 pub(crate) const GAME_RELATIVE: &str = "prefix/drive_c/Program Files (x86)/Diablo II";
+/// The Managed game folder below the managed root on the Android host,
+/// outside the prefix.
+pub(crate) const ANDROID_GAME_RELATIVE: &str = "Diablo II";
+/// The target of the prefix's link to [`ANDROID_GAME_RELATIVE`], relative to
+/// the link's folder (`prefix/drive_c/Program Files (x86)`), so the link
+/// stays right when the app's data folder moves.
+pub(crate) const GAME_LINK_TARGET: &str = "../../../Diablo II";
+/// The folder of the prefix's game folder link.
+const GAME_LINK_FOLDER: &str = "prefix/drive_c/Program Files (x86)";
+/// The folder of the prefix state that the Android app keeps (the player's
+/// registry values; for the source Blizzard's installers, what those
+/// installers wrote outside the game folder), in the managed root. Start
+/// over removes it with the game.
+pub(crate) const ANDROID_PREFIX_STATE: &str = "prefix-state";
+
+/// The Managed game folder below the managed root on the Android host
+/// (`android`) or the desktop.
+pub(crate) const fn managed_relative(android: bool) -> &'static str {
+    if android {
+        ANDROID_GAME_RELATIVE
+    } else {
+        GAME_RELATIVE
+    }
+}
+
+/// The folder below the managed root that holds the records of an import
+/// ([`IMPORT_RECORD_NAME`], the copied client's mark): the prefix on the
+/// desktop, the managed root itself on the Android host (`android`), whose
+/// prefix is disposable.
+pub(crate) const fn records_relative(android: bool) -> &'static str {
+    if android { "" } else { "prefix" }
+}
+
+/// The records' folder ([`records_relative`]) of `root`, opened.
+pub(crate) fn records_directory(root: &Directory, android: bool) -> io::Result<Directory> {
+    match records_relative(android) {
+        "" => root.try_clone(),
+        relative => root.open_directory(Path::new(relative)),
+    }
+}
+
+/// Make the prefix's `C:\Program Files (x86)\Diablo II` a link to the
+/// Managed game folder of the Android host ([`GAME_LINK_TARGET`]). True when
+/// the link was made or replaced, false when it was already right. A link
+/// elsewhere is replaced; anything else in its place (a real folder: the
+/// game of an older layout, which the app moves out first) is left as it is
+/// and refused, never removed.
+pub(crate) fn link_game(root: &Directory) -> io::Result<bool> {
+    let folder = root.ensure_directory(Path::new(GAME_LINK_FOLDER))?;
+    let descriptor = folder.try_clone_file()?;
+    match rustix::fs::readlinkat(&descriptor, "Diablo II", Vec::new()) {
+        Ok(current) if current.as_bytes() == GAME_LINK_TARGET.as_bytes() => return Ok(false),
+        Ok(_) => rustix::fs::unlinkat(&descriptor, "Diablo II", rustix::fs::AtFlags::empty())?,
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(rustix::io::Errno::INVAL) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the prefix holds a game folder of its own, not the link",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    rustix::fs::symlinkat(GAME_LINK_TARGET, &descriptor, "Diablo II")?;
+    descriptor.sync_all()?;
+    Ok(true)
+}
+
+/// On the Android host (`android`): the game folder's link ([`link_game`])
+/// and the Managed game folder itself, empty when it is new, so a Windows
+/// program that installs there (Blizzard's installers, the PD2 installer)
+/// finds a folder and not a link that leads nowhere.
+pub(crate) fn prepare_game_location(root: &Directory, android: bool) -> io::Result<()> {
+    if !android {
+        return Ok(());
+    }
+    root.ensure_directory(Path::new(ANDROID_GAME_RELATIVE))?;
+    if link_game(root)? {
+        eprintln!("pd2-launcher: the prefix's game folder links to {ANDROID_GAME_RELATIVE}");
+    }
+    Ok(())
+}
+
+/// The `PWD` for a Wine program that starts in `working_directory` below the
+/// managed root `root` on the Android host (`android`): the same folder
+/// through the prefix's game folder link, when it is in the Managed game
+/// folder. Wine takes its start folder from `PWD` when `PWD` names the same
+/// folder as the working folder, and it names a path by its text: so the
+/// program starts in `C:\Program Files (x86)\Diablo II\...`. Without it Wine
+/// names the folder by its real path, below the read-only root drive `Z:`
+/// (no free space: the game refuses a new character). None elsewhere.
+pub(crate) fn wine_pwd(root: &Path, working_directory: &Path, android: bool) -> Option<PathBuf> {
+    if !android {
+        return None;
+    }
+    let below = working_directory
+        .strip_prefix(root.join(ANDROID_GAME_RELATIVE))
+        .ok()?;
+    let through = root.join(GAME_RELATIVE);
+    Some(if below.as_os_str().is_empty() {
+        through
+    } else {
+        through.join(below)
+    })
+}
 /// The same folder as Windows programs in the Managed prefix see it.
 pub(crate) const MANAGED_WINDOWS_PATH: &str = r"C:\Program Files (x86)\Diablo II";
 /// The record of a game folder used in place, in the Managed prefix.
 pub(crate) const POINTER_NAME: &str = ".pd2launcher-game-folder.json";
-/// The record that the game was imported, in the Managed prefix. The Android
-/// app reads that it is there (its storage words and its notice about the
-/// player's folder). The Auditor does not read it: the files prove the
-/// game. Its form is the one earlier releases wrote.
+/// The record that the game was imported, in the records' folder
+/// ([`records_relative`]: the Managed prefix, or the managed root on the
+/// Android host). The Android app reads that it is there (its storage words
+/// and its notice about the player's folder), and the Android host's audit
+/// takes an imported game's short list of files for it. Its form is the one
+/// earlier releases wrote.
 pub(crate) const IMPORT_RECORD_NAME: &str = ".pd2launcher-imported-game.json";
 const SCHEMA: u32 = 1;
 const RECORD_LIMIT: u64 = 8 * 1024;
@@ -211,8 +328,13 @@ impl GameFolder {
 
     /// Open the game folder. The Managed one is opened beneath the root.
     pub(crate) fn open(&self, root: &Directory) -> io::Result<Directory> {
+        self.open_on(root, crate::android_host())
+    }
+
+    /// [`Self::open`] on the Android host (`android`) or the desktop.
+    pub(crate) fn open_on(&self, root: &Directory, android: bool) -> io::Result<Directory> {
         match self {
-            Self::Managed => root.open_directory(Path::new(GAME_RELATIVE)),
+            Self::Managed => root.open_directory(Path::new(managed_relative(android))),
             Self::External(external) => external.open(),
         }
     }
@@ -232,8 +354,13 @@ impl GameFolder {
 
     /// The folder's host path, for working directories and diagnostics.
     pub(crate) fn host_path(&self, managed_root: &Path) -> PathBuf {
+        self.host_path_on(managed_root, crate::android_host())
+    }
+
+    /// [`Self::host_path`] on the Android host (`android`) or the desktop.
+    pub(crate) fn host_path_on(&self, managed_root: &Path, android: bool) -> PathBuf {
         match self {
-            Self::Managed => managed_root.join(GAME_RELATIVE),
+            Self::Managed => managed_root.join(managed_relative(android)),
             Self::External(external) => external.path.clone(),
         }
     }
@@ -303,10 +430,11 @@ struct ImportRecord<'a> {
     install_path: &'a str,
 }
 
-/// Write the import record, once the game is in place. The caller holds the
+/// Write the import record into the records' folder `records`
+/// ([`records_directory`]), once the game is in place. The caller holds the
 /// installation lease.
 pub(crate) fn write_import_record(
-    prefix: &Directory,
+    records: &Directory,
     mode: ImportMode,
     install_path: &str,
 ) -> io::Result<()> {
@@ -316,7 +444,7 @@ pub(crate) fn write_import_record(
         install_path,
     })
     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record encode failed"))?;
-    prefix.atomic_write(OsStr::new(IMPORT_RECORD_NAME), &bytes)
+    records.atomic_write(OsStr::new(IMPORT_RECORD_NAME), &bytes)
 }
 
 fn read_bounded(directory: &Directory, name: &str) -> Result<Option<Vec<u8>>, ()> {
@@ -920,7 +1048,10 @@ fn report_copy(control: &OperationControl, copied: u64, total: u64) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{fs, os::unix::fs::symlink};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, symlink},
+    };
 
     use super::*;
 
@@ -1403,6 +1534,120 @@ pub(crate) mod tests {
             fs::read_to_string(fixture.path().join(IMPORT_RECORD_NAME)).unwrap(),
             r#"{"schema":1,"mode":"in-place","install_path":"Z:\\games\\Diablo II"}"#
         );
+    }
+
+    /// A managed root with a prefix folder to link in, as the Android host
+    /// lays it out.
+    fn android_root() -> (tempfile::TempDir, Directory) {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("prefix/drive_c/Program Files (x86)")).unwrap();
+        let root = Directory::open(fixture.path()).unwrap();
+        (fixture, root)
+    }
+
+    #[test]
+    fn the_android_game_folder_is_outside_the_prefix_and_the_records_are_in_the_root() {
+        assert_eq!(managed_relative(true), "Diablo II");
+        assert_eq!(managed_relative(false), GAME_RELATIVE);
+        assert_eq!(records_relative(true), "");
+        assert_eq!(records_relative(false), "prefix");
+        let fixture = tempfile::tempdir().unwrap();
+        assert_eq!(
+            GameFolder::Managed.host_path_on(fixture.path(), true),
+            fixture.path().join("Diablo II")
+        );
+        assert_eq!(
+            GameFolder::Managed.host_path_on(fixture.path(), false),
+            fixture.path().join(GAME_RELATIVE)
+        );
+        // Wine sees it at the same place on both hosts.
+        assert_eq!(
+            GameFolder::Managed.windows_path(),
+            r"C:\Program Files (x86)\Diablo II"
+        );
+    }
+
+    #[test]
+    fn the_game_folder_link_is_relative_and_replaces_only_a_link() {
+        let (fixture, root) = android_root();
+        let link = fixture.path().join(GAME_RELATIVE);
+        assert!(link_game(&root).unwrap());
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new(GAME_LINK_TARGET));
+        // Again: nothing changes.
+        assert!(!link_game(&root).unwrap());
+        // It leads to the game folder outside the prefix.
+        fs::create_dir_all(fixture.path().join("Diablo II/ProjectD2")).unwrap();
+        assert!(link.join("ProjectD2").is_dir());
+        // A link elsewhere is replaced, and only the link goes.
+        let elsewhere = fixture.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&elsewhere, &link).unwrap();
+        assert!(link_game(&root).unwrap());
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new(GAME_LINK_TARGET));
+        assert_eq!(fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_game_folder_inside_the_prefix_is_refused_and_kept() {
+        let (fixture, root) = android_root();
+        // The layout before the disposable prefix: the game in the prefix.
+        let game = fixture.path().join(GAME_RELATIVE);
+        fs::create_dir_all(game.join("Save")).unwrap();
+        fs::write(game.join("Save/hero.d2s"), b"hero").unwrap();
+        assert!(link_game(&root).is_err());
+        assert!(prepare_game_location(&root, true).is_err());
+        assert!(fs::symlink_metadata(&game).unwrap().is_dir());
+        assert_eq!(fs::read(game.join("Save/hero.d2s")).unwrap(), b"hero");
+    }
+
+    #[test]
+    fn the_game_location_and_its_link_are_made_only_on_android() {
+        let (fixture, root) = android_root();
+        prepare_game_location(&root, false).unwrap();
+        assert!(!fixture.path().join("Diablo II").exists());
+        assert!(fs::symlink_metadata(fixture.path().join(GAME_RELATIVE)).is_err());
+        prepare_game_location(&root, true).unwrap();
+        assert!(fixture.path().join("Diablo II").is_dir());
+        assert_eq!(
+            fs::read_link(fixture.path().join(GAME_RELATIVE)).unwrap(),
+            Path::new(GAME_LINK_TARGET)
+        );
+        // A game there stays as it is.
+        fs::write(fixture.path().join("Diablo II/Game.exe"), b"game").unwrap();
+        prepare_game_location(&root, true).unwrap();
+        assert_eq!(
+            fs::read(fixture.path().join("Diablo II/Game.exe")).unwrap(),
+            b"game"
+        );
+    }
+
+    #[test]
+    fn wine_starts_in_the_game_folder_through_the_link() {
+        let (fixture, root) = android_root();
+        let managed = fixture.path();
+        prepare_game_location(&root, true).unwrap();
+        let project = managed.join("Diablo II/ProjectD2");
+        fs::create_dir_all(&project).unwrap();
+        let pwd = wine_pwd(managed, &project, true).unwrap();
+        // The path through the prefix's C: drive, whose text Wine names
+        // C:\Program Files (x86)\Diablo II\ProjectD2.
+        assert_eq!(
+            pwd,
+            managed.join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2")
+        );
+        // Wine takes PWD only when it names the working folder itself.
+        let (by_pwd, real) = (fs::metadata(&pwd).unwrap(), fs::metadata(&project).unwrap());
+        assert_eq!((by_pwd.dev(), by_pwd.ino()), (real.dev(), real.ino()));
+        assert_eq!(
+            wine_pwd(managed, &managed.join("Diablo II"), true).unwrap(),
+            managed.join(GAME_RELATIVE)
+        );
+        // Outside the game folder, and on the desktop: no PWD.
+        assert_eq!(wine_pwd(managed, managed, true), None);
+        assert_eq!(wine_pwd(managed, &managed.join("cache"), true), None);
+        assert_eq!(wine_pwd(managed, &project, false), None);
     }
 
     #[test]

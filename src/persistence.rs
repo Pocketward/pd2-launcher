@@ -216,7 +216,8 @@ impl LauncherPaths {
 
     pub(crate) fn project_d2_root(&self) -> PathBuf {
         self.managed_root()
-            .join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2")
+            .join(crate::game_folder::managed_relative(crate::android_host()))
+            .join("ProjectD2")
     }
 
     #[cfg(test)]

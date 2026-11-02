@@ -3059,6 +3059,16 @@ impl ProductionInstallDriver {
         for (name, value) in environment {
             request = request.with_environment(name, value);
         }
+        // A program that starts in the game folder outside the Android
+        // host's prefix sees it as C:\Program Files (x86)\Diablo II, not on
+        // the root drive (`game_folder::wine_pwd`).
+        if let Some(pwd) = crate::game_folder::wine_pwd(
+            invocation.paths.root(),
+            invocation.working_directory,
+            invocation.paths.android(),
+        ) {
+            request = request.with_environment("PWD", pwd);
+        }
         for argument in invocation.arguments {
             request = request.with_argument(argument);
         }
@@ -3807,15 +3817,19 @@ pub(crate) fn gl_probe_helper() -> Option<File> {
     .ok()
 }
 
-/// Copies the Android app's prefix template (`runtime::APP_PREFIX_TEMPLATE`)
-/// to `prefix` in the managed root `root`: folders, files with their modes,
+/// Copies the Android app's prefix template `template` (PLAIN,
+/// `runtime::APP_PREFIX_TEMPLATE`, or GOLDEN) to `prefix` in the managed
+/// root `root`: folders, files with their modes,
 /// and links as they are (most of its files are relative links into the
 /// app's Wine). The copy is made under a temporary name, every file and
 /// folder of it is synced, and only then is it renamed into place, so a
 /// stop or a crash part way leaves no prefix, and never a short hive under
 /// the prefix's name. A folder gets its mode after its entries, so a
 /// template folder without the owner's write is copied too.
-fn copy_app_prefix_template(root: &Path) -> io::Result<()> {
+fn copy_app_prefix_template(
+    root: &Path,
+    template: crate::runtime::PrefixTemplate,
+) -> io::Result<()> {
     fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
         fs::create_dir(to)?;
         // Opened while the owner can write it: its mode comes last.
@@ -3836,7 +3850,7 @@ fn copy_app_prefix_template(root: &Path) -> io::Result<()> {
         folder.set_permissions(fs::metadata(from)?.permissions())?;
         folder.sync_all()
     }
-    let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+    let template = root.join(template.directory());
     if !template.join("system.reg").is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -4469,6 +4483,46 @@ fn in_place_install_path(
     Ok(install_path)
 }
 
+/// The Android host's import: the app's checked copy `existing` (opened as
+/// `source`, its identity proven) becomes the Managed game folder outside the
+/// prefix by one rename (both are on the app's data partition), and the
+/// prefix's link leads to it. An empty game folder (the setup made it) gives
+/// way first; one with files refuses the import, and so does a copy that is
+/// on another file system: nothing is copied or removed then.
+fn adopt_android_import(
+    paths: &ManagedPaths,
+    existing: &crate::game_folder::ExistingInstall,
+    source: &Directory,
+) -> Result<(), AdapterFailure> {
+    let path = existing.path();
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(AdapterFailure::here());
+    };
+    let parent = Directory::open(parent).map_err(|_| AdapterFailure::here())?;
+    let root = paths.directory();
+    let target = OsStr::new(crate::game_folder::ANDROID_GAME_RELATIVE);
+    match root.open_directory(Path::new(target)) {
+        Ok(folder) if folder.names().is_ok_and(|names| names.is_empty()) => root
+            .remove_empty_directory(target)
+            .map_err(|_| AdapterFailure::here())?,
+        Ok(_) => {
+            eprintln!("pd2-launcher: the game folder has files already; the import stops");
+            return Err(AdapterFailure::here());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(AdapterFailure::here()),
+    }
+    parent
+        .rename_directory_noreplace(name, source, root, target)
+        .map_err(|error| {
+            eprintln!("pd2-launcher: the copy did not move into the game folder: {error}");
+            AdapterFailure::here()
+        })?;
+    crate::game_folder::link_game(root).map_err(|_| AdapterFailure::here())?;
+    eprintln!("pd2-launcher: the imported copy is the game folder now");
+    Ok(())
+}
+
 /// A folder used in place is reached through Wine's `Z:` drive, which must
 /// map the host root in this prefix.
 fn require_host_root_drive(paths: &ManagedPaths) -> Result<(), AdapterFailure> {
@@ -4577,18 +4631,23 @@ fn wrapper_arguments() -> Vec<OsString> {
 
 impl ProductionInstallDriver {
     /// The Android app's prefix, while the audit rejects the runtime or the
-    /// prefix (only then does the setup come here): a new one is a copy of
-    /// the app's prefix template (made by the same Wine, so no `wineboot`
-    /// runs on the phone; it carries `"UseEGL"="N"`), with the XInput bridge
-    /// and the official launcher's WPF setting. The prefix gets GLX for
-    /// OpenGL ([`X11_DRIVER_KEY`]) when its `user.reg` lacks it, and the
-    /// link to the app's .NET. A prefix Wine never finished is made again;
-    /// any other one is kept as it is.
+    /// prefix, or the prefix was made from the other template before the
+    /// game was there (only then does the setup come here): a new one is a
+    /// copy of the app's prefix template `template` (made by the same Wine,
+    /// so no `wineboot` runs on the phone; it carries `"UseEGL"="N"`), with
+    /// the XInput bridge and the official launcher's WPF setting. The prefix
+    /// gets GLX for OpenGL ([`X11_DRIVER_KEY`]) when its `user.reg` lacks
+    /// it, the link to the app's .NET and, on the Android host's layout, the
+    /// link to the game folder outside it
+    /// ([`crate::game_folder::prepare_game_location`]). A prefix Wine never
+    /// finished is made again; any other one is kept as it is.
+    #[allow(clippy::too_many_arguments)]
     fn provision_app_prefix(
         &self,
         paths: &ManagedPaths,
         runtime: InstalledRuntime,
         new_prefix: bool,
+        template: crate::runtime::PrefixTemplate,
         parts: &mut EnvironmentParts<'_>,
         mutation_lease: &File,
         control: &OperationControl,
@@ -4606,10 +4665,14 @@ impl ProductionInstallDriver {
                     .remove_owned_tree(OsStr::new("prefix"))
                     .map_err(|_| AdapterFailure::here())?;
             }
-            copy_app_prefix_template(root).map_err(|error| {
+            copy_app_prefix_template(root, template).map_err(|error| {
                 eprintln!("pd2-launcher: the prefix template was not copied: {error}");
                 AdapterFailure::here()
             })?;
+            eprintln!(
+                "pd2-launcher: the prefix is a copy of the {} template",
+                template.mark()
+            );
             install_xinput_bridge(paths.directory()).map_err(|_| AdapterFailure::here())?;
             if self.wpf_software_rendering {
                 let _ = self.sync_wpf_software_rendering(paths, runtime, mutation_lease, control);
@@ -4633,7 +4696,13 @@ impl ProductionInstallDriver {
         link_app_dotnet(paths.root()).map_err(|error| {
             eprintln!("pd2-launcher: the .NET link was not made: {error}");
             AdapterFailure::here()
-        })
+        })?;
+        crate::game_folder::prepare_game_location(paths.directory(), paths.android()).map_err(
+            |error| {
+                eprintln!("pd2-launcher: the game folder's link was not made: {error}");
+                AdapterFailure::here()
+            },
+        )
     }
 
     /// Run a downloader wrapper to fetch its complete payload into
@@ -4767,7 +4836,8 @@ impl ProductionInstallDriver {
         mutation_lease: &File,
         control: &OperationControl,
     ) -> Result<(), AdapterFailure> {
-        let paths = ManagedPaths::prepare(managed_root).map_err(|_| AdapterFailure::here())?;
+        let paths = ManagedPaths::prepare_on(managed_root, self.android)
+            .map_err(|_| AdapterFailure::here())?;
         let project = paths.game().join("ProjectD2");
         // It updates itself, so it has no pin; it must still be a regular
         // Windows executable inside the managed ProjectD2 directory.
@@ -4793,6 +4863,12 @@ impl ProductionInstallDriver {
             && let Err(error) = crate::in_place_drive::link(paths.directory(), &folder)
         {
             eprintln!("pd2-launcher: the G: drive was not linked: {error}");
+        }
+        // The prefix's link to the game folder outside it, as before the game.
+        if paths.android()
+            && let Err(error) = crate::game_folder::link_game(paths.directory())
+        {
+            eprintln!("pd2-launcher: the game folder's link was not made: {error}");
         }
         // It can start the game, whose D2GL loads the DLLs d2gl.json names:
         // as before a Play, they must be PD2's own.
@@ -4875,6 +4951,7 @@ impl InstallDriver for ProductionInstallDriver {
             gecko,
             mono,
             dotnet,
+            template,
         } = prefix_artifacts;
         if wine.is_some_and(|wine| wine.kind() != ArtifactKind::ManagedRuntime)
             || gecko.is_some_and(|gecko| gecko.kind() != ArtifactKind::Gecko)
@@ -4886,7 +4963,10 @@ impl InstallDriver for ProductionInstallDriver {
         // The parts this setup runs, reported as each starts. A prefix that
         // is not there yet (or is made again below) is made in the first.
         let new_prefix = match paths.directory().open_directory(Path::new("prefix")) {
-            Ok(prefix) => abandoned_prefix(&prefix),
+            Ok(prefix) => {
+                abandoned_prefix(&prefix)
+                    || crate::install::prefix_has_other_template(paths, template)
+            }
             Err(error) => error.kind() == io::ErrorKind::NotFound,
         };
         let mut parts = EnvironmentParts {
@@ -4916,6 +4996,7 @@ impl InstallDriver for ProductionInstallDriver {
                 paths,
                 runtime,
                 new_prefix,
+                template,
                 &mut parts,
                 mutation_lease,
                 control,
@@ -5115,6 +5196,16 @@ impl InstallDriver for ProductionInstallDriver {
             .open()
             .map_err(|_| AdapterFailure::here())?;
         let install_path = match mode {
+            // On the Android host's layout the app's checked copy becomes the
+            // Managed game folder, outside the prefix: one rename, no copy, no
+            // G: drive and no record of a folder used in place.
+            ImportMode::InPlace if paths.android() => {
+                if !crate::game_folder::usable_in_place(existing) {
+                    return Err(AdapterFailure::here());
+                }
+                adopt_android_import(paths, existing, &source)?;
+                crate::game_folder::MANAGED_WINDOWS_PATH.to_owned()
+            }
             ImportMode::Copy => {
                 let program_files = paths
                     .directory()
@@ -5148,17 +5239,19 @@ impl InstallDriver for ProductionInstallDriver {
         };
         reject_artifact_cancelled(control)?;
         // No registry value is written: the game writes `InstallPath` when
-        // the value is missing, and the files prove the game.
-        let prefix = paths
-            .directory()
-            .open_directory(Path::new("prefix"))
-            .map_err(|_| AdapterFailure::here())?;
-        if mode == ImportMode::InPlace {
+        // the value is missing (the Android host's GOLDEN template has the
+        // installers' value), and the files prove the game.
+        if mode == ImportMode::InPlace && !paths.android() {
+            let prefix = paths
+                .directory()
+                .open_directory(Path::new("prefix"))
+                .map_err(|_| AdapterFailure::here())?;
             crate::game_folder::write_pointer(&prefix, existing.folder())
                 .map_err(|_| AdapterFailure::here())?;
         }
         // Last, the record that the game was imported, for the Android app.
-        crate::game_folder::write_import_record(&prefix, mode, &install_path)
+        let records = paths.records().map_err(|_| AdapterFailure::here())?;
+        crate::game_folder::write_import_record(&records, mode, &install_path)
             .map_err(|_| AdapterFailure::here())
     }
 
@@ -5175,6 +5268,17 @@ impl InstallDriver for ProductionInstallDriver {
         if request.artifact().kind() != expected_kind {
             return Err(VendorFailure::Install);
         }
+        // Blizzard's installer installs into C:\Program Files (x86)\Diablo II:
+        // on the Android host's layout, the link to the game folder outside
+        // the prefix, and that folder.
+        crate::game_folder::prepare_game_location(
+            request.paths().directory(),
+            request.paths().android(),
+        )
+        .map_err(|error| {
+            eprintln!("pd2-launcher: the game folder's link was not made: {error}");
+            VendorFailure::Install
+        })?;
         let payload_directory =
             managed_complete_payload_directory(request.artifact(), request.paths())?;
         let downloaded;
@@ -5241,6 +5345,14 @@ impl InstallDriver for ProductionInstallDriver {
         if bootstrap.kind() != ArtifactKind::ClientBootstrap {
             return Err(AdapterFailure::here());
         }
+        // It installs into the game folder (`/DIR=`): on the Android host's
+        // layout, through the prefix's link to the folder outside it.
+        crate::game_folder::prepare_game_location(paths.directory(), paths.android()).map_err(
+            |error| {
+                eprintln!("pd2-launcher: the game folder's link was not made: {error}");
+                AdapterFailure::here()
+            },
+        )?;
         // On the Android host it runs from a checked copy under its own file
         // name (`android_client_installer`).
         let android_copy = if self.android {
@@ -9524,10 +9636,14 @@ mod tests {
         );
         // Each kind of host, whatever the host the test runs on.
         for (translated, android) in [(true, true), (true, false), (false, true), (false, false)] {
-            let (fixture, paths) = managed_paths_with_runtime();
+            let (fixture, _) = managed_paths_with_runtime();
             app_runtime_fixture(fixture.path());
             initialized_prefix_fixture(fixture.path());
-            let project = paths.game().join("ProjectD2");
+            // The game folder of the host's layout (on Android outside the prefix).
+            let project = ManagedPaths::prepare_on(fixture.path(), android)
+                .unwrap()
+                .game()
+                .join("ProjectD2");
             fs::create_dir_all(&project).unwrap();
             fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
             let lease = fixture_lease(fixture.path());
@@ -10111,14 +10227,19 @@ mod tests {
         let host = Arc::new(StalledDownloadHost::default());
         let lease = fixture_lease(fixture.path());
         // Data comes in for six seconds; nothing is written to the folder.
+        // The count is written whole through a rename, as the app writes it
+        // (ReceivedBytes.kt): a plain write empties the file first, and a
+        // watch that reads it then counts no data.
         let feeder = {
             let counter = counter.clone();
             thread::spawn(move || {
                 let started = Instant::now();
                 let mut bytes = 0u64;
+                let temporary = counter.with_extension("tmp");
                 while started.elapsed() < Duration::from_secs(6) {
                     bytes += 128 * 1024;
-                    fs::write(&counter, format!("{bytes}\n")).unwrap();
+                    fs::write(&temporary, format!("{bytes}\n")).unwrap();
+                    fs::rename(&temporary, &counter).unwrap();
                     thread::sleep(Duration::from_millis(300));
                 }
                 Instant::now()
@@ -10127,21 +10248,22 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let driver_host = host.clone();
         thread::spawn(move || {
+            // Twice the watch's interval, so one late look does not stop it.
             let failure = ProductionInstallDriver::new(driver_host)
-                .with_download_stall_limit(Duration::from_secs(1))
+                .with_download_stall_limit(Duration::from_secs(2))
                 .with_received_bytes(counter)
                 .download_vendor_payload(&paths, &artifact, &lease, &OperationControl::default())
                 .unwrap_err();
             let _ = sender.send((failure, Instant::now()));
-            drop(fixture);
         });
         let (failure, stopped) = receiver
             .recv_timeout(Duration::from_secs(30))
             .expect("the downloader was not stopped once the data stopped");
         let fed_until = feeder.join().unwrap();
+        drop(fixture);
         assert_eq!(failure, VendorFailure::DownloadStalled);
         // Stopped only once no data came for the limit after the feed ended:
-        // with the folder alone it would have stopped a second after arming.
+        // with the folder alone it would have stopped two seconds after arming.
         assert!(
             stopped >= fed_until + Duration::from_millis(500),
             "stopped {:?} before the feed ended",
@@ -11987,7 +12109,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path();
         // No template: no prefix, and nothing half made.
-        assert!(copy_app_prefix_template(root).is_err());
+        assert!(copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain).is_err());
         assert!(!root.join("prefix").exists());
         let template = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
         let system32 = template.join("drive_c/windows/system32");
@@ -12005,7 +12127,7 @@ mod tests {
         .unwrap();
         // A copy cut short before is replaced.
         fs::create_dir_all(root.join(".prefix.partial/stale")).unwrap();
-        copy_app_prefix_template(root).unwrap();
+        copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain).unwrap();
         let prefix = root.join("prefix");
         assert!(!root.join(".prefix.partial").exists());
         assert_eq!(
@@ -12121,7 +12243,7 @@ mod tests {
         let windows = template.join("drive_c/windows");
         fs::write(windows.join("win.ini"), b"[windows]\n").unwrap();
         fs::set_permissions(&windows, fs::Permissions::from_mode(0o555)).unwrap();
-        let copied = copy_app_prefix_template(root);
+        let copied = copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain);
         let copy = root.join("prefix/drive_c/windows");
         let mode = fs::metadata(&copy).map(|metadata| metadata.permissions().mode() & 0o777);
         writable_again(&[
@@ -12149,11 +12271,11 @@ mod tests {
             // Root reads every file: nothing to show.
             return;
         }
-        assert!(copy_app_prefix_template(root).is_err());
+        assert!(copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain).is_err());
         assert!(!root.join("prefix").exists(), "no prefix from a part");
         // The next copy goes to the end, and only then has the name.
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
-        copy_app_prefix_template(root).unwrap();
+        copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain).unwrap();
         assert!(!root.join(".prefix.partial").exists());
         let prefix = root.join("prefix");
         assert_eq!(
@@ -12176,7 +12298,7 @@ mod tests {
         fs::create_dir_all(&stale).unwrap();
         fs::write(stale.join("leftover.dll"), b"MZ").unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o555)).unwrap();
-        let copied = copy_app_prefix_template(root);
+        let copied = copy_app_prefix_template(root, crate::runtime::PrefixTemplate::Plain);
         writable_again(&[stale]);
         copied.unwrap();
         assert!(!root.join(".prefix.partial").exists());
@@ -12296,6 +12418,290 @@ mod tests {
             Path::new(crate::runtime::APP_DOTNET_LINK_TARGET)
         );
         assert!(parts.lock().unwrap().is_empty());
+    }
+
+    /// The GOLDEN template beside the PLAIN one of `root`: the PLAIN copy
+    /// with a file of the golden layer, and each template's mark.
+    fn golden_template_fixture(root: &Path) {
+        let plain = root.join(crate::runtime::APP_PREFIX_TEMPLATE);
+        fs::write(plain.join(crate::runtime::PREFIX_TEMPLATE_MARK), b"plain\n").unwrap();
+        let golden = root.join(crate::runtime::APP_PREFIX_TEMPLATE_GOLDEN);
+        LegacyCopy::tree(&plain, &golden);
+        fs::write(
+            golden.join(crate::runtime::PREFIX_TEMPLATE_MARK),
+            b"golden\n",
+        )
+        .unwrap();
+        fs::write(
+            golden.join("drive_c/windows/syswow64/mfc140u.dll"),
+            b"MZ golden",
+        )
+        .unwrap();
+    }
+
+    /// A plain copy of a fixture's folder tree (files and folders).
+    struct LegacyCopy;
+
+    impl LegacyCopy {
+        fn tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    Self::tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The Android host's managed root: the runtime, both templates, the
+    /// layout with the game folder outside the prefix, and the lease.
+    fn android_layout_fixture() -> (tempfile::TempDir, ManagedPaths, File) {
+        let fixture = tempfile::tempdir().unwrap();
+        app_runtime_fixture(fixture.path());
+        app_prefix_template_fixture(fixture.path());
+        golden_template_fixture(fixture.path());
+        let paths = ManagedPaths::prepare_on(fixture.path(), true).unwrap();
+        let lease = fixture_lease(fixture.path());
+        (fixture, paths, lease)
+    }
+
+    fn template_mark(root: &Path) -> String {
+        fs::read_to_string(
+            root.join("prefix")
+                .join(crate::runtime::PREFIX_TEMPLATE_MARK),
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    }
+
+    #[test]
+    fn on_android_a_new_prefix_is_a_copy_of_the_sources_template_with_the_game_link() {
+        for template in [
+            crate::runtime::PrefixTemplate::Plain,
+            crate::runtime::PrefixTemplate::Golden,
+        ] {
+            let (fixture, paths, lease) = android_layout_fixture();
+            let root = fixture.path();
+            ProductionInstallDriver::new(Arc::new(RecordingHost::default()))
+                .on_android_host(true)
+                .provision_runtime(
+                    &paths,
+                    None,
+                    PrefixArtifacts {
+                        template,
+                        ..PrefixArtifacts::default()
+                    },
+                    &lease,
+                    &OperationControl::default(),
+                )
+                .unwrap();
+            assert_eq!(template_mark(root), template.mark());
+            assert_eq!(
+                root.join("prefix/drive_c/windows/syswow64/mfc140u.dll")
+                    .exists(),
+                template == crate::runtime::PrefixTemplate::Golden
+            );
+            // The game folder outside the prefix, and the link to it.
+            assert!(
+                root.join(crate::game_folder::ANDROID_GAME_RELATIVE)
+                    .is_dir()
+            );
+            assert_eq!(
+                fs::read_link(root.join(crate::game_folder::GAME_RELATIVE)).unwrap(),
+                Path::new(crate::game_folder::GAME_LINK_TARGET)
+            );
+        }
+    }
+
+    #[test]
+    fn on_android_the_prefix_of_the_other_template_is_made_again_before_the_game() {
+        let (fixture, paths, lease) = android_layout_fixture();
+        let root = fixture.path();
+        let golden = PrefixArtifacts {
+            template: crate::runtime::PrefixTemplate::Golden,
+            ..PrefixArtifacts::default()
+        };
+        let driver =
+            ProductionInstallDriver::new(Arc::new(RecordingHost::default())).on_android_host(true);
+        let control = OperationControl::default();
+        // Blizzard's installers first made a PLAIN prefix; then the player
+        // chose Fast download before any file of the game was there.
+        driver
+            .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+            .unwrap();
+        assert_eq!(template_mark(root), "plain");
+        driver
+            .provision_runtime(&paths, None, golden, &lease, &control)
+            .unwrap();
+        assert_eq!(template_mark(root), "golden");
+        // With a file of the game there, the prefix is kept.
+        let game = root.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        fs::write(game.join("Game.exe"), b"game").unwrap();
+        driver
+            .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+            .unwrap();
+        assert_eq!(template_mark(root), "golden");
+        assert_eq!(fs::read(game.join("Game.exe")).unwrap(), b"game");
+    }
+
+    #[test]
+    fn on_android_an_import_moves_the_copy_into_the_game_folder_by_one_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let (fixture, paths, lease) = android_layout_fixture();
+        let root = fixture.path();
+        let driver =
+            ProductionInstallDriver::new(Arc::new(RecordingHost::default())).on_android_host(true);
+        let control = OperationControl::default();
+        driver
+            .provision_runtime(
+                &paths,
+                None,
+                PrefixArtifacts {
+                    template: crate::runtime::PrefixTemplate::Golden,
+                    ..PrefixArtifacts::default()
+                },
+                &lease,
+                &control,
+            )
+            .unwrap();
+        // The app's checked copy, below its own token folder outside the
+        // managed root (on the same file system).
+        let files = tempfile::tempdir_in(fixture.path().parent().unwrap()).unwrap();
+        let copy = files.path().join("import/t1/Diablo II");
+        crate::game_folder::tests::write_game_folder(&copy, b"game", b"archive");
+        fs::write(copy.join("ProjectD2/loot.filter"), b"mine").unwrap();
+        let inode = fs::metadata(&copy).unwrap().ino();
+        let existing = crate::game_folder::validate_existing(&copy, root).unwrap();
+        driver
+            .import_existing(
+                &paths,
+                &existing,
+                crate::game_folder::ImportMode::InPlace,
+                &control,
+            )
+            .unwrap();
+        let game = root.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        // The same folder (a rename, no copy), with everything in it.
+        assert_eq!(fs::metadata(&game).unwrap().ino(), inode);
+        assert!(!copy.exists());
+        assert_eq!(
+            fs::read(game.join("ProjectD2/loot.filter")).unwrap(),
+            b"mine"
+        );
+        assert_eq!(fs::read(game.join("Save/hero.d2s")).unwrap(), b"hero");
+        // Through the link at C:\Program Files (x86)\Diablo II; no G: drive
+        // and no record of a folder used in place.
+        assert!(
+            root.join(crate::game_folder::GAME_RELATIVE)
+                .join("Game.exe")
+                .is_file()
+        );
+        assert!(fs::symlink_metadata(root.join("prefix/dosdevices/g:")).is_err());
+        assert!(
+            !root
+                .join("prefix")
+                .join(crate::game_folder::POINTER_NAME)
+                .exists()
+        );
+        // The import record is in the managed root, with the C: path.
+        assert!(
+            !root
+                .join("prefix")
+                .join(crate::game_folder::IMPORT_RECORD_NAME)
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(crate::game_folder::IMPORT_RECORD_NAME)).unwrap(),
+            r#"{"schema":1,"mode":"in-place","install_path":"C:\\Program Files (x86)\\Diablo II"}"#
+        );
+        assert_eq!(
+            crate::game_folder::GameFolder::read(paths.directory()),
+            Ok(crate::game_folder::GameFolder::Managed)
+        );
+    }
+
+    #[test]
+    fn on_android_an_import_into_a_game_folder_with_files_moves_nothing() {
+        let (fixture, paths, lease) = android_layout_fixture();
+        let root = fixture.path();
+        let driver =
+            ProductionInstallDriver::new(Arc::new(RecordingHost::default())).on_android_host(true);
+        let control = OperationControl::default();
+        driver
+            .provision_runtime(&paths, None, PrefixArtifacts::default(), &lease, &control)
+            .unwrap();
+        let game = root.join(crate::game_folder::ANDROID_GAME_RELATIVE);
+        fs::write(game.join("Game.exe"), b"other game").unwrap();
+        let files = tempfile::tempdir_in(fixture.path().parent().unwrap()).unwrap();
+        let copy = files.path().join("import/t1/Diablo II");
+        crate::game_folder::tests::write_game_folder(&copy, b"game", b"archive");
+        let existing = crate::game_folder::validate_existing(&copy, root).unwrap();
+        assert!(
+            driver
+                .import_existing(
+                    &paths,
+                    &existing,
+                    crate::game_folder::ImportMode::InPlace,
+                    &control,
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(copy.join("Game.exe")).unwrap(), b"game");
+        assert_eq!(fs::read(game.join("Game.exe")).unwrap(), b"other game");
+        assert!(!root.join(crate::game_folder::IMPORT_RECORD_NAME).exists());
+    }
+
+    #[test]
+    fn on_android_the_official_launcher_starts_in_the_game_folder_through_the_link() {
+        use std::os::unix::fs::MetadataExt;
+        for android in [true, false] {
+            let (fixture, _) = managed_paths_with_runtime();
+            let root = fixture.path();
+            app_runtime_fixture(root);
+            initialized_prefix_fixture(root);
+            fs::create_dir_all(root.join("prefix/drive_c/Program Files (x86)")).unwrap();
+            let paths = ManagedPaths::prepare_on(root, android).unwrap();
+            let project = paths.game().join("ProjectD2");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
+            let lease = fixture_lease(root);
+            let host = Arc::new(RecordingHost::default());
+            ProductionInstallDriver::new(host.clone())
+                .on_android_host(android)
+                .run_official_launcher(root, &lease, &OperationControl::default())
+                .unwrap();
+            let requests = host.requests.lock().unwrap();
+            let launcher = requests
+                .iter()
+                .find(|request| {
+                    request
+                        .arguments
+                        .ends_with(&[OsString::from(OFFICIAL_LAUNCHER)])
+                })
+                .unwrap();
+            assert_eq!(
+                launcher.working_directory.as_deref(),
+                Some(project.as_path())
+            );
+            let pwd = environment_value(launcher, "PWD");
+            if android {
+                let pwd = Path::new(pwd.unwrap());
+                assert_eq!(
+                    pwd,
+                    root.join("prefix/drive_c/Program Files (x86)/Diablo II/ProjectD2")
+                );
+                // The same folder as the working folder, through the link.
+                let (by_pwd, real) = (fs::metadata(pwd).unwrap(), fs::metadata(&project).unwrap());
+                assert_eq!((by_pwd.dev(), by_pwd.ino()), (real.dev(), real.ino()));
+            } else {
+                assert_eq!(pwd, None);
+            }
+        }
     }
 
     /// Records the arguments of every request. The first `reg` runs until
@@ -12442,7 +12848,11 @@ mod tests {
             let (fixture, paths) = managed_paths_with_runtime();
             app_runtime_fixture(fixture.path());
             initialized_prefix_fixture(fixture.path());
-            let project = paths.game().join("ProjectD2");
+            // The game folder of the host's layout (on Android outside the prefix).
+            let project = ManagedPaths::prepare_on(fixture.path(), android)
+                .unwrap()
+                .game()
+                .join("ProjectD2");
             fs::create_dir_all(&project).unwrap();
             fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
             let lease = fixture_lease(fixture.path());
@@ -12504,10 +12914,14 @@ mod tests {
     #[test]
     fn the_official_launcher_gets_detailed_logging_and_strict_memory_order_as_asked() {
         for (strict, detailed) in [(false, false), (false, true), (true, false), (true, true)] {
-            let (fixture, paths) = managed_paths_with_runtime();
+            let (fixture, _) = managed_paths_with_runtime();
             app_runtime_fixture(fixture.path());
             initialized_prefix_fixture(fixture.path());
-            let project = paths.game().join("ProjectD2");
+            // The game folder of the host's layout (on Android outside the prefix).
+            let project = ManagedPaths::prepare_on(fixture.path(), true)
+                .unwrap()
+                .game()
+                .join("ProjectD2");
             fs::create_dir_all(&project).unwrap();
             fs::write(project.join(OFFICIAL_LAUNCHER), minimal_pe()).unwrap();
             let lease = fixture_lease(fixture.path());
@@ -12912,6 +13326,7 @@ mod tests {
                     gecko: None,
                     mono: Some(&mono),
                     dotnet: Some(&dotnet),
+                    ..PrefixArtifacts::default()
                 },
                 &lease,
                 &control,
@@ -12986,6 +13401,7 @@ mod tests {
                     gecko: None,
                     mono: Some(&mono),
                     dotnet: Some(&dotnet),
+                    ..PrefixArtifacts::default()
                 },
                 &lease,
                 &OperationControl::default(),
@@ -13040,6 +13456,7 @@ mod tests {
                 gecko: Some(&gecko),
                 mono: Some(&mono),
                 dotnet: None,
+                ..PrefixArtifacts::default()
             },
         ] {
             let host = Arc::new(RecordingHost::default());
@@ -13133,6 +13550,7 @@ mod tests {
                 gecko: Some(&gecko),
                 mono: Some(&mono),
                 dotnet: Some(&dotnet),
+                ..PrefixArtifacts::default()
             },
             &lease,
             &control,
@@ -13185,6 +13603,7 @@ mod tests {
                         gecko: Some(&gecko),
                         mono: Some(&mono),
                         dotnet: Some(&dotnet),
+                        ..PrefixArtifacts::default()
                     },
                     &lease,
                     &OperationControl::default(),

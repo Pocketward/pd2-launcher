@@ -10,6 +10,13 @@
 //! stage left part way reports `StageInterrupted`, which only a confirmed
 //! Start over resolves, instead of `Indeterminate`.
 //!
+//! On the Android host Start over itself writes a started base-game record
+//! before its first removal and clears it after its last one
+//! (`install::start_over_android`): a Start over that a stop left part way
+//! then reads as an interrupted step while a file of the game is there, and
+//! the player's next Start over finishes it; it never reads as a Ready
+//! installation.
+//!
 //! The games are proven by their files alone, and a file can be
 //! there but short while it is written. So for a game stage that is not
 //! finished, any file it wrote means the stage stopped part way; a

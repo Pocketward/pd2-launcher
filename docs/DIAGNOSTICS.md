@@ -21,6 +21,9 @@ file's location. Attach the file when you open an issue.
 
 - `summary.txt`: the Launcher's version, the system, session and GPU, each
   setup step's state, and the most recent failure with its code and reason.
+  In PD2 Launcher for Android, an `Android` line (the Android version and
+  SDK, the device, its GPU, the kernel and the memory page size) is there in
+  place of the system, session and GPU lines.
 - `report.json`: the same in detail: step 1's checks of the computer, a
   read-only check of the installation, the setup steps, the recent jobs with
   their failure codes, and the settings (download sources by host name only).

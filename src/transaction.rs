@@ -3621,6 +3621,51 @@ mod tests {
         reclaimed_staging_is_clean(&Directory::open(&staging).unwrap()).unwrap();
     }
 
+    /// A Start over on the Android host that a stop left inside the removal
+    /// of the game folder, with the update records of a committed update in
+    /// `ProjectD2/.pd2launcher` part way gone: the staging container went
+    /// first, the journal is still there. The probe reads it as Unsafe, which
+    /// the audit gives as an Indeterminate transaction and which Start over's
+    /// preflight refused (`composition::production` `start_over_on` now lets a
+    /// Start over that its marker shows as begun go on). Once `transactions`
+    /// is gone too, there are no records, and it is clear.
+    #[test]
+    fn update_records_that_a_removal_cut_part_way_read_as_unsafe() {
+        let temporary = TempDir::new().unwrap();
+        let layout = UpdateLayout::new(temporary.path());
+        let manifest = manifest_for("Game.exe", b"new game");
+        layout.prepare_staging(&manifest).unwrap();
+        fs::write(
+            layout.staged_files(manifest.id()).join("object-0000"),
+            b"new game",
+        )
+        .unwrap();
+        fs::write(temporary.path().join("Game.exe"), b"old game").unwrap();
+        TransactionManager::new(&layout, &NoFaults)
+            .promote(
+                "start-over",
+                &manifest,
+                &[Promotion {
+                    path: RelativeGamePath::parse("Game.exe").unwrap(),
+                    expected_md5: Md5::digest(b"new game").into(),
+                }],
+            )
+            .unwrap();
+        let probe = UpdateTransactionProbe::new(layout.clone());
+        assert_eq!(probe.probe().unwrap(), TransactionEvidence::Clear);
+        fs::remove_dir_all(
+            layout
+                .metadata_root()
+                .join("staging")
+                .join(STAGING_CONTAINER),
+        )
+        .unwrap();
+        assert!(layout.journal_path("start-over").is_file());
+        assert_eq!(probe.probe().unwrap(), TransactionEvidence::Unsafe);
+        fs::remove_dir_all(layout.transactions_directory()).unwrap();
+        assert_eq!(probe.probe().unwrap(), TransactionEvidence::Clear);
+    }
+
     #[test]
     fn repeated_success_and_prune_reuse_fixed_transaction_storage() {
         let temporary = TempDir::new().unwrap();

@@ -54,6 +54,19 @@ const PREFLIGHT_WINE_PROOF_FD: i32 = 201;
 const PREFLIGHT_PREFIX_FD: i32 = 202;
 const PREFLIGHT_RUNTIME_BIN_FD: i32 = 203;
 const MANAGED_GAME_BASE: &str = "prefix/drive_c/Program Files (x86)/Diablo II/";
+/// The Managed game folder of the Android host, outside its prefix
+/// (`game_folder::ANDROID_GAME_RELATIVE`).
+const ANDROID_MANAGED_GAME_BASE: &str = "Diablo II/";
+
+/// [`MANAGED_GAME_BASE`] or, on the Android host (`android`),
+/// [`ANDROID_MANAGED_GAME_BASE`].
+const fn managed_game_base(android: bool) -> &'static str {
+    if android {
+        ANDROID_MANAGED_GAME_BASE
+    } else {
+        MANAGED_GAME_BASE
+    }
+}
 
 /// The game folder as the audit reads it: the Managed one below the root,
 /// or a folder used in place. Every lookup stays beneath its
@@ -84,12 +97,18 @@ fn top_level_names(folder: Option<Directory>) -> BTreeSet<String> {
 
 impl<'a> GameTree<'a> {
     pub(crate) fn managed(root: &'a Directory) -> Self {
+        Self::managed_on(root, crate::android_host())
+    }
+
+    /// [`Self::managed`] on the Android host (`android`) or the desktop.
+    pub(crate) fn managed_on(root: &'a Directory, android: bool) -> Self {
+        let base = managed_game_base(android);
         let folder = root
-            .open_directory(Path::new(MANAGED_GAME_BASE.trim_end_matches('/')))
+            .open_directory(Path::new(base.trim_end_matches('/')))
             .ok();
         Self {
             directory: root,
-            base: MANAGED_GAME_BASE,
+            base,
             names: top_level_names(folder),
         }
     }
@@ -100,6 +119,25 @@ impl<'a> GameTree<'a> {
             base: "",
             names: top_level_names(folder.try_clone().ok()),
         }
+    }
+
+    /// Whether the folder holds an entry other than its link to the
+    /// player's characters (`Save`; a real `Save` folder counts), whatever
+    /// the entry is: it need not be a file that a check names. Only that the
+    /// entry is there; nothing is read.
+    pub(crate) fn holds_an_entry(&self) -> bool {
+        self.names.iter().any(|name| {
+            name != "Save"
+                || !rustix::fs::statat(
+                    self.directory.as_file(),
+                    Path::new(&self.path(name)),
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )
+                .is_ok_and(|stat| {
+                    rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                        == rustix::fs::FileType::Symlink
+                })
+        })
     }
 
     /// The path of `file` (such as `Game.exe` or `ProjectD2/d2gl.json`)
@@ -1377,11 +1415,12 @@ impl Auditor {
                         // 2026-10-26); one that Blizzard's installers put
                         // there, and the desktop's, by all of them.
                         let imported = crate::android_host()
-                            && root
-                                .open_file(
-                                    &Path::new("prefix")
-                                        .join(crate::game_folder::IMPORT_RECORD_NAME),
-                                )
+                            && crate::game_folder::records_directory(root, true)
+                                .and_then(|records| {
+                                    records.open_file(Path::new(
+                                        crate::game_folder::IMPORT_RECORD_NAME,
+                                    ))
+                                })
                                 .is_ok();
                         results.push(check_base_game(&game, request.activity, imported));
                         results.push(check_expansion(&game, request.activity, imported));
@@ -1512,7 +1551,24 @@ impl Auditor {
             }
             _ => MarkerState::Absent,
         };
-        let installation_status = classify_installation(&checks, prefix_components.base, marker);
+        let live_game = match (managed_root.as_ref(), game_folder.as_ref()) {
+            (Some(root), Some(folder))
+                if lease_guard.is_some() && request.activity != ActivityEvidence::Mutating =>
+            {
+                Some(match folder {
+                    Some(folder) => GameTree::external(folder),
+                    None => GameTree::managed(root),
+                })
+            }
+            _ => None,
+        };
+        // Beside a started base-game marker on the Android host (Start over
+        // writes one first), any entry of the game folder counts as written.
+        let game_entry = crate::android_host()
+            && marker == MarkerState::Present(InterruptedStage::BaseGame)
+            && live_game.as_ref().is_some_and(GameTree::holds_an_entry);
+        let installation_status =
+            classify_installation(&checks, prefix_components.base, marker, game_entry);
         // The Android app has no window to show why: its log says it, once per changed result.
         if crate::android_host() {
             log_android_audit(installation_status, &findings);
@@ -1526,17 +1582,6 @@ impl Auditor {
             LaunchPreflight::Failed
         };
 
-        let live_game = match (managed_root.as_ref(), game_folder.as_ref()) {
-            (Some(root), Some(folder))
-                if lease_guard.is_some() && request.activity != ActivityEvidence::Mutating =>
-            {
-                Some(match folder {
-                    Some(folder) => GameTree::external(folder),
-                    None => GameTree::managed(root),
-                })
-            }
-            _ => None,
-        };
         let official_launcher = match (managed_root.as_ref(), live_game.as_ref()) {
             (Some(root), Some(game)) => {
                 check_official_launcher(root, game, request.accepted_client.as_ref())
@@ -2653,7 +2698,7 @@ fn protected_file_inventory(
     manifest: Option<&AcceptedClientManifest>,
 ) -> (ProtectedInventoryStatus, Vec<ProtectedFileInventoryEntry>) {
     let project_d2 = game.map_or_else(
-        || format!("{MANAGED_GAME_BASE}ProjectD2"),
+        || format!("{}ProjectD2", managed_game_base(crate::android_host())),
         |game| game.path("ProjectD2"),
     );
     let mut entries: Vec<_> = PROTECTED_FILES
@@ -2904,10 +2949,14 @@ fn android_audit_line(status: InstallationStatus, findings: &[AuditFinding]) -> 
     )
 }
 
+/// `game_entry`: on the Android host, beside a started base-game marker, the
+/// game folder holds an entry other than its `Save` link
+/// ([`GameTree::holds_an_entry`]); false elsewhere.
 fn classify_installation(
     checks: &[CheckStatus; CHECK_COUNT],
     prefix_base: CheckStatus,
     marker: MarkerState,
+    game_entry: bool,
 ) -> InstallationStatus {
     match checks[AuditCheck::Transaction.index()] {
         CheckStatus::Indeterminate => return InstallationStatus::Indeterminate,
@@ -2944,8 +2993,15 @@ fn classify_installation(
                 // short while it is written: a step that has not returned
                 // stopped part way once it wrote any of its files. Diablo
                 // II's files are there before Lord of Destruction's step.
+                // On the Android host any entry of the game folder counts
+                // too: a stop late in Start over's removal of the folder
+                // (it writes this marker first) can leave only files that
+                // no check names, as `ProjectD2/`.
                 InterruptedStage::BaseGame => {
-                    !finished && (written(AuditCheck::BaseGame) || written(AuditCheck::Expansion))
+                    !finished
+                        && (written(AuditCheck::BaseGame)
+                            || written(AuditCheck::Expansion)
+                            || game_entry)
                 }
                 // A started Lord of Destruction marker beside the PD2
                 // client can only be one an earlier release left: this
@@ -3431,6 +3487,138 @@ fn hex_nibble(value: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Start over on the Android host that a stop left after it removed the
+    /// app's prefix state (the game folder and the prefix whole,
+    /// `install::tests::
+    /// on_android_a_start_over_stopped_after_the_prefix_state_leaves_the_marker`):
+    /// every check passes, as for the Ready installation it was, and the
+    /// started base-game marker that Start over writes first makes it an
+    /// interrupted step, which only Start over resolves. With part of the game
+    /// gone it is one too; with all of it gone the marker is the start of an
+    /// install.
+    #[test]
+    fn a_start_over_stopped_after_the_prefix_state_is_an_interrupted_step() {
+        let mut checks = [CheckStatus::Satisfied; CHECK_COUNT];
+        let started = MarkerState::Present(InterruptedStage::BaseGame);
+        let interrupted = InstallationStatus::StageInterrupted(InterruptedStage::BaseGame);
+        assert_eq!(
+            classify_installation(&checks, CheckStatus::Satisfied, MarkerState::Absent, false),
+            InstallationStatus::Ready
+        );
+        assert_eq!(
+            classify_installation(&checks, CheckStatus::Satisfied, started, true),
+            interrupted
+        );
+        // The prefix gone before the game folder.
+        checks[AuditCheck::Prefix.index()] = CheckStatus::Missing;
+        assert_eq!(
+            classify_installation(&checks, CheckStatus::Missing, started, true),
+            interrupted
+        );
+        // A stop while the game folder went.
+        checks[AuditCheck::BaseGame.index()] = CheckStatus::Invalid;
+        assert_eq!(
+            classify_installation(&checks, CheckStatus::Missing, started, true),
+            interrupted
+        );
+        for check in [
+            AuditCheck::BaseGame,
+            AuditCheck::Expansion,
+            AuditCheck::Client,
+        ] {
+            checks[check.index()] = CheckStatus::Missing;
+        }
+        // No entry left in the game folder: the start of an install.
+        assert_eq!(
+            classify_installation(&checks, CheckStatus::Missing, started, false),
+            InstallationStatus::NeedsBaseGame
+        );
+    }
+
+    /// A stop late in an Android Start over's removal of the game folder:
+    /// only `ProjectD2/`, or a stray file, is left beside its `Save` link,
+    /// none of them a file that the base-game or expansion check names, and
+    /// the started base-game marker stands. Both checks say Missing; the
+    /// entry makes it an interrupted step all the same (before, the audit said
+    /// NeedsBaseGame, and Fast download and an import then refused the game
+    /// folder that is not empty). Only the `Save` link, or a game folder that
+    /// is not there, is no entry; a real `Save` folder is one.
+    #[test]
+    fn a_game_folder_with_only_unnamed_entries_beside_a_started_marker_is_interrupted() {
+        let started = MarkerState::Present(InterruptedStage::BaseGame);
+        for left in [
+            "ProjectD2/BH.json",
+            "stray.txt",
+            "Save/hero.d2s",
+            "none",
+            "the Save link",
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let game = fixture.path().join("Diablo II");
+            fs::create_dir_all(&game).unwrap();
+            match left {
+                "none" => fs::remove_dir(&game).unwrap(),
+                "the Save link" => {
+                    std::os::unix::fs::symlink(fixture.path(), game.join("Save")).unwrap()
+                }
+                file => {
+                    fs::create_dir_all(game.join(file).parent().unwrap()).unwrap();
+                    fs::write(game.join(file), b"left").unwrap();
+                    if !file.starts_with("Save/") {
+                        std::os::unix::fs::symlink(fixture.path(), game.join("Save")).unwrap();
+                    }
+                }
+            }
+            let root = Directory::open(fixture.path()).unwrap();
+            let tree = GameTree::managed_on(&root, true);
+            let mut checks = [CheckStatus::Missing; CHECK_COUNT];
+            for check in [
+                AuditCheck::Host,
+                AuditCheck::Runtime,
+                AuditCheck::Transaction,
+            ] {
+                checks[check.index()] = CheckStatus::Satisfied;
+            }
+            checks[AuditCheck::BaseGame.index()] =
+                check_base_game(&tree, ActivityEvidence::Idle, false).status;
+            checks[AuditCheck::Expansion.index()] =
+                check_expansion(&tree, ActivityEvidence::Idle, false).status;
+            assert_eq!(
+                checks[AuditCheck::BaseGame.index()],
+                CheckStatus::Missing,
+                "{left}"
+            );
+            assert_eq!(
+                checks[AuditCheck::Expansion.index()],
+                CheckStatus::Missing,
+                "{left}"
+            );
+            let entry = !matches!(left, "none" | "the Save link");
+            assert_eq!(tree.holds_an_entry(), entry, "{left}");
+            assert_eq!(
+                classify_installation(
+                    &checks,
+                    CheckStatus::Missing,
+                    started,
+                    tree.holds_an_entry()
+                ),
+                if entry {
+                    InstallationStatus::StageInterrupted(InterruptedStage::BaseGame)
+                } else {
+                    InstallationStatus::NeedsBaseGame
+                },
+                "{left}"
+            );
+            // The desktop gives no game entry: there the same checks are the
+            // start of an install, as before.
+            assert_eq!(
+                classify_installation(&checks, CheckStatus::Missing, started, false),
+                InstallationStatus::NeedsBaseGame,
+                "{left}"
+            );
+        }
+    }
 
     fn android_host(guest_execution: GuestExecutionEvidence) -> HostEvidence {
         // The Android host facts as the probe maps them, with no Android
