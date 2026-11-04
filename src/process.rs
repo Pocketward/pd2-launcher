@@ -480,12 +480,21 @@ impl GameSupervisor {
             && let Some(renderer) = options.direct_draw_renderer
         {
             match ddraw::set_renderer(&paths.folder, renderer) {
-                Ok(changed) => eprintln!(
-                    "pd2-launcher: DirectDraw draws with {renderer} (ddraw.ini {})",
-                    if changed { "updated" } else { "already set" }
-                ),
+                // The Android app reads this line ([`ddraw::draws_with_line`]).
+                Ok(changed) => eprintln!("{}", ddraw::draws_with_line(renderer, changed)),
                 Err(error) => {
                     eprintln!("pd2-launcher: ddraw.ini left as it is: {error}");
+                }
+            }
+        } else {
+            // A start without the Software driver's `gdi` after it: the lines from before it again.
+            match ddraw::leave_software(&paths.folder) {
+                Ok(true) => eprintln!(
+                    "pd2-launcher: ddraw.ini has its renderer= and adjmouse= lines from before the software renderer again"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("pd2-launcher: ddraw.ini's software values not put back: {error}")
                 }
             }
         }

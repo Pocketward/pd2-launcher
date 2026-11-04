@@ -65,6 +65,13 @@ use crate::{
 /// looks for the game in the prefix, so the handshake refuses it.
 pub(crate) const PROTOCOL: u32 = 7;
 
+/// The engine's capabilities in `welcome`, which an additive field carries
+/// within the same protocol: `gdi_adjmouse`, a DirectDraw start with the
+/// `software` renderer (`renderer=gdi`) also writes `adjmouse=true` and puts
+/// the earlier lines back afterwards ([`crate::process`]'s `ddraw`), so the
+/// Android app offers its Software driver only with it.
+pub(crate) const CAPABILITIES: &[&str] = &["gdi_adjmouse"];
+
 /// The largest frame either side may send: 1 MiB of JSON.
 pub(crate) const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -100,6 +107,10 @@ pub(crate) enum EngineMessage {
     Welcome {
         protocol: u32,
         launcher_version: String,
+        /// What this engine can do beyond its protocol, for the app's
+        /// screens ([`CAPABILITIES`]); an engine without the field has none.
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// The `hello` named a protocol this engine does not speak; it exits.
     Refused { supported: Vec<u32> },
@@ -1707,6 +1718,7 @@ fn handshake(stream: &UnixStream, writer: &Mutex<UnixStream>) -> Option<HostFact
     match send(&EngineMessage::Welcome {
         protocol: PROTOCOL,
         launcher_version: env!("CARGO_PKG_VERSION").to_owned(),
+        capabilities: CAPABILITIES.iter().map(|&name| name.to_owned()).collect(),
     }) {
         Ok(()) => Some(host_facts),
         Err(error) => {
@@ -2625,6 +2637,7 @@ mod tests {
                 EngineMessage::Welcome {
                     protocol: PROTOCOL,
                     launcher_version: "1.0.0".to_owned(),
+                    capabilities: CAPABILITIES.iter().map(|&name| name.to_owned()).collect(),
                 },
             ),
             (
