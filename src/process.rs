@@ -2039,6 +2039,34 @@ mod tests {
         assert_eq!(stored()["screen"]["window_size_width"], 800);
         assert_eq!(stored()["screen"]["window_size_height"], 600);
 
+        // Only a Glide launch on the Android host asks D2GL for OpenGL 3.3:
+        // DirectDraw (any of its renderers, gdi too) and the desktop leave
+        // the saved version as it is.
+        const SAVED_4_6: &str = r#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "other": {"gl_ver_major": 4, "gl_ver_minor": 6, "load_dlls_early": "", "load_dlls_late": "SGD2FreeRes.dll"}}"#;
+        fs::write(&config, SAVED_4_6).unwrap();
+        for renderer in [None, Some("gdi"), Some("opengl")] {
+            assert_eq!(
+                prepare_d2gl(
+                    &folder,
+                    direct_draw.with_direct_draw_renderer(renderer),
+                    true
+                ),
+                Ok(D2glSetup::NotRequested)
+            );
+            assert_eq!(fs::read_to_string(&config).unwrap(), SAVED_4_6);
+        }
+        assert_eq!(
+            prepare_d2gl(&folder, glide, false),
+            Ok(D2glSetup::Unchanged)
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), SAVED_4_6);
+        assert_eq!(prepare_d2gl(&folder, glide, true), Ok(D2glSetup::Written));
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            SAVED_4_6.replace("4, \"gl_ver_minor\": 6", "3, \"gl_ver_minor\": 3")
+        );
+        assert_eq!(prepare_d2gl(&folder, glide, true), Ok(D2glSetup::Unchanged));
+
         // A configuration that cannot be checked keeps the game from starting.
         fs::remove_file(&config).unwrap();
         fs::create_dir(&config).unwrap();

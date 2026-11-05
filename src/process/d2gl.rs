@@ -16,7 +16,8 @@
 //! (fixed first-launch settings) before the first Glide launch. An existing
 //! configuration gets the first launch's cursor and full-screen values
 //! ([`ANDROID_SCREEN`]: an imported one keeps a desktop player's, often
-//! windowed with a locked cursor, which the X screen cannot use), and the
+//! windowed with a locked cursor, which the X screen cannot use) and
+//! OpenGL 3.3 as the version D2GL asks for ([`gl_version`]), and the
 //! app's graphics profile ([`GraphicsProfile`]) sets its few `graphics`
 //! values when it is not the profile last applied ([`PROFILE_RECORD`]);
 //! nothing else in it is touched (the player changes D2GL's graphics in the
@@ -78,6 +79,22 @@ const ANDROID_SCREEN: [(&str, Value); 3] = [
     // and the X screen has no taskbar or window manager to bring it back.
     ("auto_minimize", Value::Bool(false)),
 ];
+
+/// The `other` values for the OpenGL version D2GL asks for, 3.3, which the
+/// Android host writes before each Glide start. D2GL tries 4.6 down to 3.3,
+/// keeps the first that works, saves it here, and at its next start skips
+/// each version whose major or minor is above the saved one: so a saved 4.0
+/// to 4.2 never asks for 3.3. The game's shaders are GLSL 330 and, on the
+/// 0.4.0 line of the Android app, every route gives OpenGL 3.3
+/// (`android/userland/userland.env.in`), so 3.3 is the version on each of
+/// them. These two keys are the one change of D2GL's own values the owner
+/// approved (2026-11-04).
+fn gl_version() -> [(&'static str, Value); 2] {
+    [
+        ("gl_ver_major", Value::from(3)),
+        ("gl_ver_minor", Value::from(3)),
+    ]
+}
 
 /// The `other` values naming the DLLs D2GL loads, as PD2 ships them: the
 /// defaults of PD2's D2GL build, which it writes into a new configuration.
@@ -285,16 +302,23 @@ fn configure_config(game: &Directory, profile: Option<GraphicsProfile>) -> io::R
     // An existing configuration gets the first launch's cursor and
     // full-screen values too: an imported one keeps a desktop player's, with
     // which the game loses the first click after each start and runs
-    // windowed partly off the X screen. These values and the profile stand
-    // alone: one that cannot address the configuration never keeps the
-    // other from being written. A profile that cannot be written is not
-    // recorded, so the next Play tries again.
+    // windowed partly off the X screen. Then OpenGL 3.3 ([`gl_version`]).
+    // These values and the profile stand alone: one that cannot address the
+    // configuration never keeps the others from being written. A profile
+    // that cannot be written is not recorded, so the next Play tries again.
     let screened = set_values(&raw, "screen", &ANDROID_SCREEN).inspect_err(|error| {
         eprintln!("pd2-launcher: d2gl.json keeps its cursor and full-screen settings: {error}");
     });
     let base = match &screened {
         Ok(Some(screened)) => screened.as_slice(),
         _ => &raw,
+    };
+    let versioned = set_values(base, "other", &gl_version()).inspect_err(|error| {
+        eprintln!("pd2-launcher: d2gl.json keeps its OpenGL version: {error}");
+    });
+    let base = match &versioned {
+        Ok(Some(versioned)) => versioned.as_slice(),
+        _ => base,
     };
     let profiled = changed.and_then(|profile| match profiled_config(base, profile) {
         Ok(profiled) => Some((profile, profiled)),
@@ -308,18 +332,32 @@ fn configure_config(game: &Directory, profile: Option<GraphicsProfile>) -> io::R
     });
     let (applied, profiled) = profiled.unzip();
     let screen_written = matches!(screened, Ok(Some(_)));
-    // The profile's edit was made on the bytes of the screen values' edit.
-    let written = match screened {
-        Ok(screened) => profiled.flatten().or(screened),
-        // No value could be set, so the configuration stays as it is.
-        Err(error) if applied.is_none() => return Err(error),
-        Err(_) => profiled.flatten(),
+    let version_written = matches!(versioned, Ok(Some(_)));
+    // Each edit was made on the bytes of the edits before it.
+    // A screen error with no profile written is reported (the caller shows
+    // DisplayConfigSkipped), but only after the version is written.
+    let skipped = match &screened {
+        Err(error) if applied.is_none() => Some(io::Error::new(error.kind(), error.to_string())),
+        _ => None,
     };
+    let written = profiled
+        .flatten()
+        .or(versioned.ok().flatten())
+        .or(screened.ok().flatten());
     if let Some(bytes) = &written {
         replace(&project, &config, bytes)?;
     }
     if screen_written {
         eprintln!("pd2-launcher: d2gl.json is full screen with the cursor unlocked");
+    }
+    if version_written {
+        eprintln!(
+            "pd2-launcher: d2gl.json asks for OpenGL 3.3, was {}",
+            saved_gl_version(&raw)
+        );
+    }
+    if let Some(error) = skipped {
+        return Err(error);
     }
     if let Some(profile) = applied {
         record_profile(&project, profile);
@@ -328,6 +366,30 @@ fn configure_config(game: &Directory, profile: Option<GraphicsProfile>) -> io::R
         None => D2glSetup::Unchanged,
         Some(_) => D2glSetup::Written,
     })
+}
+
+/// The OpenGL version that `raw` saves, for the log: `major.minor`, or
+/// `not set` when it has neither key (D2GL then takes its default, 4.6), or
+/// `major 4, minor not set` when it has one key only.
+fn saved_gl_version(raw: &[u8]) -> String {
+    let config = serde_json::from_slice::<Value>(raw.strip_prefix(UTF8_BOM).unwrap_or(raw)).ok();
+    let part = |key: &str| {
+        config
+            .as_ref()
+            .and_then(|config| config.get("other")?.get(key).cloned())
+    };
+    match (part("gl_ver_major"), part("gl_ver_minor")) {
+        (None, None) => "not set".to_owned(),
+        (major, minor) => {
+            let shown = |part: Option<Value>| {
+                part.map_or_else(|| "not set".to_owned(), |value| value.to_string())
+            };
+            match (&major, &minor) {
+                (Some(major), Some(minor)) => format!("{major}.{minor}"),
+                _ => format!("major {}, minor {}", shown(major), shown(minor)),
+            }
+        }
+    }
 }
 
 /// The profile [`PROFILE_RECORD`] names, or `None` when there is none (no
@@ -623,7 +685,8 @@ fn remove(project: &Directory, original: &File) -> io::Result<()> {
 }
 
 /// The Android host's first-launch D2GL settings: D2GL's corner mini map
-/// off, and [`ANDROID_SCREEN`]'s, [`shipped_dlls`]' and `profile`'s values.
+/// off, and [`ANDROID_SCREEN`]'s, [`shipped_dlls`]', [`gl_version`]'s and
+/// `profile`'s values.
 /// It has no window size: D2GL sizes the full-screen game from the X screen
 /// and takes its own default for a windowed one. The player changes these
 /// settings in the game (Ctrl+O); [`ANDROID_SCREEN`]'s are set again at the
@@ -676,8 +739,10 @@ fn first_launch_config(profile: GraphicsProfile) -> Vec<u8> {
             "show_fps": false
         },
         "other": {
-            "gl_ver_major": 4,
-            "gl_ver_minor": 6,
+            // These two keep their place here; their values are
+            // gl_version()'s, set below.
+            "gl_ver_major": 0,
+            "gl_ver_minor": 0,
             "use_compute_shader": false,
             "frame_latency": 1,
             // These two keep their place here; their values are
@@ -689,7 +754,7 @@ fn first_launch_config(profile: GraphicsProfile) -> Vec<u8> {
     for (key, value) in ANDROID_SCREEN {
         config["screen"][key] = value;
     }
-    for (key, value) in shipped_dlls() {
+    for (key, value) in shipped_dlls().into_iter().chain(gl_version()) {
         config["other"][key] = value;
     }
     for (key, value) in profile.values() {
@@ -774,6 +839,128 @@ mod tests {
         fs::read(root.path().join(PROJECT_D2).join(CONFIG)).expect("read d2gl.json")
     }
 
+    /// A configuration with the Android host's screen values already, so
+    /// only its `other` section can change.
+    fn screened_config(other: &str) -> String {
+        format!(
+            "{{\n    \"screen\": {{\n        \"unlock_cursor\": true,\n        \"window_fullscreen\": true,\n        \"auto_minimize\": false\n    }},\n    \"other\": {{{other}}}\n}}"
+        )
+    }
+
+    #[test]
+    fn the_android_host_asks_d2gl_for_opengl_3_3_and_every_other_byte_stays() {
+        // D2GL tries only the versions up to the saved one, so a saved 4.0
+        // to 4.2 never asks for 3.3; 3.3 on every route.
+        for (major, minor) in [(4, 0), (4, 2), (4, 6)] {
+            let other = |major, minor| {
+                format!(
+                    "\n        \"gl_ver_major\": {major},\n        \"gl_ver_minor\": {minor},\n        \"use_compute_shader\": false,\n        \"frame_latency\": 1,\n        \"load_dlls_early\": \"\",\n        \"load_dlls_late\": \"SGD2FreeRes.dll\"\n    "
+                )
+            };
+            let saved = screened_config(&other(major, minor));
+            assert_eq!(
+                saved_gl_version(saved.as_bytes()),
+                format!("{major}.{minor}")
+            );
+            let (temporary, root) = managed_root(Some(saved.as_bytes()));
+            assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
+            assert_eq!(
+                String::from_utf8(read_config(&temporary)).unwrap(),
+                screened_config(&other(3, 3))
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_opengl_3_3_is_not_written_again() {
+        let saved = screened_config("\"gl_ver_major\": 3, \"gl_ver_minor\": 3");
+        let (temporary, root) = managed_root(Some(saved.as_bytes()));
+        let path = temporary.path().join(PROJECT_D2).join(CONFIG);
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Unchanged);
+        assert_eq!(read_config(&temporary), saved.as_bytes());
+        // Not replaced by a rename: the same file.
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn missing_opengl_keys_are_inserted_where_d2gl_reads_them() {
+        // Without the keys D2GL takes its default, 4.6.
+        let saved = screened_config("\"use_compute_shader\": false");
+        assert_eq!(saved_gl_version(saved.as_bytes()), "not set");
+        let (temporary, root) = managed_root(Some(saved.as_bytes()));
+        assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            screened_config(
+                "\"gl_ver_major\": 3, \"gl_ver_minor\": 3, \"use_compute_shader\": false"
+            )
+        );
+
+        // One key only: the other is inserted, the present one replaced.
+        let saved = screened_config("\"gl_ver_minor\": 2");
+        assert_eq!(saved_gl_version(saved.as_bytes()), "major not set, minor 2");
+        let (temporary, root) = managed_root(Some(saved.as_bytes()));
+        assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            screened_config("\"gl_ver_major\": 3, \"gl_ver_minor\": 3")
+        );
+
+        // No `other` section: a new one, at the start.
+        let saved = r#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}}"#;
+        let (temporary, root) = managed_root(Some(saved.as_bytes()));
+        assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
+        assert_eq!(
+            String::from_utf8(read_config(&temporary)).unwrap(),
+            saved.replacen(
+                '{',
+                "{\"other\": {\"gl_ver_major\": 3, \"gl_ver_minor\": 3}, ",
+                1
+            )
+        );
+    }
+
+    #[test]
+    fn the_first_launch_configuration_asks_for_opengl_3_3() {
+        for profile in [GraphicsProfile::Default, GraphicsProfile::Performance] {
+            let written: Value = serde_json::from_slice(&first_launch_config(profile)).unwrap();
+            assert_eq!(written["other"]["gl_ver_major"], 3);
+            assert_eq!(written["other"]["gl_ver_minor"], 3);
+        }
+        let (temporary, root) = managed_root(None);
+        assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
+        assert_eq!(saved_gl_version(&read_config(&temporary)), "3.3");
+    }
+
+    #[test]
+    fn the_opengl_version_is_written_when_the_screen_values_cannot_be() {
+        // A `screen` that is not an object keeps its value; the version
+        // stands alone. The Play still reports the skipped screen values
+        // (DisplayConfigSkipped), as before 0.1.14, on every Play.
+        let saved = r#"{"screen": 1, "other": {"gl_ver_major": 4, "gl_ver_minor": 6}}"#;
+        let (temporary, root) = managed_root(Some(saved.as_bytes()));
+        assert_eq!(configure(&root, None), D2glSetup::Skipped);
+        let written = saved.replace("4, \"gl_ver_minor\": 6", "3, \"gl_ver_minor\": 3");
+        assert_eq!(String::from_utf8(read_config(&temporary)).unwrap(), written);
+        assert_eq!(configure(&root, None), D2glSetup::Skipped);
+        assert_eq!(String::from_utf8(read_config(&temporary)).unwrap(), written);
+    }
+
+    #[test]
+    fn a_saved_opengl_version_with_one_key_is_logged_readably() {
+        let one = |other: &str| format!(r#"{{"other": {{{other}}}}}"#);
+        assert_eq!(
+            saved_gl_version(one("\"gl_ver_major\": 4").as_bytes()),
+            "major 4, minor not set"
+        );
+        assert_eq!(
+            saved_gl_version(one("\"gl_ver_minor\": 2").as_bytes()),
+            "major not set, minor 2"
+        );
+        assert_eq!(saved_gl_version(one("").as_bytes()), "not set");
+    }
+
     #[test]
     fn the_android_host_writes_the_first_launch_configuration() {
         let (temporary, root) = managed_root(None);
@@ -830,7 +1017,7 @@ mod tests {
 
         // A size given twice stays as it is, and the screen values are
         // still written.
-        let twice = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "window_size_width": 1280}}"#;
+        let twice = r#"{"screen": {"window_size_width": 800, "window_size_height": 600, "window_size_width": 1280}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#;
         let (temporary, root) = managed_root(Some(twice.as_bytes()));
         assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
         assert_eq!(
@@ -1010,6 +1197,11 @@ mod tests {
                         1
                     )
                     .replacen("anti-aliasing\\\\advanced-aa.slangp", "bilinear.slangp", 1)
+                    .replacen(
+                        "\"other\": {",
+                        "\"other\": {\"gl_ver_major\": 3, \"gl_ver_minor\": 3, ",
+                        1
+                    )
             );
             assert_eq!(
                 fs::read_to_string(record_path(&temporary)).unwrap(),
@@ -1023,7 +1215,7 @@ mod tests {
         // Graphics that are not an object: the screen values are still
         // written, and nothing is recorded, so the next Play tries again.
         let (temporary, root) = managed_root(Some(
-            br#"{"screen": {"window_size_width": 1604, "window_size_height": 720}, "graphics": null}"#,
+            br#"{"screen": {"window_size_width": 1604, "window_size_height": 720}, "graphics": null, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#,
         ));
         assert_eq!(
             configure_config(&root, Some(GraphicsProfile::Performance)).unwrap(),
@@ -1031,14 +1223,13 @@ mod tests {
         );
         assert_eq!(
             read_config(&temporary),
-            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false, "window_size_width": 1604, "window_size_height": 720}, "graphics": null}"#
+            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false, "window_size_width": 1604, "window_size_height": 720}, "graphics": null, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#
         );
         assert!(!record_path(&temporary).exists());
 
         // Screen values that are not addressable (a key twice): nothing can
         // be set without a profile, and the profile is still written.
-        let twice =
-            r#"{"screen": {"unlock_cursor": false, "unlock_cursor": false}, "graphics": {}}"#;
+        let twice = r#"{"screen": {"unlock_cursor": false, "unlock_cursor": false}, "graphics": {}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#;
         let (temporary, root) = managed_root(Some(twice.as_bytes()));
         assert!(configure_config(&root, None).is_err());
         assert_eq!(read_config(&temporary), twice.as_bytes());
@@ -1168,6 +1359,12 @@ mod tests {
                 "\"window_fullscreen\": false",
                 "\"window_fullscreen\": true",
                 1,
+            )
+            // D2GL writes the version when it saves; this one has none.
+            .replacen(
+                '{',
+                "{\"other\": {\"gl_ver_major\": 3, \"gl_ver_minor\": 3}, ",
+                1,
             );
         assert_eq!(
             String::from_utf8(read_config(&temporary)).unwrap(),
@@ -1196,25 +1393,29 @@ mod tests {
         // Missing values at the start of screen, present ones in place: a
         // player's auto_minimize goes off with the game full screen.
         let (temporary, root) = managed_root(Some(
-            br#"{"screen": {"window_size_width": 1280, "window_size_height": 960, "auto_minimize": true}, "other": {}}"#,
+            br#"{"screen": {"window_size_width": 1280, "window_size_height": 960, "auto_minimize": true}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#,
         ));
         assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
         assert_eq!(
             read_config(&temporary),
-            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "window_size_width": 1280, "window_size_height": 960, "auto_minimize": false}, "other": {}}"#
+            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "window_size_width": 1280, "window_size_height": 960, "auto_minimize": false}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#
         );
 
         // No screen at all: a new one with just these values.
-        let (temporary, root) = managed_root(Some(br#"{"other": {}}"#));
+        let (temporary, root) = managed_root(Some(
+            br#"{"other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#,
+        ));
         assert_eq!(configure_config(&root, None).unwrap(), D2glSetup::Written);
         assert_eq!(
             read_config(&temporary),
-            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "other": {}}"#
+            br#"{"screen": {"unlock_cursor": true, "window_fullscreen": true, "auto_minimize": false}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#
         );
 
         // A screen that is not an object: it stays, and the profile is still
         // written.
-        let (temporary, root) = managed_root(Some(br#"{"screen": null, "graphics": {}}"#));
+        let (temporary, root) = managed_root(Some(
+            br#"{"screen": null, "graphics": {}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#,
+        ));
         assert!(configure_config(&root, None).is_err());
         assert_eq!(
             configure_config(&root, Some(GraphicsProfile::Performance)).unwrap(),
@@ -1222,7 +1423,7 @@ mod tests {
         );
         assert_eq!(
             read_config(&temporary),
-            br#"{"screen": null, "graphics": {"shader_preset": "bilinear.slangp", "sharpen": false, "bloom": false}}"#
+            br#"{"screen": null, "graphics": {"shader_preset": "bilinear.slangp", "sharpen": false, "bloom": false}, "other": {"gl_ver_major": 3, "gl_ver_minor": 3}}"#
         );
     }
 
